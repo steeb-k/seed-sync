@@ -19,12 +19,15 @@ public sealed class SyncEngine : IAsyncDisposable
     private readonly TimeSpan _debounceDelay = TimeSpan.FromSeconds(2);
     private bool _isRunning;
 
+    /// <summary>Default BitTorrent listen port so peers can connect; use same port on both sides when possible.</summary>
+    public const int DefaultListenPort = 6881;
+
     /// <summary>
     /// Creates a new sync engine instance.
     /// </summary>
     /// <param name="dataPath">Path where engine data (torrents, state) is stored.</param>
-    /// <param name="listenPort">Port to listen on for incoming connections (0 for random).</param>
-    public SyncEngine(string dataPath, int listenPort = 0)
+    /// <param name="listenPort">Port to listen on for incoming connections (0 for random, default 6881).</param>
+    public SyncEngine(string dataPath, int listenPort = DefaultListenPort)
     {
         _dataPath = dataPath;
         Directory.CreateDirectory(dataPath);
@@ -37,7 +40,8 @@ public sealed class SyncEngine : IAsyncDisposable
             AutoSaveLoadFastResume = true,
             AutoSaveLoadMagnetLinkMetadata = true,
             CacheDirectory = Path.Combine(dataPath, "cache"),
-            MaximumConnections = 100
+            MaximumConnections = 100,
+            ListenPort = listenPort == 0 ? 6881 : listenPort
         };
 
         _engine = new ClientEngine(settingsBuilder.ToSettings());
@@ -369,17 +373,26 @@ public sealed class SyncEngine : IAsyncDisposable
         {
             magnetInfoHash = KeyGenerator.DeriveInfoHash(share.Id);
         }
-        var magnetUri = $"magnet:?xt=urn:btih:{Convert.ToHexString(magnetInfoHash).ToLowerInvariant()}";
+        var infoHashHex = Convert.ToHexString(magnetInfoHash).ToLowerInvariant();
+        var trParams = string.Join("", GetDefaultTrackers().Select(u => $"&tr={Uri.EscapeDataString(u)}"));
+        var magnetUri = $"magnet:?xt=urn:btih:{infoHashHex}{trParams}";
 
         // Create or use existing torrent for the folder
         var torrentPath = Path.Combine(_dataPath, $"{share.Id}.torrent");
         TorrentManager manager;
+        bool needsHashCheck = false;
+
+        // MonoTorrent expects savePath to be the PARENT directory when CreateContainingDirectory=true (default).
+        // The torrent name becomes a subdirectory under savePath. So for sharing "C:\path\Drivers",
+        // we pass "C:\path" as savePath and MonoTorrent looks in "C:\path\Drivers\..." which is correct.
+        var parentPath = Path.GetDirectoryName(share.LocalPath) ?? share.LocalPath;
 
         if (File.Exists(torrentPath))
         {
-            // Load existing torrent
+            // Load existing torrent (we likely have the files already)
             var torrent = await Torrent.LoadAsync(torrentPath);
-            manager = await _engine.AddAsync(torrent, share.LocalPath);
+            manager = await _engine.AddAsync(torrent, parentPath);
+            needsHashCheck = true; // Verify local files
         }
         else
         {
@@ -400,13 +413,15 @@ public sealed class SyncEngine : IAsyncDisposable
                 await File.WriteAllBytesAsync(torrentPath, torrentInfo.Encode());
 
                 var torrent = await Torrent.LoadAsync(torrentPath);
-                manager = await _engine.AddAsync(torrent, share.LocalPath);
+                manager = await _engine.AddAsync(torrent, parentPath);
+                needsHashCheck = true; // We have the files, need to verify
             }
             else
             {
-                // Empty folder - use magnet link to join swarm
+                // Empty folder - use magnet link to join swarm (joiner path)
                 var magnet = MagnetLink.Parse(magnetUri);
-                manager = await _engine.AddAsync(magnet, share.LocalPath);
+                manager = await _engine.AddAsync(magnet, parentPath);
+                needsHashCheck = false; // No local files to verify
             }
         }
 
@@ -414,13 +429,40 @@ public sealed class SyncEngine : IAsyncDisposable
         manager.TorrentStateChanged += (sender, e) => OnTorrentStateChanged(share.Id, e);
         manager.PieceHashed += (sender, e) => OnPieceHashed(share.Id, e);
 
-        // For ReadOnly shares, disable uploading (receive only)
-        // Note: ReadOnly peers should only download, not seed back to the swarm
-        // This is enforced at the key level - RO key holders can't modify the share
-        // but they can still seed what they've downloaded to help distribute
+        // Add public trackers for peer discovery (DHT/LPD alone often not enough across NAT)
+        if (manager.Torrent == null || !manager.Torrent.IsPrivate)
+        {
+            var trackerManager = manager.TrackerManager;
+            var urls = GetDefaultTrackers();
+            _ = Task.Run(async () =>
+            {
+                foreach (var trackerUrl in urls)
+                {
+                    try
+                    {
+                        await trackerManager.AddTrackerAsync(new Uri(trackerUrl));
+                    }
+                    catch
+                    {
+                        // Ignore invalid or unreachable trackers
+                    }
+                }
+            });
+        }
 
-        // Start the manager
-        await manager.StartAsync();
+        // For creator/existing torrent: hash check first to verify local files, then auto-start (→ Seeding)
+        // For joiner (magnet): just start (→ Downloading/Metadata)
+        if (needsHashCheck)
+        {
+            Console.WriteLine($"[SEED] Starting hash check for share {share.Id}...");
+            await manager.HashCheckAsync(autoStart: true);
+            Console.WriteLine($"[SEED] Hash check complete. State: {manager.State}, Progress: {manager.Progress:P1}");
+        }
+        else
+        {
+            await manager.StartAsync();
+            Console.WriteLine($"[SEED] Started magnet download. State: {manager.State}");
+        }
         _activeShares[share.Id] = manager;
         _shareConfigs[share.Id] = share;
         share.Status = ShareStatus.Syncing;
@@ -431,6 +473,8 @@ public sealed class SyncEngine : IAsyncDisposable
 
     private void OnTorrentStateChanged(string shareId, TorrentStateChangedEventArgs e)
     {
+        Console.WriteLine($"[SEED] Share {shareId}: State changed {e.OldState} -> {e.NewState}");
+        
         if (!_shareConfigs.TryGetValue(shareId, out var share))
             return;
 
@@ -455,6 +499,12 @@ public sealed class SyncEngine : IAsyncDisposable
 
     private void OnPieceHashed(string shareId, PieceHashedEventArgs e)
     {
+        // Log piece hash results for debugging
+        if (!e.HashPassed)
+        {
+            Console.WriteLine($"[SEED] Share {shareId}: Piece {e.PieceIndex} FAILED hash check");
+        }
+        
         // A piece was verified - could be from download or local hash check
         // Only notify if the piece passed verification and was actually downloaded
         if (e.HashPassed && _shareConfigs.TryGetValue(shareId, out var share))
@@ -467,6 +517,18 @@ public sealed class SyncEngine : IAsyncDisposable
                 ShareChanged?.Invoke(this, new ShareChangedEventArgs(shareId, ShareChangeType.FilesDownloaded));
             }
         }
+    }
+
+    /// <summary>Public UDP trackers used for peer discovery when DHT/LPD alone are not enough.</summary>
+    private static List<string> GetDefaultTrackers()
+    {
+        return
+        [
+            "udp://tracker.opentrackr.org:1337/announce",
+            "udp://open.stealth.si:80/announce",
+            "udp://tracker.torrent.eu.org:451/announce",
+            "udp://exodus.desync.com:6969/announce"
+        ];
     }
 
     private static List<string> GetFilesToSync(string folderPath, IEnumerable<string> ignorePatterns)
