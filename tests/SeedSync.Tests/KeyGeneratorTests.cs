@@ -69,6 +69,25 @@ public class KeyGeneratorTests
         Assert.NotNull(parsed);
         Assert.Equal(keys.ShareId, parsed.Value.ShareId);
         Assert.Equal(AccessLevel.ReadOnly, parsed.Value.AccessLevel);
+        Assert.Null(parsed.Value.InfoHash); // Legacy format has no embedded info hash
+    }
+
+    [Fact]
+    public void WithInfoHash_EmbedsInfoHashInRoKey()
+    {
+        var keys = KeyGenerator.GenerateKeys();
+        var infoHash = KeyGenerator.DeriveInfoHash(keys.ShareId);
+
+        var roKeyWithHash = KeyGenerator.WithInfoHash(keys.ReadOnlyKey, infoHash);
+
+        Assert.StartsWith("SEEDRO", roKeyWithHash, StringComparison.OrdinalIgnoreCase);
+        Assert.True(roKeyWithHash.Length > keys.ReadOnlyKey.Length);
+        var parsed = KeyGenerator.ParseKey(roKeyWithHash);
+        Assert.NotNull(parsed);
+        Assert.Equal(keys.ShareId, parsed.Value.ShareId);
+        Assert.Equal(AccessLevel.ReadOnly, parsed.Value.AccessLevel);
+        Assert.NotNull(parsed.Value.InfoHash);
+        Assert.Equal(infoHash, parsed.Value.InfoHash);
     }
 
     [Fact]

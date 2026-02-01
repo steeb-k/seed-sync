@@ -119,6 +119,18 @@ public sealed class SyncEngine : IAsyncDisposable
 
         await StartSyncingShareAsync(share, keys);
 
+        // Embed actual torrent info hash in RO key so joiners use the same swarm
+        if (_activeShares.TryGetValue(share.Id, out var manager) && manager.Torrent != null)
+        {
+            var infoHashBytes = manager.Torrent.InfoHash.ToArray();
+            keys = new ShareKeys
+            {
+                ShareId = keys.ShareId,
+                ReadWriteKey = keys.ReadWriteKey,
+                ReadOnlyKey = KeyGenerator.WithInfoHash(keys.ReadOnlyKey, infoHashBytes)
+            };
+        }
+
         return (share, keys);
     }
 
@@ -346,8 +358,18 @@ public sealed class SyncEngine : IAsyncDisposable
 
     private async Task StartSyncingShareAsync(Share share, ShareKeys? keys)
     {
-        var infoHash = KeyGenerator.DeriveInfoHash(share.Id);
-        var magnetUri = $"magnet:?xt=urn:btih:{Convert.ToHexString(infoHash).ToLowerInvariant()}";
+        // Joiner: use info hash from key if present (new RO key format), else derived. Creator with empty folder: use derived.
+        byte[] magnetInfoHash;
+        if (keys == null)
+        {
+            var parsed = KeyGenerator.ParseKey(share.Key);
+            magnetInfoHash = parsed?.InfoHash ?? KeyGenerator.DeriveInfoHash(share.Id);
+        }
+        else
+        {
+            magnetInfoHash = KeyGenerator.DeriveInfoHash(share.Id);
+        }
+        var magnetUri = $"magnet:?xt=urn:btih:{Convert.ToHexString(magnetInfoHash).ToLowerInvariant()}";
 
         // Create or use existing torrent for the folder
         var torrentPath = Path.Combine(_dataPath, $"{share.Id}.torrent");
