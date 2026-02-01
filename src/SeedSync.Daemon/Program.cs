@@ -1,8 +1,15 @@
+using System.Text.Json.Serialization;
 using SeedSync.Core.Services;
 using SeedSync.Daemon;
 using SeedSync.Daemon.Services;
 
 var builder = WebApplication.CreateBuilder(args);
+
+// Serialize enums as strings so API consumers (e.g. GUI) get "ReadWrite"/"ReadOnly" not 0/1
+builder.Services.ConfigureHttpJsonOptions(options =>
+{
+    options.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
+});
 
 // Configure the app data path
 var appDataPath = Path.Combine(
