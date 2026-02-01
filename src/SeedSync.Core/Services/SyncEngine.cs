@@ -387,16 +387,21 @@ public sealed class SyncEngine : IAsyncDisposable
         // machines to use different folder names/locations.
         var torrentSettings = new TorrentSettingsBuilder { CreateContainingDirectory = false }.ToSettings();
 
+        // Determine if we're the creator (have keys) or joiner (keys is null)
+        bool isCreator = keys != null;
+        Console.WriteLine($"[SEED] Share {share.Id}: isCreator={isCreator}, torrentExists={File.Exists(torrentPath)}");
+
         if (File.Exists(torrentPath))
         {
-            // Load existing torrent (we likely have the files already)
+            // Load existing torrent (we likely have the files already, or previously synced)
             var torrent = await Torrent.LoadAsync(torrentPath);
+            Console.WriteLine($"[SEED] Loaded existing torrent: {torrent.Name}, {torrent.Files.Count} files");
             manager = await _engine.AddAsync(torrent, share.LocalPath, torrentSettings);
             needsHashCheck = true; // Verify local files
         }
-        else
+        else if (isCreator)
         {
-            // Create new torrent from folder
+            // Creator: build torrent from local files
             var files = GetFilesToSync(share.LocalPath, share.IgnorePatterns);
 
             if (files.Count > 0)
@@ -414,16 +419,27 @@ public sealed class SyncEngine : IAsyncDisposable
                 await File.WriteAllBytesAsync(torrentPath, torrentInfo.Encode());
 
                 var torrent = await Torrent.LoadAsync(torrentPath);
+                Console.WriteLine($"[SEED] Created new torrent: {torrent.Name}, {torrent.Files.Count} files");
                 manager = await _engine.AddAsync(torrent, share.LocalPath, torrentSettings);
                 needsHashCheck = true; // We have the files, need to verify
             }
             else
             {
-                // Empty folder - use magnet link to join swarm (joiner path)
+                // Creator with empty folder - still use magnet to wait for files
                 var magnet = MagnetLink.Parse(magnetUri);
+                Console.WriteLine($"[SEED] Creator with empty folder, using magnet link");
                 manager = await _engine.AddAsync(magnet, share.LocalPath, torrentSettings);
-                needsHashCheck = false; // No local files to verify
+                needsHashCheck = false;
             }
+        }
+        else
+        {
+            // Joiner: ALWAYS use magnet link to get the CREATOR's torrent
+            // Even if we have local files, they might not match - use the magnet to sync properly
+            var magnet = MagnetLink.Parse(magnetUri);
+            Console.WriteLine($"[SEED] Joiner using magnet link: {magnetUri}");
+            manager = await _engine.AddAsync(magnet, share.LocalPath, torrentSettings);
+            needsHashCheck = false; // No hash check - we're downloading
         }
 
         // Hook up event handlers for download notifications
