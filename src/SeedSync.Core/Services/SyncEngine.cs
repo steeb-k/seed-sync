@@ -11,12 +11,16 @@ namespace SeedSync.Core.Services;
 public sealed class SyncEngine : IAsyncDisposable
 {
     private readonly ClientEngine _engine;
-    private readonly Dictionary<string, TorrentManager> _activeShares = new();
+    private readonly Dictionary<string, TorrentManager> _activeShares = new();  // Content torrents
+    private readonly Dictionary<string, TorrentManager> _signalManagers = new(); // Signal torrents for peer discovery
+    private readonly Dictionary<string, byte[]> _currentContentHashes = new();   // Current content hash per share
     private readonly Dictionary<string, FileSystemWatcher> _watchers = new();
     private readonly Dictionary<string, Share> _shareConfigs = new();
     private readonly Dictionary<string, CancellationTokenSource> _debounceTokens = new();
     private readonly string _dataPath;
     private readonly TimeSpan _debounceDelay = TimeSpan.FromSeconds(2);
+    private readonly TimeSpan _updateCheckInterval = TimeSpan.FromSeconds(5);    // How often joiners check for updates
+    private CancellationTokenSource? _updateCheckCts;
     private bool _isRunning;
 
     /// <summary>Default BitTorrent listen port so peers can connect; use same port on both sides when possible.</summary>
@@ -57,6 +61,11 @@ public sealed class SyncEngine : IAsyncDisposable
         // DHT and local peer discovery are enabled via settings
         // The engine starts when we add and start torrents
         _isRunning = true;
+        
+        // Start background task to check for updates from creators (for joiner shares)
+        _updateCheckCts = new CancellationTokenSource();
+        _ = RunUpdateCheckLoopAsync(_updateCheckCts.Token);
+        
         await Task.CompletedTask;
     }
 
@@ -67,12 +76,18 @@ public sealed class SyncEngine : IAsyncDisposable
     {
         if (!_isRunning) return;
 
+        // Stop update check loop
+        _updateCheckCts?.Cancel();
+        _updateCheckCts?.Dispose();
+        _updateCheckCts = null;
+
         // Stop all file watchers
         foreach (var shareId in _watchers.Keys.ToList())
         {
             StopFileWatcher(shareId);
         }
 
+        // Stop content managers
         foreach (var manager in _activeShares.Values)
         {
             try
@@ -82,6 +97,19 @@ public sealed class SyncEngine : IAsyncDisposable
             catch (OperationCanceledException)
             {
                 // Ignore cancellation during shutdown
+            }
+            catch
+            {
+                // Ignore errors during shutdown
+            }
+        }
+
+        // Stop signal managers
+        foreach (var manager in _signalManagers.Values)
+        {
+            try
+            {
+                await manager.StopAsync();
             }
             catch
             {
@@ -118,7 +146,8 @@ public sealed class SyncEngine : IAsyncDisposable
             AccessLevel = AccessLevel.ReadWrite,
             DefaultPath = defaultPath ?? GetDefaultPathSuggestion(folderPath),
             IgnorePatterns = ignoreList,
-            Name = Path.GetFileName(folderPath)
+            Name = Path.GetFileName(folderPath),
+            IsCreator = true  // This peer created the share
         };
 
         await StartSyncingShareAsync(share, keys);
@@ -157,7 +186,8 @@ public sealed class SyncEngine : IAsyncDisposable
             LocalPath = Path.GetFullPath(localPath),
             Key = key,
             AccessLevel = parsed.AccessLevel,
-            Name = Path.GetFileName(localPath)
+            Name = Path.GetFileName(localPath),
+            IsCreator = false  // Joining an existing share
         };
 
         await StartSyncingShareAsync(share, null);
@@ -245,10 +275,6 @@ public sealed class SyncEngine : IAsyncDisposable
 
     private void SetupFileWatcher(Share share)
     {
-        // Only watch for changes on ReadWrite shares
-        if (share.AccessLevel != AccessLevel.ReadWrite)
-            return;
-
         if (_watchers.ContainsKey(share.Id))
             return;
 
@@ -280,7 +306,7 @@ public sealed class SyncEngine : IAsyncDisposable
             ShouldIgnore(relativePath, share.IgnorePatterns))
             return;
 
-        // Debounce: cancel any pending resync and schedule a new one
+        // Debounce: cancel any pending action and schedule a new one
         if (_debounceTokens.TryGetValue(shareId, out var existingCts))
         {
             existingCts.Cancel();
@@ -295,7 +321,17 @@ public sealed class SyncEngine : IAsyncDisposable
             try
             {
                 await Task.Delay(_debounceDelay, cts.Token);
-                await ResyncShareAsync(shareId);
+                
+                if (share.AccessLevel == AccessLevel.ReadWrite)
+                {
+                    // RW share: rebuild torrent with new files
+                    await ResyncShareAsync(shareId);
+                }
+                else
+                {
+                    // RO share: restore correct files via hash check
+                    await RestoreReadOnlyShareAsync(shareId);
+                }
             }
             catch (OperationCanceledException)
             {
@@ -303,9 +339,35 @@ public sealed class SyncEngine : IAsyncDisposable
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"Error resyncing share {shareId}: {ex.Message}");
+                Console.WriteLine($"Error handling file change for share {shareId}: {ex.Message}");
             }
         });
+    }
+
+    /// <summary>
+    /// Restores a RO share to match the creator's state by re-verifying and re-downloading modified files.
+    /// </summary>
+    private async Task RestoreReadOnlyShareAsync(string shareId)
+    {
+        if (!_shareConfigs.TryGetValue(shareId, out var share))
+            return;
+
+        if (!_activeShares.TryGetValue(shareId, out var manager))
+            return;
+
+        Console.WriteLine($"[SEED] RO share {shareId}: Local changes detected, restoring correct state...");
+
+        // First, clean up any extra files that shouldn't exist
+        await CleanupExtraFilesAsync(share, shareId);
+
+        // Then trigger a hash check to find and re-download any modified files
+        // This will mark corrupted/modified pieces as needing download
+        if (manager.State == TorrentState.Seeding || manager.State == TorrentState.Stopped)
+        {
+            Console.WriteLine($"[SEED] RO share {shareId}: Starting hash check to detect modifications...");
+            await manager.HashCheckAsync(autoStart: true);
+            Console.WriteLine($"[SEED] RO share {shareId}: Hash check complete. State: {manager.State}");
+        }
     }
 
     private async Task ResyncShareAsync(string shareId)
@@ -338,6 +400,13 @@ public sealed class SyncEngine : IAsyncDisposable
 
         // Recreate the torrent with current files
         await StartSyncingShareAsync(share, null);
+
+        // Update signal torrent to broadcast new content hash to joiners
+        if (share.IsCreator)
+        {
+            Console.WriteLine($"[SEED] Creator content updated, broadcasting new hash to joiners...");
+            await UpdateSignalTorrentAsync(share);
+        }
 
         // Raise event
         ShareChanged?.Invoke(this, new ShareChangedEventArgs(shareId, ShareChangeType.FilesUpdated));
@@ -387,8 +456,8 @@ public sealed class SyncEngine : IAsyncDisposable
         // machines to use different folder names/locations.
         var torrentSettings = new TorrentSettingsBuilder { CreateContainingDirectory = false }.ToSettings();
 
-        // Determine if we're the creator (have keys) or joiner (keys is null)
-        bool isCreator = keys != null;
+        // Use the share's IsCreator flag to determine behavior
+        bool isCreator = share.IsCreator;
         Console.WriteLine($"[SEED] Share {share.Id}: isCreator={isCreator}, torrentExists={File.Exists(torrentPath)}");
 
         if (File.Exists(torrentPath))
@@ -484,8 +553,352 @@ public sealed class SyncEngine : IAsyncDisposable
         _shareConfigs[share.Id] = share;
         share.Status = ShareStatus.Syncing;
 
-        // Start watching for file changes (ReadWrite shares only)
+        // Store the current content hash (for update detection)
+        if (manager.Torrent != null)
+        {
+            _currentContentHashes[share.Id] = manager.Torrent.InfoHash.ToArray();
+            Console.WriteLine($"[SEED] Content hash for {share.Id}: {Convert.ToHexString(manager.Torrent.InfoHash.ToArray())}");
+        }
+
+        // Start watching for file changes
         SetupFileWatcher(share);
+        
+        // For creators: announce current content hash via signal torrent
+        if (isCreator)
+        {
+            await UpdateSignalTorrentAsync(share);
+        }
+        // For joiners: start monitoring for updates from creators
+        else
+        {
+            await StartJoinerSignalMonitorAsync(share);
+        }
+    }
+
+    /// <summary>
+    /// Starts monitoring the signal swarm for content hash updates from creators.
+    /// </summary>
+    private async Task StartJoinerSignalMonitorAsync(Share share)
+    {
+        // Use the derived hash to find the creator's signal torrent
+        var signalHash = KeyGenerator.DeriveInfoHash(share.Id);
+        var signalHashHex = Convert.ToHexString(signalHash).ToLowerInvariant();
+        var trParams = string.Join("", GetDefaultTrackers().Select(u => $"&tr={Uri.EscapeDataString(u)}"));
+        var signalMagnetUri = $"magnet:?xt=urn:btih:{signalHashHex}&dn=signal_{share.Id}{trParams}";
+
+        Console.WriteLine($"[SEED] Joiner starting signal monitor for {share.Id}");
+        Console.WriteLine($"[SEED] Signal magnet: {signalMagnetUri}");
+
+        try
+        {
+            var signalMagnet = MagnetLink.Parse(signalMagnetUri);
+            var signalSettings = new TorrentSettingsBuilder { CreateContainingDirectory = false }.ToSettings();
+            
+            var signalPath = Path.Combine(_dataPath, "signals", share.Id);
+            Directory.CreateDirectory(signalPath);
+            
+            var signalManager = await _engine.AddAsync(signalMagnet, signalPath, signalSettings);
+            
+            // When we get metadata/files from signal torrent, check for content hash
+            signalManager.TorrentStateChanged += async (sender, e) =>
+            {
+                if (e.NewState == TorrentState.Seeding || e.NewState == TorrentState.Downloading)
+                {
+                    await CheckSignalForUpdatesAsync(share.Id);
+                }
+            };
+
+            await signalManager.StartAsync();
+            _signalManagers[share.Id] = signalManager;
+            
+            Console.WriteLine($"[SEED] Signal monitor started for {share.Id}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SEED] Failed to start signal monitor: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Checks the signal torrent for a new content hash from the creator.
+    /// </summary>
+    private async Task CheckSignalForUpdatesAsync(string shareId)
+    {
+        if (!_shareConfigs.TryGetValue(shareId, out var share))
+            return;
+
+        var signalFile = Path.Combine(_dataPath, "signals", shareId, "current_hash.txt");
+        
+        if (!File.Exists(signalFile))
+        {
+            Console.WriteLine($"[SEED] Signal file not yet received for {shareId}");
+            return;
+        }
+
+        try
+        {
+            var newContentHashHex = (await File.ReadAllTextAsync(signalFile)).Trim();
+            if (string.IsNullOrEmpty(newContentHashHex) || newContentHashHex.Length != 40)
+            {
+                Console.WriteLine($"[SEED] Invalid content hash in signal file: {newContentHashHex}");
+                return;
+            }
+
+            var newContentHash = Convert.FromHexString(newContentHashHex);
+            
+            // Compare with current content hash
+            if (_currentContentHashes.TryGetValue(shareId, out var currentHash))
+            {
+                var currentHashHex = Convert.ToHexString(currentHash).ToLowerInvariant();
+                if (currentHashHex == newContentHashHex)
+                {
+                    // Same hash, no update needed
+                    return;
+                }
+
+                Console.WriteLine($"[SEED] New content hash detected for {shareId}!");
+                Console.WriteLine($"[SEED]   Current: {currentHashHex}");
+                Console.WriteLine($"[SEED]   New:     {newContentHashHex}");
+                
+                await SwitchToNewContentAsync(share, newContentHash);
+            }
+            else
+            {
+                // First time - just record the hash
+                _currentContentHashes[shareId] = newContentHash;
+                Console.WriteLine($"[SEED] Initial content hash for {shareId}: {newContentHashHex}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SEED] Error reading signal file: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Creates or updates the signal torrent for a share.
+    /// The signal torrent has a fixed hash (derived from share ID) and contains the current content hash.
+    /// </summary>
+    private async Task UpdateSignalTorrentAsync(Share share)
+    {
+        if (!_currentContentHashes.TryGetValue(share.Id, out var contentHash))
+            return;
+
+        var contentHashHex = Convert.ToHexString(contentHash).ToLowerInvariant();
+        var signalDir = Path.Combine(_dataPath, "signals", share.Id);
+        var signalFile = Path.Combine(signalDir, "current_hash.txt");
+        var signalTorrentPath = Path.Combine(_dataPath, $"signal_{share.Id}.torrent");
+
+        Directory.CreateDirectory(signalDir);
+        
+        // Write the current content hash to a signal file
+        await File.WriteAllTextAsync(signalFile, contentHashHex);
+        Console.WriteLine($"[SEED] Updated signal file for {share.Id}: {contentHashHex}");
+
+        // Stop old signal manager if exists
+        if (_signalManagers.TryGetValue(share.Id, out var oldSignal))
+        {
+            try
+            {
+                await oldSignal.StopAsync();
+                await _engine.RemoveAsync(oldSignal, RemoveMode.CacheDataOnly);
+            }
+            catch { }
+            _signalManagers.Remove(share.Id);
+        }
+
+        // Delete old signal torrent
+        if (File.Exists(signalTorrentPath))
+        {
+            try { File.Delete(signalTorrentPath); } catch { }
+        }
+
+        // Create a new signal torrent containing the hash file
+        var creator = new TorrentCreator();
+        creator.Private = false;
+        
+        var fileSource = new TorrentFileSource(signalDir);
+        var signalTorrentData = await creator.CreateAsync(fileSource);
+        await File.WriteAllBytesAsync(signalTorrentPath, signalTorrentData.Encode());
+
+        // Load and start the signal torrent
+        var signalTorrent = await Torrent.LoadAsync(signalTorrentPath);
+        var signalSettings = new TorrentSettingsBuilder { CreateContainingDirectory = false }.ToSettings();
+        var signalManager = await _engine.AddAsync(signalTorrent, signalDir, signalSettings);
+
+        // Add trackers
+        var trackerManager = signalManager.TrackerManager;
+        foreach (var trackerUrl in GetDefaultTrackers())
+        {
+            try { await trackerManager.AddTrackerAsync(new Uri(trackerUrl)); } catch { }
+        }
+
+        await signalManager.HashCheckAsync(autoStart: true);
+        _signalManagers[share.Id] = signalManager;
+
+        Console.WriteLine($"[SEED] Signal torrent ready for {share.Id}, hash: {Convert.ToHexString(signalTorrent.InfoHash.ToArray())}");
+    }
+
+    /// <summary>
+    /// Announces the current content hash via DHT using the signal hash.
+    /// </summary>
+    private async Task AnnounceContentHashAsync(Share share)
+    {
+        // Announce our content torrent to trackers - this is already done
+        // Also update our signal torrent so joiners can discover the new content hash
+        await UpdateSignalTorrentAsync(share);
+    }
+
+    /// <summary>
+    /// Background loop that checks for updates from creators (for joiner shares).
+    /// </summary>
+    private async Task RunUpdateCheckLoopAsync(CancellationToken cancellationToken)
+    {
+        Console.WriteLine("[SEED] Update check loop started");
+        
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(_updateCheckInterval, cancellationToken);
+                await CheckForUpdatesAsync();
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SEED] Update check error: {ex.Message}");
+            }
+        }
+        
+        Console.WriteLine("[SEED] Update check loop stopped");
+    }
+
+    /// <summary>
+    /// Checks all joiner shares for updates from their creators.
+    /// </summary>
+    private async Task CheckForUpdatesAsync()
+    {
+        foreach (var (shareId, share) in _shareConfigs.ToList())
+        {
+            // Only check joiner shares
+            if (share.IsCreator)
+                continue;
+
+            try
+            {
+                // Always check the signal file for updates
+                await CheckSignalForUpdatesAsync(shareId);
+
+                if (!_activeShares.TryGetValue(shareId, out var currentManager))
+                    continue;
+
+                // If stuck in Metadata state, the signal check above should help
+                if (currentManager.State == TorrentState.Metadata)
+                {
+                    Console.WriteLine($"[SEED] Share {shareId}: Still in Metadata state, waiting for signal...");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[SEED] Error checking updates for {shareId}: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Attempts to fetch the latest content from a creator by re-querying the signal hash.
+    /// </summary>
+    private async Task TryFetchLatestContentAsync(Share share)
+    {
+        // Use the derived hash (signal hash) to find the creator
+        var signalHash = KeyGenerator.DeriveInfoHash(share.Id);
+        var signalHashHex = Convert.ToHexString(signalHash).ToLowerInvariant();
+        
+        // Check if creator is announcing different content
+        // For now, we query the engine's DHT for peers on the signal hash
+        // and see if any of them have different metadata
+        
+        // Simple approach: if we have a stale content hash or no progress,
+        // try to re-add the share using the current key (which may have updated hash)
+        if (_currentContentHashes.TryGetValue(share.Id, out var currentHash))
+        {
+            var currentHashHex = Convert.ToHexString(currentHash).ToLowerInvariant();
+            
+            // Parse the key to see if it has a different embedded hash
+            var parsed = KeyGenerator.ParseKey(share.Key);
+            if (parsed?.InfoHash != null)
+            {
+                var keyHashHex = Convert.ToHexString(parsed.Value.InfoHash).ToLowerInvariant();
+                if (keyHashHex != currentHashHex)
+                {
+                    Console.WriteLine($"[SEED] Share {share.Id}: Key has different hash, switching...");
+                    Console.WriteLine($"[SEED]   Current: {currentHashHex}");
+                    Console.WriteLine($"[SEED]   Key:     {keyHashHex}");
+                    
+                    // Stop current and restart with new hash
+                    await SwitchToNewContentAsync(share, parsed.Value.InfoHash);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Switches a joiner share to a new content hash.
+    /// </summary>
+    private async Task SwitchToNewContentAsync(Share share, byte[] newContentHash)
+    {
+        if (!_activeShares.TryGetValue(share.Id, out var oldManager))
+            return;
+
+        Console.WriteLine($"[SEED] Switching share {share.Id} to new content hash: {Convert.ToHexString(newContentHash)}");
+
+        // Stop old manager
+        try
+        {
+            await oldManager.StopAsync();
+            await _engine.RemoveAsync(oldManager, RemoveMode.CacheDataOnly);
+        }
+        catch
+        {
+            // Ignore
+        }
+        _activeShares.Remove(share.Id);
+
+        // Delete old torrent file
+        var torrentPath = Path.Combine(_dataPath, $"{share.Id}.torrent");
+        if (File.Exists(torrentPath))
+        {
+            try { File.Delete(torrentPath); } catch { }
+        }
+
+        // Start with new hash
+        var newHashHex = Convert.ToHexString(newContentHash).ToLowerInvariant();
+        var trParams = string.Join("", GetDefaultTrackers().Select(u => $"&tr={Uri.EscapeDataString(u)}"));
+        var magnetUri = $"magnet:?xt=urn:btih:{newHashHex}{trParams}";
+
+        var torrentSettings = new TorrentSettingsBuilder { CreateContainingDirectory = false }.ToSettings();
+        var magnet = MagnetLink.Parse(magnetUri);
+        var newManager = await _engine.AddAsync(magnet, share.LocalPath, torrentSettings);
+
+        newManager.TorrentStateChanged += (sender, e) => OnTorrentStateChanged(share.Id, e);
+        newManager.PieceHashed += (sender, e) => OnPieceHashed(share.Id, e);
+
+        // Add trackers
+        var trackerManager = newManager.TrackerManager;
+        foreach (var trackerUrl in GetDefaultTrackers())
+        {
+            try { await trackerManager.AddTrackerAsync(new Uri(trackerUrl)); } catch { }
+        }
+
+        await newManager.StartAsync();
+        
+        _activeShares[share.Id] = newManager;
+        _currentContentHashes[share.Id] = newContentHash;
+        
+        Console.WriteLine($"[SEED] Switched to new content. State: {newManager.State}");
     }
 
     private void OnTorrentStateChanged(string shareId, TorrentStateChangedEventArgs e)
@@ -501,6 +914,12 @@ public sealed class SyncEngine : IAsyncDisposable
                 // Download complete, now seeding
                 share.Status = ShareStatus.UpToDate;
                 ShareChanged?.Invoke(this, new ShareChangedEventArgs(shareId, ShareChangeType.SyncCompleted));
+                
+                // For RO shares, clean up any extra local files that aren't in the torrent
+                if (share.AccessLevel == AccessLevel.ReadOnly)
+                {
+                    _ = Task.Run(() => CleanupExtraFilesAsync(share, shareId));
+                }
                 break;
             case TorrentState.Downloading:
                 share.Status = ShareStatus.Syncing;
@@ -512,6 +931,84 @@ public sealed class SyncEngine : IAsyncDisposable
                 share.Status = ShareStatus.Idle;
                 break;
         }
+    }
+
+    /// <summary>
+    /// Removes files in the local folder that aren't part of the torrent (for RO shares).
+    /// </summary>
+    private async Task CleanupExtraFilesAsync(Share share, string shareId)
+    {
+        try
+        {
+            if (!_activeShares.TryGetValue(shareId, out var manager) || manager.Torrent == null)
+                return;
+
+            // Get the set of expected file paths (relative paths from the torrent)
+            var expectedFiles = new HashSet<string>(
+                manager.Torrent.Files.Select(f => f.Path),
+                StringComparer.OrdinalIgnoreCase);
+
+            Console.WriteLine($"[SEED] RO cleanup: {expectedFiles.Count} expected files");
+
+            // Get all local files
+            var localFiles = Directory.GetFiles(share.LocalPath, "*", SearchOption.AllDirectories);
+            
+            foreach (var localFile in localFiles)
+            {
+                var relativePath = Path.GetRelativePath(share.LocalPath, localFile);
+                
+                // Skip ignored files
+                if (ShouldIgnore(relativePath, share.IgnorePatterns))
+                    continue;
+
+                // If this file isn't in the torrent, delete it
+                if (!expectedFiles.Contains(relativePath))
+                {
+                    try
+                    {
+                        File.Delete(localFile);
+                        Console.WriteLine($"[SEED] RO cleanup: Deleted extra file: {relativePath}");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[SEED] RO cleanup: Failed to delete {relativePath}: {ex.Message}");
+                    }
+                }
+            }
+
+            // Clean up empty directories
+            await CleanupEmptyDirectoriesAsync(share.LocalPath);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[SEED] RO cleanup error: {ex.Message}");
+        }
+    }
+
+    /// <summary>
+    /// Removes empty directories recursively.
+    /// </summary>
+    private static Task CleanupEmptyDirectoriesAsync(string rootPath)
+    {
+        return Task.Run(() =>
+        {
+            foreach (var dir in Directory.GetDirectories(rootPath, "*", SearchOption.AllDirectories)
+                                         .OrderByDescending(d => d.Length)) // Deepest first
+            {
+                try
+                {
+                    if (Directory.GetFileSystemEntries(dir).Length == 0)
+                    {
+                        Directory.Delete(dir);
+                        Console.WriteLine($"[SEED] RO cleanup: Deleted empty directory: {dir}");
+                    }
+                }
+                catch
+                {
+                    // Ignore - directory might have been removed by parent cleanup
+                }
+            }
+        });
     }
 
     private void OnPieceHashed(string shareId, PieceHashedEventArgs e)

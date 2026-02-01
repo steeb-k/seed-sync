@@ -50,6 +50,12 @@ public sealed class Share
     /// Timestamp of when this share was created or added.
     /// </summary>
     public DateTime CreatedAt { get; init; } = DateTime.UtcNow;
+
+    /// <summary>
+    /// True if this peer is the origin creator of the share (created the torrent from local files).
+    /// False if this peer joined an existing share using a key.
+    /// </summary>
+    public bool IsCreator { get; init; } = false;
 }
 
 /// <summary>
