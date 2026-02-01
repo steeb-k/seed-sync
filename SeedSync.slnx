@@ -1,0 +1,13 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SeedSync.App/SeedSync.App.csproj">
+      <Platform Project="x86" />
+    </Project>
+    <Project Path="src/SeedSync.Cli/SeedSync.Cli.csproj" />
+    <Project Path="src/SeedSync.Core/SeedSync.Core.csproj" />
+    <Project Path="src/SeedSync.Daemon/SeedSync.Daemon.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SeedSync.Tests/SeedSync.Tests.csproj" />
+  </Folder>
+</Solution>

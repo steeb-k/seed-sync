@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+  DOTNET_NOLOGO: true
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Get version from tag
+      id: get_version
+      shell: bash
+      run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+    - name: Setup .NET 8.0
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
+    - name: Setup .NET 10.0
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 10.0.x
+
+    - name: Run tests
+      run: dotnet test --configuration Release --verbosity normal
+
+    - name: Publish Daemon (win-x64)
+      run: |
+        dotnet publish src/SeedSync.Daemon/SeedSync.Daemon.csproj `
+          --configuration Release `
+          --runtime win-x64 `
+          --self-contained true `
+          --output dist/win-x64/Daemon `
+          -p:PublishSingleFile=true `
+          -p:IncludeNativeLibrariesForSelfExtract=true `
+          -p:Version=${{ steps.get_version.outputs.VERSION }}
+
+    - name: Publish CLI (win-x64)
+      run: |
+        dotnet publish src/SeedSync.Cli/SeedSync.Cli.csproj `
+          --configuration Release `
+          --runtime win-x64 `
+          --self-contained true `
+          --output dist/win-x64/Cli `
+          -p:PublishSingleFile=true `
+          -p:IncludeNativeLibrariesForSelfExtract=true `
+          -p:Version=${{ steps.get_version.outputs.VERSION }}
+
+    - name: Publish App (win-x64)
+      run: |
+        dotnet publish src/SeedSync.App/SeedSync.App.csproj `
+          --configuration Release `
+          -p:Platform=x64 `
+          -p:Version=${{ steps.get_version.outputs.VERSION }} `
+          --output dist/win-x64/App
+
+    - name: Copy documentation
+      run: |
+        Copy-Item README.md -Destination dist/win-x64/
+        Copy-Item LICENSE -Destination dist/win-x64/ -ErrorAction SilentlyContinue
+        Copy-Item INSTALL.md -Destination dist/win-x64/ -ErrorAction SilentlyContinue
+
+    - name: Create ZIP package
+      run: |
+        Compress-Archive -Path dist/win-x64/* `
+          -DestinationPath dist/SeedSync-${{ steps.get_version.outputs.VERSION }}-win-x64.zip
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        files: |
+          dist/SeedSync-${{ steps.get_version.outputs.VERSION }}-win-x64.zip
+        generate_release_notes: true
+        draft: false
+        prerelease: ${{ contains(steps.get_version.outputs.VERSION, '-') }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "SeedSync.App (Package)": {
+      "commandName": "MsixPackage"
+    },
+    "SeedSync.App (Unpackaged)": {
+      "commandName": "Project"
+    }
+  }
+}
