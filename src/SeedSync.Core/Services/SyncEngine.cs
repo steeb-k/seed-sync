@@ -382,16 +382,16 @@ public sealed class SyncEngine : IAsyncDisposable
         TorrentManager manager;
         bool needsHashCheck = false;
 
-        // MonoTorrent expects savePath to be the PARENT directory when CreateContainingDirectory=true (default).
-        // The torrent name becomes a subdirectory under savePath. So for sharing "C:\path\Drivers",
-        // we pass "C:\path" as savePath and MonoTorrent looks in "C:\path\Drivers\..." which is correct.
-        var parentPath = Path.GetDirectoryName(share.LocalPath) ?? share.LocalPath;
+        // Use CreateContainingDirectory=false so files go directly in the user's specified path,
+        // not in a subdirectory named after the original folder. This allows users on different
+        // machines to use different folder names/locations.
+        var torrentSettings = new TorrentSettingsBuilder { CreateContainingDirectory = false }.ToSettings();
 
         if (File.Exists(torrentPath))
         {
             // Load existing torrent (we likely have the files already)
             var torrent = await Torrent.LoadAsync(torrentPath);
-            manager = await _engine.AddAsync(torrent, parentPath);
+            manager = await _engine.AddAsync(torrent, share.LocalPath, torrentSettings);
             needsHashCheck = true; // Verify local files
         }
         else
@@ -404,7 +404,8 @@ public sealed class SyncEngine : IAsyncDisposable
                 var creator = new TorrentCreator();
                 creator.Private = false;
 
-                // Build file mappings
+                // Build file mappings - use TorrentFileSource with the folder
+                // This creates a multi-file torrent where file paths are relative to the folder
                 var fileSource = new TorrentFileSource(share.LocalPath);
 
                 var torrentInfo = await creator.CreateAsync(fileSource);
@@ -413,14 +414,14 @@ public sealed class SyncEngine : IAsyncDisposable
                 await File.WriteAllBytesAsync(torrentPath, torrentInfo.Encode());
 
                 var torrent = await Torrent.LoadAsync(torrentPath);
-                manager = await _engine.AddAsync(torrent, parentPath);
+                manager = await _engine.AddAsync(torrent, share.LocalPath, torrentSettings);
                 needsHashCheck = true; // We have the files, need to verify
             }
             else
             {
                 // Empty folder - use magnet link to join swarm (joiner path)
                 var magnet = MagnetLink.Parse(magnetUri);
-                manager = await _engine.AddAsync(magnet, parentPath);
+                manager = await _engine.AddAsync(magnet, share.LocalPath, torrentSettings);
                 needsHashCheck = false; // No local files to verify
             }
         }
