@@ -94,6 +94,46 @@ pub struct ScannedFile {
     pub abs_path: PathBuf,
 }
 
+/// A file discovered by [`list_files`]: relative POSIX path, absolute path, and
+/// size — with no content hash (the publish path obtains the hash from the blob
+/// store as it imports the file).
+pub struct ListedFile {
+    pub rel: String,
+    pub abs: PathBuf,
+    pub size: u64,
+}
+
+/// Walk `root` like [`scan`] but **without hashing** file contents: returns the
+/// live (non-ignored, non-symlink) file set with sizes, sorted by relative path
+/// (so the manifest's file order is deterministic). Used by publish, which reads
+/// each file exactly once by importing it into the blob store.
+pub fn list_files(root: &Path, ignore: &IgnoreSet) -> std::io::Result<Vec<ListedFile>> {
+    let mut out = Vec::new();
+    for dent in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !dent.file_type().is_file() {
+            continue;
+        }
+        let Some(rel) = rel_posix(root, dent.path()) else {
+            continue;
+        };
+        if ignore.is_ignored(&rel) {
+            continue;
+        }
+        let size = dent.metadata().map(|m| m.len()).unwrap_or(0);
+        out.push(ListedFile {
+            rel,
+            abs: dent.path().to_path_buf(),
+            size,
+        });
+    }
+    out.sort_by(|a, b| a.rel.cmp(&b.rel));
+    Ok(out)
+}
+
 /// Hash one file with BLAKE3, streaming so large files don't load into memory.
 pub fn hash_file(path: &Path) -> std::io::Result<(Vec<u8>, u64)> {
     let mut hasher = blake3::Hasher::new();

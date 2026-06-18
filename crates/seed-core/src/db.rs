@@ -28,6 +28,10 @@ pub struct ShareRecord {
     /// seedless viewer key. False means `key` is self-contained (a viewer key,
     /// or a full master key in the keystore-unavailable fallback).
     pub seed_in_keyring: bool,
+    /// Cheap (path,size,mtime) folder signature at the last publish. Persisted so
+    /// a restart can tell an unchanged master folder from a changed one and skip
+    /// a needless re-import. 0 means "unknown / republish".
+    pub quick_sig: u64,
 }
 
 /// `Connection` is `Send` but not `Sync`; wrap it so the `Db` (and thus the
@@ -50,9 +54,16 @@ impl Db {
                  ignore     TEXT NOT NULL DEFAULT '',
                  last_seqno INTEGER NOT NULL DEFAULT 0,
                  paused     INTEGER NOT NULL DEFAULT 0,
-                 seed_in_keyring INTEGER NOT NULL DEFAULT 0
+                 seed_in_keyring INTEGER NOT NULL DEFAULT 0,
+                 quick_sig  INTEGER NOT NULL DEFAULT 0
              );",
         )?;
+        // Migration for DBs created before `quick_sig` existed; the error when the
+        // column is already present is expected and ignored.
+        let _ = conn.execute(
+            "ALTER TABLE shares ADD COLUMN quick_sig INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -65,12 +76,12 @@ impl Db {
     /// Insert or replace a share row (used on create/add).
     pub fn upsert_share(&self, r: &ShareRecord) -> anyhow::Result<()> {
         self.lock().execute(
-            "INSERT INTO shares (share_id, key, folder, role_master, ignore, last_seqno, paused, seed_in_keyring)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO shares (share_id, key, folder, role_master, ignore, last_seqno, paused, seed_in_keyring, quick_sig)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(share_id) DO UPDATE SET
                  key=excluded.key, folder=excluded.folder, role_master=excluded.role_master,
                  ignore=excluded.ignore, last_seqno=excluded.last_seqno, paused=excluded.paused,
-                 seed_in_keyring=excluded.seed_in_keyring",
+                 seed_in_keyring=excluded.seed_in_keyring, quick_sig=excluded.quick_sig",
             rusqlite::params![
                 r.share_id,
                 r.key,
@@ -80,6 +91,7 @@ impl Db {
                 r.last_seqno as i64,
                 r.paused as i64,
                 r.seed_in_keyring as i64,
+                r.quick_sig as i64,
             ],
         )?;
         Ok(())
@@ -90,6 +102,15 @@ impl Db {
         self.lock().execute(
             "UPDATE shares SET last_seqno=?2 WHERE share_id=?1",
             rusqlite::params![share_id, seqno as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Persist the folder change-signature for a share (after a publish).
+    pub fn set_quick_sig(&self, share_id: &str, quick_sig: u64) -> anyhow::Result<()> {
+        self.lock().execute(
+            "UPDATE shares SET quick_sig=?2 WHERE share_id=?1",
+            rusqlite::params![share_id, quick_sig as i64],
         )?;
         Ok(())
     }
@@ -114,7 +135,7 @@ impl Db {
     pub fn load_all(&self) -> anyhow::Result<Vec<ShareRecord>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT share_id, key, folder, role_master, ignore, last_seqno, paused, seed_in_keyring FROM shares",
+            "SELECT share_id, key, folder, role_master, ignore, last_seqno, paused, seed_in_keyring, quick_sig FROM shares",
         )?;
         let rows = stmt.query_map([], |row| {
             let ignore_str: String = row.get(4)?;
@@ -131,6 +152,7 @@ impl Db {
                 last_seqno: row.get::<_, i64>(5)? as u64,
                 paused: row.get::<_, i64>(6)? != 0,
                 seed_in_keyring: row.get::<_, i64>(7)? != 0,
+                quick_sig: row.get::<_, i64>(8)? as u64,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -154,10 +176,12 @@ mod tests {
             last_seqno: 3,
             paused: false,
             seed_in_keyring: false,
+            quick_sig: 0,
         };
         db.upsert_share(&rec).unwrap();
         db.set_seqno("abc", 7).unwrap();
         db.set_paused("abc", true).unwrap();
+        db.set_quick_sig("abc", 12345).unwrap();
 
         let all = db.load_all().unwrap();
         assert_eq!(all.len(), 1);
@@ -166,6 +190,7 @@ mod tests {
         assert_eq!(r.ignore, vec!["*.tmp", "node_modules"]);
         assert_eq!(r.last_seqno, 7);
         assert!(r.paused);
+        assert_eq!(r.quick_sig, 12345);
 
         db.remove_share("abc").unwrap();
         assert!(db.load_all().unwrap().is_empty());

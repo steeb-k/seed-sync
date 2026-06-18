@@ -166,49 +166,49 @@ impl PublishJob {
     /// engine lock.
     pub async fn run(&self) -> anyhow::Result<u64> {
         let (ignore_set, _bad) = IgnoreSet::compile(&self.ignore);
-        let scanned = scan::scan(&self.folder, &ignore_set).context("scan folder")?;
+        // List files *without* hashing — the blob import below hashes each file
+        // as it streams it in, so we read every file exactly once (vs. scanning
+        // to hash and then re-reading to import). This also lets progress start
+        // immediately instead of after a full hashing pass.
+        let listed = scan::list_files(&self.folder, &ignore_set).context("scan folder")?;
 
         // Seed the live import progress (bytes) so the GUI can show a moving
         // percent while large files stream in. Cleared in `finish_publish`.
-        let total_bytes: u64 = scanned.iter().map(|sf| sf.entry.size).sum();
+        let total_bytes: u64 = listed.iter().map(|f| f.size).sum();
         let mut done_bytes: u64 = 0;
         self.set_progress(0, total_bytes);
 
         // Write/refresh a doc entry per file (content -> blob), collecting the
         // authoritative file list. Files stream into the blob store by path;
         // never load a whole file into memory.
-        let mut files = Vec::with_capacity(scanned.len());
+        let mut files = Vec::with_capacity(listed.len());
         let mut live_keys: HashSet<Vec<u8>> = HashSet::new();
-        for sf in &scanned {
-            let arr: [u8; 32] = sf
-                .entry
-                .hash
-                .as_slice()
-                .try_into()
-                .context("scanned hash has wrong length")?;
-            let hash = Hash::from(arr);
-            // Hold the temp tag until the doc entry references the hash, so the
-            // freshly-imported blob can't be reclaimed in between.
-            let _tag = self
+        for f in &listed {
+            // The import hashes the content; take that hash for the doc entry +
+            // manifest. Hold the temp tag until the doc references the hash so
+            // the freshly-imported blob can't be reclaimed in between.
+            let tag = self
                 .blobs
                 .blobs()
-                .add_path(&sf.abs_path)
+                .add_path(&f.abs)
                 .temp_tag()
                 .await
-                .with_context(|| format!("import {}", sf.abs_path.display()))?;
+                .with_context(|| format!("import {}", f.abs.display()))?;
+            let hash = tag.hash();
             self.doc
-                .set_hash(
-                    self.author,
-                    sf.entry.path.as_bytes().to_vec(),
-                    hash,
-                    sf.entry.size,
-                )
+                .set_hash(self.author, f.rel.as_bytes().to_vec(), hash, f.size)
                 .await
-                .with_context(|| format!("set doc entry {}", sf.entry.path))?;
-            live_keys.insert(sf.entry.path.as_bytes().to_vec());
-            files.push(sf.entry.clone());
-            done_bytes += sf.entry.size;
+                .with_context(|| format!("set doc entry {}", f.rel))?;
+            files.push(manifest::FileEntry {
+                path: f.rel.clone(),
+                hash: hash.as_bytes().to_vec(),
+                size: f.size,
+                deleted: false,
+            });
+            live_keys.insert(f.rel.as_bytes().to_vec());
+            done_bytes += f.size;
             self.set_progress(done_bytes, total_bytes);
+            drop(tag);
         }
 
         // GC doc entries for files that no longer exist (cosmetic; the manifest
@@ -337,7 +337,8 @@ impl Engine {
                     ),
                 }
             }
-            let state = self
+            let quick_sig = rec.quick_sig;
+            let mut state = self
                 .open_share(
                     &key,
                     &PathBuf::from(&rec.folder),
@@ -347,6 +348,9 @@ impl Engine {
                     rec.paused,
                 )
                 .await?;
+            // Restore the persisted change-signature so an unchanged folder isn't
+            // re-imported on every restart.
+            state.last_quick_sig = quick_sig;
             self.shares.insert(rec.share_id, state);
         }
         if !self.shares.is_empty() {
@@ -659,8 +663,12 @@ impl Engine {
         state.last_seqno = seqno;
         state.last_updated = now_secs();
         let (ig, _) = IgnoreSet::compile(&state.ignore);
-        state.last_quick_sig = scan::quick_signature(&state.folder, &ig);
+        let sig = scan::quick_signature(&state.folder, &ig);
+        state.last_quick_sig = sig;
         let _ = self.db.set_seqno(share_id, seqno);
+        // Persist the signature so a restart skips re-importing an unchanged
+        // folder (an unpersisted sig would always look "changed" => republish).
+        let _ = self.db.set_quick_sig(share_id, sig);
     }
 
     /// Plan the master shares that need a republish (folder changed since last
@@ -732,6 +740,7 @@ impl Engine {
             last_seqno,
             paused,
             seed_in_keyring,
+            quick_sig: 0, // set by finish_publish after the first publish
         })?;
         Ok(())
     }
