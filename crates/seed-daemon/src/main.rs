@@ -268,7 +268,11 @@ async fn throughput_loop(daemon: Daemon) {
     let mut last: Option<(u64, u64)> = None;
     loop {
         tick.tick().await;
-        let (sent, recv) = daemon.engine.lock().await.byte_totals();
+        let (sent, recv, indexing) = {
+            let engine = daemon.engine.lock().await;
+            let (s, r) = engine.byte_totals();
+            (s, r, engine.publishing_active())
+        };
         if let Some((psent, precv)) = last {
             // Counters are monotonic; saturating_sub guards a reset.
             let up = sent.saturating_sub(psent);
@@ -279,6 +283,11 @@ async fn throughput_loop(daemon: Daemon) {
             });
         }
         last = Some((sent, recv));
+        // While an off-lock import is running, nudge clients to re-query so the
+        // indexing percent visibly advances.
+        if indexing {
+            let _ = daemon.events.send(IpcEvent::ShareListChanged);
+        }
     }
 }
 

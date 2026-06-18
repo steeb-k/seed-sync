@@ -449,6 +449,22 @@ fn share_row(s: &ShareSummary, net: &Net) -> gtk::ListBoxRow {
     let status_txt = match s.status {
         ShareStatus::Healthy => format!("Healthy {}%", s.percent),
         ShareStatus::Syncing => format!("Syncing {}%", s.percent),
+        ShareStatus::Indexing => {
+            // Show "Indexing 13.4/29.0 GB (46%)", picking GB vs MB off the total.
+            let (div, unit) = if s.index_total >= 1 << 30 {
+                (1u64 << 30, "GB")
+            } else {
+                (1u64 << 20, "MB")
+            };
+            let v = |b: u64| b as f64 / div as f64;
+            format!(
+                "Indexing {:.1}/{:.1} {} ({}%)",
+                v(s.indexed_bytes),
+                v(s.index_total),
+                unit,
+                s.percent
+            )
+        }
         ShareStatus::Paused => "Paused".into(),
         ShareStatus::Error => "Error".into(),
     };

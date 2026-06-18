@@ -153,6 +153,9 @@ pub enum Role {
 pub enum ShareStatus {
     Healthy,
     Syncing,
+    /// Master is hashing + importing the local folder into the content store
+    /// (the initial publish or a republish). `percent`/`indexed_bytes` track it.
+    Indexing,
     Paused,
     Error,
 }
@@ -168,6 +171,10 @@ pub struct ShareSummary {
     pub online: u32,
     pub total: u32,
     pub paused: bool,
+    /// While `status == Indexing`: bytes imported so far and the total to import.
+    /// Both 0 otherwise.
+    pub indexed_bytes: u64,
+    pub index_total: u64,
     /// Unix seconds of the last successful sync/publish for this share (0 if never).
     pub last_updated: i64,
 }

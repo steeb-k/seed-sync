@@ -146,11 +146,18 @@ pub struct PublishJob {
     share_id_bytes: Vec<u8>,
     author: AuthorId,
     last_seqno: u64,
+    progress: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
 }
 
 impl PublishJob {
     pub fn share_id(&self) -> &str {
         &self.share_id
+    }
+
+    fn set_progress(&self, done: u64, total: u64) {
+        if let Ok(mut m) = self.progress.lock() {
+            m.insert(self.share_id.clone(), (done, total));
+        }
     }
 
     /// Scan the folder, stream each file into the blob store by path, refresh the
@@ -160,6 +167,12 @@ impl PublishJob {
     pub async fn run(&self) -> anyhow::Result<u64> {
         let (ignore_set, _bad) = IgnoreSet::compile(&self.ignore);
         let scanned = scan::scan(&self.folder, &ignore_set).context("scan folder")?;
+
+        // Seed the live import progress (bytes) so the GUI can show a moving
+        // percent while large files stream in. Cleared in `finish_publish`.
+        let total_bytes: u64 = scanned.iter().map(|sf| sf.entry.size).sum();
+        let mut done_bytes: u64 = 0;
+        self.set_progress(0, total_bytes);
 
         // Write/refresh a doc entry per file (content -> blob), collecting the
         // authoritative file list. Files stream into the blob store by path;
@@ -194,6 +207,8 @@ impl PublishJob {
                 .with_context(|| format!("set doc entry {}", sf.entry.path))?;
             live_keys.insert(sf.entry.path.as_bytes().to_vec());
             files.push(sf.entry.clone());
+            done_bytes += sf.entry.size;
+            self.set_progress(done_bytes, total_bytes);
         }
 
         // GC doc entries for files that no longer exist (cosmetic; the manifest
@@ -272,6 +287,10 @@ pub struct Engine {
     author: AuthorId,
     shares: HashMap<String, ShareState>,
     db: crate::db::Db,
+    /// Live import progress (`done_bytes`, `total_bytes`) for shares currently
+    /// being published off-lock, keyed by share id. Shared with each in-flight
+    /// [`PublishJob`] so [`Engine::list_summaries`] can report a moving percent.
+    progress: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
 }
 
 impl Engine {
@@ -286,6 +305,7 @@ impl Engine {
             author,
             shares: HashMap::new(),
             db,
+            progress: Arc::new(StdMutex::new(HashMap::new())),
         };
         engine.reload_shares().await?;
         Ok(engine)
@@ -420,7 +440,14 @@ impl Engine {
     }
 
     /// Build IPC summaries for all shares.
+    /// Whether any share is currently being published/indexed off-lock. Used by
+    /// the daemon to keep emitting refresh events so the GUI's progress moves.
+    pub fn publishing_active(&self) -> bool {
+        self.progress.lock().map(|m| !m.is_empty()).unwrap_or(false)
+    }
+
     pub fn list_summaries(&self) -> Vec<seed_ipc::ShareSummary> {
+        let progress = self.progress.lock().map(|m| m.clone()).unwrap_or_default();
         self.shares
             .iter()
             .map(|(id, s)| {
@@ -433,12 +460,18 @@ impl Engine {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| id.clone());
-                let status = if s.paused {
-                    seed_ipc::ShareStatus::Paused
+                // An active progress entry means we're importing the folder now;
+                // report a moving percent. Otherwise fall back to the binary
+                // healthy/syncing state.
+                let (status, percent, indexed_bytes, index_total) = if s.paused {
+                    (seed_ipc::ShareStatus::Paused, 0, 0, 0)
+                } else if let Some(&(done, tot)) = progress.get(id) {
+                    let pct = (done.min(tot) * 100).checked_div(tot).unwrap_or(0) as u8;
+                    (seed_ipc::ShareStatus::Indexing, pct, done, tot)
                 } else if s.last_seqno > 0 {
-                    seed_ipc::ShareStatus::Healthy
+                    (seed_ipc::ShareStatus::Healthy, 100, 0, 0)
                 } else {
-                    seed_ipc::ShareStatus::Syncing
+                    (seed_ipc::ShareStatus::Syncing, 0, 0, 0)
                 };
                 let (online, total) = s.roster.lock().map(|r| r.counts()).unwrap_or((0, 0));
                 seed_ipc::ShareSummary {
@@ -447,10 +480,12 @@ impl Engine {
                     folder: s.folder.to_string_lossy().into_owned(),
                     role,
                     status,
-                    percent: if s.last_seqno > 0 { 100 } else { 0 },
+                    percent,
                     online,
                     total,
                     paused: s.paused,
+                    indexed_bytes,
+                    index_total,
                     last_updated: s.last_updated,
                 }
             })
@@ -582,6 +617,7 @@ impl Engine {
     fn make_job(&mut self, share_id: &str) -> anyhow::Result<Option<PublishJob>> {
         let blobs = self.node.blobs.clone();
         let author = self.author;
+        let progress = self.progress.clone();
         let Some(state) = self.shares.get_mut(share_id) else {
             return Ok(None);
         };
@@ -602,6 +638,7 @@ impl Engine {
             share_id_bytes: state.key.share_id().to_vec(),
             author,
             last_seqno: state.last_seqno,
+            progress,
         }))
     }
 
@@ -609,6 +646,9 @@ impl Engine {
     /// `new_seqno` is `Some` on success (advances the watermark + persists the
     /// seqno) and `None` on failure (just clears the guard).
     pub fn finish_publish(&mut self, share_id: &str, new_seqno: Option<u64>) {
+        if let Ok(mut m) = self.progress.lock() {
+            m.remove(share_id);
+        }
         let Some(state) = self.shares.get_mut(share_id) else {
             return;
         };
