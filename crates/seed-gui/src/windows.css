@@ -24,10 +24,22 @@ entry,
   border-radius: 8px;
 }
 
+/* Pull the window controls flush to the top-right corner (kill the default
+ * header padding/margin on that side) so the close button reaches the edge. */
+headerbar {
+  padding-right: 0;
+}
+
+windowcontrols {
+  margin-right: 0;
+  margin-left: 0;
+}
+
 /* Window control buttons: Windows 11 style — rectangular, full title-bar height,
- * subtle hover, and a red close button. (Restyles GTK's client-side controls
- * rather than the GNOME-ish circular default.) */
-windowcontrols > button.titlebutton {
+ * subtle hover, and a red close button. The GTK controls here carry the
+ * `image-button` + `minimize`/`maximize`/`close` classes (not `titlebutton`),
+ * scoped under `windowcontrols`. */
+windowcontrols button {
   border-radius: 0;
   min-width: 44px;
   min-height: 34px;
@@ -37,16 +49,35 @@ windowcontrols > button.titlebutton {
   box-shadow: none;
 }
 
-windowcontrols > button.titlebutton:hover {
+windowcontrols button:hover {
   background-color: alpha(@window_fg_color, 0.09);
 }
 
-windowcontrols > button.titlebutton.close:hover {
+/* The icon's own node carries a circular background in Adwaita — flatten it so
+ * only the button's square highlight shows. */
+windowcontrols button image {
+  background: none;
+  background-color: transparent;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+/* Round only the close button's top-right corner to match the window corner, so
+ * its hover highlight tucks into the rounded corner (Windows 11 style). */
+windowcontrols button.close {
+  border-top-right-radius: 8px;
+}
+
+windowcontrols button.close:hover {
   background-color: #c42b1c;
   color: #ffffff;
 }
 
-windowcontrols > button.titlebutton.close:active {
+windowcontrols button.close:hover image {
+  color: #ffffff;
+}
+
+windowcontrols button.close:active {
   background-color: #b0271a;
   color: #ffffff;
 }

@@ -231,7 +231,9 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
     gear_box.append(&quit_btn);
     gear_popover.set_child(Some(&gear_box));
     gear_btn.set_popover(Some(&gear_popover));
-    header.pack_end(&gear_btn);
+    // Packed on the left beside "+": the top-right corner now belongs to the
+    // window controls (and the close button's rounded corner), so keep it clear.
+    header.pack_start(&gear_btn);
 
     // --- share list ---
     let listbox = gtk::ListBox::builder()
