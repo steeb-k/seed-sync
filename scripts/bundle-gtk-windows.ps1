@@ -43,11 +43,20 @@ Copy-Item "$GtkRoot\share\glib-2.0\schemas\*.xml" $schemas -ErrorAction Silently
 & "$gbin\glib-compile-schemas.exe" $schemas
 
 # 4. gdk-pixbuf loaders (+ cache) — required for PNG/SVG icons.
+# query-loaders always emits ABSOLUTE module paths, and `--update-cache` writes
+# the cache to GTK's compiled-in default location (e.g. C:\gtk\...), not here.
+# So we capture stdout and rewrite the paths RELATIVE to the cache directory,
+# which keeps the tree relocatable (works after the MSI installs it elsewhere).
 $loaders = "$dist\lib\gdk-pixbuf-2.0\2.10.0\loaders"
 New-Item -ItemType Directory -Force -Path $loaders | Out-Null
 Copy-Item "$GtkRoot\lib\gdk-pixbuf-2.0\2.10.0\loaders\*.dll" $loaders
-$env:GDK_PIXBUF_MODULEDIR = $loaders
-& "$gbin\gdk-pixbuf-query-loaders.exe" --update-cache
+$cache = "$dist\lib\gdk-pixbuf-2.0\2.10.0\loaders.cache"
+$cacheDir = (Split-Path $cache).Replace('\', '/')
+[string[]]$loaderNames = Get-ChildItem "$loaders\*.dll" | Select-Object -ExpandProperty Name
+Push-Location $loaders
+$cacheText = & "$gbin\gdk-pixbuf-query-loaders.exe" $loaderNames
+Pop-Location
+($cacheText | ForEach-Object { $_.Replace("$cacheDir/", '') }) | Set-Content -Encoding ASCII $cache
 
 # 5. Icon theme (Adwaita + hicolor) + cache.
 New-Item -ItemType Directory -Force -Path "$dist\share\icons" | Out-Null
