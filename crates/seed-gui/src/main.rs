@@ -507,59 +507,129 @@ fn share_row(s: &ShareSummary, net: &Net) -> gtk::ListBoxRow {
     row
 }
 
-/// Create flow: pick a folder, then create the share and show the keys.
+/// Default ignore patterns offered when creating a share.
+const DEFAULT_IGNORE: &str = ".DS_Store\nThumbs.db\ndesktop.ini\n*.tmp\n*~";
+
+/// Create flow: pick a folder, then show the ignore-list editor before creating.
 fn create_share_flow(window: &adw::ApplicationWindow, net: &Net) {
     let dialog = gtk::FileDialog::builder()
         .title("Choose a folder to share")
         .build();
     let net = net.clone();
-    let window2 = window.clone();
+    let win = window.clone();
     dialog.select_folder(Some(window), gio::Cancellable::NONE, move |res| {
         if let Ok(folder) = res {
             if let Some(path) = folder.path() {
-                net.send(
-                    IpcRequest::CreateShare {
-                        folder: path.to_string_lossy().into_owned(),
-                        generate_ignore: false,
-                        ignore: vec![],
-                    },
-                    {
-                        let net = net.clone();
-                        move |res| match res {
-                            Ok(IpcResponse::ShareCreated {
-                                master_key,
-                                viewer_key,
-                                ..
-                            }) => {
-                                // Fetch the bootstrap address to show alongside.
-                                net.send(IpcRequest::NodeAddr, {
-                                    let master_key = master_key.clone();
-                                    let viewer_key = viewer_key.clone();
-                                    move |r| {
-                                        let bootstrap = match r {
-                                            Ok(IpcResponse::NodeAddr(a)) => a,
-                                            _ => String::new(),
-                                        };
-                                        Some(UiMsg::Created {
-                                            master: master_key,
-                                            viewer: viewer_key,
-                                            bootstrap,
-                                        })
-                                    }
-                                });
-                                None
-                            }
-                            Ok(IpcResponse::Err(e)) => {
-                                Some(UiMsg::Toast(format!("create failed: {e}")))
-                            }
-                            _ => Some(UiMsg::Toast("create failed".into())),
-                        }
-                    },
-                );
-                let _ = &window2;
+                show_create_dialog(&win, &net, path);
             }
         }
     });
+}
+
+/// Dialog to review the folder + edit ignore patterns, then create the share.
+fn show_create_dialog(window: &adw::ApplicationWindow, net: &Net, folder: PathBuf) {
+    let dialog = gtk::Window::builder()
+        .title("Create share")
+        .transient_for(window)
+        .modal(true)
+        .default_width(480)
+        .default_height(360)
+        .build();
+    let vbox = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_start(16)
+        .margin_end(16)
+        .margin_top(16)
+        .margin_bottom(16)
+        .build();
+
+    vbox.append(
+        &gtk::Label::builder()
+            .label(format!("Folder: {}", folder.to_string_lossy()))
+            .halign(gtk::Align::Start)
+            .ellipsize(gtk::pango::EllipsizeMode::Middle)
+            .css_classes(["dim-label"])
+            .build(),
+    );
+    vbox.append(
+        &gtk::Label::builder()
+            .label("Ignore patterns (one glob per line)")
+            .halign(gtk::Align::Start)
+            .css_classes(["caption-heading"])
+            .build(),
+    );
+
+    let text = gtk::TextView::builder().monospace(true).build();
+    text.buffer().set_text(DEFAULT_IGNORE);
+    let scroller = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .min_content_height(140)
+        .child(&text)
+        .build();
+    vbox.append(&scroller);
+
+    let create = gtk::Button::builder()
+        .label("Create share")
+        .css_classes(["suggested-action"])
+        .build();
+    {
+        let net = net.clone();
+        let dialog = dialog.clone();
+        create.connect_clicked(move |_| {
+            let buf = text.buffer();
+            let body = buf
+                .text(&buf.start_iter(), &buf.end_iter(), false)
+                .to_string();
+            let ignore: Vec<String> = body
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty())
+                .collect();
+            submit_create(&net, folder.clone(), ignore);
+            dialog.close();
+        });
+    }
+    vbox.append(&create);
+    dialog.set_child(Some(&vbox));
+    dialog.present();
+}
+
+/// Send the CreateShare request and, on success, fetch the bootstrap address to
+/// show alongside the generated keys.
+fn submit_create(net: &Net, folder: PathBuf, ignore: Vec<String>) {
+    net.send(
+        IpcRequest::CreateShare {
+            folder: folder.to_string_lossy().into_owned(),
+            generate_ignore: false,
+            ignore,
+        },
+        {
+            let net = net.clone();
+            move |res| match res {
+                Ok(IpcResponse::ShareCreated {
+                    master_key,
+                    viewer_key,
+                    ..
+                }) => {
+                    net.send(IpcRequest::NodeAddr, move |r| {
+                        let bootstrap = match r {
+                            Ok(IpcResponse::NodeAddr(a)) => a,
+                            _ => String::new(),
+                        };
+                        Some(UiMsg::Created {
+                            master: master_key,
+                            viewer: viewer_key,
+                            bootstrap,
+                        })
+                    });
+                    None
+                }
+                Ok(IpcResponse::Err(e)) => Some(UiMsg::Toast(format!("create failed: {e}"))),
+                _ => Some(UiMsg::Toast("create failed".into())),
+            }
+        },
+    );
 }
 
 /// Add flow: enter a key (+ optional bootstrap), pick a folder, add the share.
