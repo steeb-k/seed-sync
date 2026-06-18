@@ -53,12 +53,13 @@ directories = "5"
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 # --- gui (binding versions track installed GTK 4.22 / libadwaita 1.9) ---
-gtk = { package = "gtk4", version = "0.11" }
-adw = { package = "libadwaita", version = "0.9" }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_10"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_4"] }
 glib = "0.22"
 
 # --- platform / ipc ---
 interprocess = { version = "2", features = ["tokio"] }
+tray-icon = "0.24"
 
 # --- diagnostics / cli ---
 tracing = "0.1"

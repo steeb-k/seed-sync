@@ -10,15 +10,20 @@ name = "seed-gui"
 path = "src/main.rs"
 
 [dependencies]
-seed-ipc = { path = "../seed-ipc" }
+seed-ipc = { path = "../seed-ipc", features = ["transport"] }
 gtk.workspace = true
 adw.workspace = true
 glib.workspace = true
 tokio.workspace = true
-tokio-util.workspace = true
-interprocess.workspace = true
 futures-lite.workspace = true
 async-channel.workspace = true
+directories.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+
+# Tray is wired on Windows/macOS (the primary targets for it). On Linux the
+# tray-icon backend pulls GTK3/appindicator which clashes with our GTK4 app, so
+# the Linux tray is a no-op for now (tracked for a later ksni-based pass).
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+tray-icon.workspace = true

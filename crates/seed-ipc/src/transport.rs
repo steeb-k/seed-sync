@@ -67,3 +67,34 @@ pub fn bind(path: &Path) -> io::Result<Listener> {
 pub async fn accept(listener: &Listener) -> io::Result<Stream> {
     listener.accept().await
 }
+
+/// Open a one-shot connection, send a single request, and return its correlated
+/// response (skipping any pushed events). Used by the CLI and GUI command paths.
+pub async fn oneshot_request(
+    path: &Path,
+    req: crate::IpcRequest,
+) -> io::Result<crate::IpcResponse> {
+    let stream = connect(path).await?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    write_frame(
+        &mut writer,
+        &Frame {
+            id: 1,
+            body: crate::Message::Request(req),
+        },
+    )
+    .await?;
+    loop {
+        let Some(frame) = read_frame(&mut reader).await? else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "daemon closed without responding",
+            ));
+        };
+        if frame.id == 1 {
+            if let crate::Message::Response(resp) = frame.body {
+                return Ok(resp);
+            }
+        }
+    }
+}
