@@ -181,10 +181,33 @@ async fn two_daemons_sync_over_ipc() -> anyhow::Result<()> {
         },
     )
     .await?;
-    assert!(matches!(resp, IpcResponse::ShareAdded { .. }), "{resp:?}");
+    let IpcResponse::ShareAdded { share_id } = resp else {
+        anyhow::bail!("expected ShareAdded, got {resp:?}");
+    };
 
     // 1. Initial sync.
     wait_until_match(&b_folder, &snapshot(&a_folder)).await?;
+
+    // Membership: the viewer should now see the master as a peer. Poll briefly,
+    // since neighbor events arrive slightly after the first content.
+    let mut saw_peer = false;
+    for _ in 0..40 {
+        if let IpcResponse::Peers(peers) = request(
+            &b_sock,
+            IpcRequest::GetPeers {
+                share_id: share_id.clone(),
+            },
+        )
+        .await?
+        {
+            if peers.iter().any(|p| p.online) {
+                saw_peer = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(saw_peer, "viewer never saw the master as an online peer");
 
     // 2. Update + add + delete on master; reconcile loop auto-republishes.
     std::fs::write(a_folder.join("readme.txt"), b"hello v2")?;

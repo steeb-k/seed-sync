@@ -300,7 +300,10 @@ async fn handle_request(daemon: &Daemon, req: IpcRequest) -> anyhow::Result<IpcR
             IpcResponse::Ok
         }
         IpcRequest::SetSettings(_) => IpcResponse::Ok,
-        IpcRequest::GetPeers { .. } => IpcResponse::Peers(vec![]),
+        IpcRequest::GetPeers { share_id } => {
+            let engine = daemon.engine.lock().await;
+            IpcResponse::Peers(engine.peers(&share_id)?)
+        }
         IpcRequest::GetSettings => IpcResponse::Settings(seed_ipc::Settings::default()),
         IpcRequest::Subscribe => IpcResponse::Ok, // handled before dispatch
     })

@@ -16,7 +16,7 @@ use std::time::Duration;
 use adw::prelude::*;
 use gtk::{gio, glib};
 use seed_ipc::transport::oneshot_request;
-use seed_ipc::{IpcRequest, IpcResponse, Role, ShareStatus, ShareSummary};
+use seed_ipc::{IpcRequest, IpcResponse, PeerInfo, Role, ShareStatus, ShareSummary};
 use tokio::runtime::Handle;
 
 const APP_ID: &str = "io.github.steeb_k.SeedSync";
@@ -34,6 +34,7 @@ enum UiMsg {
         viewer: String,
     },
     NodeAddr(String),
+    Peers(Vec<PeerInfo>),
     Toast(String),
 }
 
@@ -263,6 +264,7 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
                         "Hand this to a peer as the bootstrap address when adding the share.",
                         &a,
                     ),
+                    UiMsg::Peers(peers) => show_peers_dialog(&window, &peers),
                     UiMsg::Toast(t) => toast_overlay.add_toast(adw::Toast::new(&t)),
                 }
             }
@@ -372,13 +374,28 @@ fn share_row(s: &ShareSummary, net: &Net) -> gtk::ListBoxRow {
         .build();
     hbox.append(&status);
 
-    // members
-    let members = gtk::Label::builder()
-        .label(format!("{} of {}", s.online, s.total))
-        .halign(gtk::Align::End)
-        .css_classes(["dim-label"])
-        .width_chars(8)
+    // members (clickable -> peers dialog)
+    let members = gtk::Button::builder()
+        .label(format!("{} of {} ▸", s.online, s.total))
+        .tooltip_text("View peers")
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
         .build();
+    {
+        let net = net.clone();
+        let id = s.share_id.clone();
+        members.connect_clicked(move |_| {
+            net.send(
+                IpcRequest::GetPeers {
+                    share_id: id.clone(),
+                },
+                |res| match res {
+                    Ok(IpcResponse::Peers(p)) => Some(UiMsg::Peers(p)),
+                    _ => Some(UiMsg::Toast("could not load peers".into())),
+                },
+            );
+        });
+    }
     hbox.append(&members);
 
     // reveal keys (master only)
@@ -648,6 +665,64 @@ fn show_text_dialog(window: &adw::ApplicationWindow, title: &str, subtitle: &str
             .build(),
     );
     vbox.append(&key_field(title, text));
+    let close = gtk::Button::with_label("Close");
+    {
+        let dialog = dialog.clone();
+        close.connect_clicked(move |_| dialog.close());
+    }
+    vbox.append(&close);
+    dialog.set_child(Some(&vbox));
+    dialog.present();
+}
+
+/// Show the peers known for a share.
+fn show_peers_dialog(window: &adw::ApplicationWindow, peers: &[PeerInfo]) {
+    let dialog = gtk::Window::builder()
+        .title("Peers")
+        .transient_for(window)
+        .modal(true)
+        .default_width(420)
+        .default_height(320)
+        .build();
+    let vbox = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_start(16)
+        .margin_end(16)
+        .margin_top(16)
+        .margin_bottom(16)
+        .build();
+
+    if peers.is_empty() {
+        vbox.append(
+            &gtk::Label::builder()
+                .label("No peers seen yet.")
+                .css_classes(["dim-label"])
+                .build(),
+        );
+    } else {
+        let list = gtk::ListBox::builder().css_classes(["boxed-list"]).build();
+        for p in peers {
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+            row.set_margin_start(8);
+            row.set_margin_end(8);
+            row.set_margin_top(6);
+            row.set_margin_bottom(6);
+            let dot = gtk::Label::new(Some(if p.online { "●" } else { "○" }));
+            dot.set_tooltip_text(Some(if p.online { "online" } else { "offline" }));
+            let id = gtk::Label::builder()
+                .label(&p.node_id)
+                .halign(gtk::Align::Start)
+                .hexpand(true)
+                .css_classes(["monospace"])
+                .build();
+            row.append(&dot);
+            row.append(&id);
+            list.append(&row);
+        }
+        vbox.append(&list);
+    }
+
     let close = gtk::Button::with_label("Close");
     {
         let dialog = dialog.clone();

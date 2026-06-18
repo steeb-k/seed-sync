@@ -16,12 +16,75 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use futures_lite::StreamExt;
 use iroh_blobs::Hash;
-use iroh_docs::{api::Doc, store::Query, sync::Capability, AuthorId, NamespaceId, NamespaceSecret};
+use iroh_docs::{
+    api::Doc, engine::LiveEvent, store::Query, sync::Capability, AuthorId, NamespaceId,
+    NamespaceSecret,
+};
+
+/// How long since a peer was last heard from before we consider it offline.
+const PEER_ONLINE_TTL_SECS: i64 = 60;
+
+/// Tracks the peers seen for one share, fed by the doc's live events. `total`
+/// is every distinct peer seen since the daemon started; `online` is those that
+/// are currently connected (a neighbor) or heard-from within the TTL.
+#[derive(Default)]
+struct PeerRoster {
+    peers: HashMap<String, PeerEntry>,
+}
+
+struct PeerEntry {
+    neighbor: bool,
+    last_seen: i64,
+}
+
+impl PeerRoster {
+    fn note(&mut self, id: &str, neighbor: Option<bool>) {
+        let e = self.peers.entry(id.to_string()).or_insert(PeerEntry {
+            neighbor: false,
+            last_seen: 0,
+        });
+        e.last_seen = now_secs();
+        if let Some(n) = neighbor {
+            e.neighbor = n;
+        }
+    }
+
+    fn is_online(&self, e: &PeerEntry, now: i64) -> bool {
+        e.neighbor || (now - e.last_seen) < PEER_ONLINE_TTL_SECS
+    }
+
+    fn counts(&self) -> (u32, u32) {
+        let now = now_secs();
+        let online = self
+            .peers
+            .values()
+            .filter(|e| self.is_online(e, now))
+            .count() as u32;
+        (online, self.peers.len() as u32)
+    }
+
+    fn infos(&self) -> Vec<seed_ipc::PeerInfo> {
+        let now = now_secs();
+        self.peers
+            .iter()
+            .map(|(id, e)| seed_ipc::PeerInfo {
+                node_id: id.chars().take(16).collect(),
+                // We can't yet tell a peer's role from doc events; reported as
+                // Viewer as a placeholder until presence carries it.
+                role: seed_ipc::Role::Viewer,
+                online: self.is_online(e, now),
+                last_seen: e.last_seen,
+                have_seqno: 0,
+            })
+            .collect()
+    }
+}
 
 use crate::identity::{Role, ShareKey};
 use crate::manifest::{self, Manifest, SignedManifest};
@@ -62,6 +125,8 @@ struct ShareState {
     last_quick_sig: u64,
     /// When paused, the reconcile loop skips this share.
     paused: bool,
+    /// Live peer membership, updated by the doc event task.
+    roster: Arc<StdMutex<PeerRoster>>,
 }
 
 impl ShareState {
@@ -161,9 +226,10 @@ impl Engine {
             .await
             .context("import namespace")?;
         std::fs::create_dir_all(folder)?;
-        // Subscribe (keeps live sync alive) and register the namespace for
-        // serving + connect to any bootstrap peers.
-        spawn_drain(&doc).await?;
+        // Subscribe (keeps live sync alive + feeds the peer roster) and register
+        // the namespace for serving + connect to any bootstrap peers.
+        let roster = Arc::new(StdMutex::new(PeerRoster::default()));
+        spawn_event_task(&doc, roster.clone()).await?;
         doc.start_sync(bootstrap).await.context("start sync")?;
         Ok(ShareState {
             key: key.clone(),
@@ -173,6 +239,7 @@ impl Engine {
             last_seqno,
             last_quick_sig: 0,
             paused,
+            roster,
         })
     }
 
@@ -192,14 +259,6 @@ impl Engine {
         let ticket = iroh_tickets::endpoint::EndpointTicket::from_str(s)
             .map_err(|e| anyhow!("bad bootstrap ticket: {e}"))?;
         Ok(ticket.endpoint_addr().clone())
-    }
-
-    /// IDs and roles of all loaded shares (for the daemon's reconcile loop).
-    pub fn shares_roles(&self) -> Vec<(String, Role)> {
-        self.shares
-            .iter()
-            .map(|(id, s)| (id.clone(), s.key.role))
-            .collect()
     }
 
     /// Build IPC summaries for all shares.
@@ -223,6 +282,7 @@ impl Engine {
                 } else {
                     seed_ipc::ShareStatus::Syncing
                 };
+                let (online, total) = s.roster.lock().map(|r| r.counts()).unwrap_or((0, 0));
                 seed_ipc::ShareSummary {
                     share_id: id.clone(),
                     name,
@@ -230,12 +290,21 @@ impl Engine {
                     role,
                     status,
                     percent: if s.last_seqno > 0 { 100 } else { 0 },
-                    online: 0,
-                    total: 0,
+                    online,
+                    total,
                     paused: s.paused,
                 }
             })
             .collect()
+    }
+
+    /// Peer membership for a share (for the GUI's "view peers" dialog).
+    pub fn peers(&self, share_id: &str) -> anyhow::Result<Vec<seed_ipc::PeerInfo>> {
+        let state = self
+            .shares
+            .get(share_id)
+            .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
+        Ok(state.roster.lock().map(|r| r.infos()).unwrap_or_default())
     }
 
     /// Reveal the keys for a share. Returns the master key only when this node
@@ -569,13 +638,24 @@ impl Engine {
     }
 }
 
-/// Subscribe to a doc's live events and drain them in a background task. This
-/// keeps the live-sync session active; the daemon will later replace the drain
-/// with real status handling.
-async fn spawn_drain(doc: &Doc) -> anyhow::Result<()> {
+/// Subscribe to a doc's live events in a background task. This keeps the
+/// live-sync session active and feeds the peer roster (neighbor up/down, remote
+/// inserts, sync completions).
+async fn spawn_event_task(doc: &Doc, roster: Arc<StdMutex<PeerRoster>>) -> anyhow::Result<()> {
     let mut events = doc.subscribe().await?;
     tokio::spawn(async move {
         while let Some(ev) = events.next().await {
+            if let Ok(e) = &ev {
+                if let Ok(mut r) = roster.lock() {
+                    match e {
+                        LiveEvent::NeighborUp(pk) => r.note(&pk.to_string(), Some(true)),
+                        LiveEvent::NeighborDown(pk) => r.note(&pk.to_string(), Some(false)),
+                        LiveEvent::InsertRemote { from, .. } => r.note(&from.to_string(), None),
+                        LiveEvent::SyncFinished(se) => r.note(&se.peer.to_string(), None),
+                        _ => {}
+                    }
+                }
+            }
             if std::env::var("SEED_DEBUG_EVENTS").is_ok() {
                 eprintln!("[doc event] {ev:?}");
             }
