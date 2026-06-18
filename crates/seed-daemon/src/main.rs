@@ -211,13 +211,36 @@ pub(crate) async fn serve(
 }
 
 /// Periodically apply updates to viewer shares and republish changed masters.
+///
+/// Master publishes run *off* the engine lock: we plan them under a brief lock,
+/// stream the content while unlocked (so a big folder can't freeze the GUI's
+/// share list), then re-lock briefly to record the result. Viewer applies still
+/// hold the lock.
 async fn reconcile_loop(daemon: Daemon) {
     let mut tick = tokio::time::interval(Duration::from_millis(750));
     loop {
         tick.tick().await;
-        let mut engine = daemon.engine.lock().await;
-        let changed = engine.reconcile_all().await;
-        drop(engine);
+        let mut changed = Vec::new();
+
+        // Masters: plan (brief lock) -> publish (no lock) -> commit (brief lock).
+        let jobs = { daemon.engine.lock().await.plan_publishes() };
+        for job in jobs {
+            let result = job.run().await;
+            let ok = result.is_ok();
+            let id = job.share_id().to_string();
+            if let Err(e) = &result {
+                tracing::warn!("publish {id} failed: {e:#}");
+            }
+            daemon.engine.lock().await.finish_publish(&id, result.ok());
+            if ok {
+                changed.push(id);
+            }
+        }
+
+        // Viewers apply under the lock.
+        let applied = { daemon.engine.lock().await.apply_all_viewers().await };
+        changed.extend(applied);
+
         if !changed.is_empty() {
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
             let ts = now_unix();
@@ -346,10 +369,24 @@ async fn handle_request(daemon: &Daemon, req: IpcRequest) -> anyhow::Result<IpcR
             generate_ignore: _,
             ignore,
         } => {
-            let created = {
+            // Open the share under a brief lock, then stream the initial publish
+            // *without* the lock so a large folder doesn't block other requests
+            // (ListShares, status, etc.). The share is visible in the list while
+            // it publishes.
+            let (created, job) = {
                 let mut engine = daemon.engine.lock().await;
-                engine.create_share(&PathBuf::from(folder), ignore).await?
+                engine.create_open(&PathBuf::from(folder), ignore).await?
             };
+            let _ = daemon.events.send(IpcEvent::ShareListChanged);
+            let result = job.run().await;
+            {
+                let mut engine = daemon.engine.lock().await;
+                match &result {
+                    Ok(seqno) => engine.create_finish(&created.share_id, *seqno).await?,
+                    Err(_) => engine.finish_publish(&created.share_id, None),
+                }
+            }
+            result?;
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
             IpcResponse::ShareCreated {
                 share_id: created.share_id,

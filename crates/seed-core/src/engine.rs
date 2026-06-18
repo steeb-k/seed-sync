@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
+use ed25519_dalek::SigningKey;
 use futures_lite::StreamExt;
-use iroh_blobs::Hash;
+use iroh_blobs::{store::fs::FsStore, Hash};
 use iroh_docs::{
     api::Doc, engine::LiveEvent, store::Query, sync::Capability, AuthorId, NamespaceId,
     NamespaceSecret,
@@ -128,6 +129,111 @@ pub struct CreatedShare {
     pub viewer_key: String,
 }
 
+/// A self-contained unit of publish work holding *cloned* iroh handles, so the
+/// heavy part (scanning the folder + streaming every file into the blob store)
+/// can run with **no engine lock held** — keeping the daemon responsive while a
+/// large folder transfers. Produced under a brief lock by [`Engine::make_job`]
+/// or [`Engine::create_open`], then run via [`PublishJob::run`]; the engine is
+/// only re-locked afterwards (via [`Engine::finish_publish`]) to record the
+/// resulting seqno.
+pub struct PublishJob {
+    share_id: String,
+    folder: PathBuf,
+    ignore: Vec<String>,
+    doc: Doc,
+    blobs: FsStore,
+    signing: SigningKey,
+    share_id_bytes: Vec<u8>,
+    author: AuthorId,
+    last_seqno: u64,
+}
+
+impl PublishJob {
+    pub fn share_id(&self) -> &str {
+        &self.share_id
+    }
+
+    /// Scan the folder, stream each file into the blob store by path, refresh the
+    /// doc, and publish a freshly-signed manifest. Returns the new manifest
+    /// seqno. Touches only the cloned handles, so it is safe to call without the
+    /// engine lock.
+    pub async fn run(&self) -> anyhow::Result<u64> {
+        let (ignore_set, _bad) = IgnoreSet::compile(&self.ignore);
+        let scanned = scan::scan(&self.folder, &ignore_set).context("scan folder")?;
+
+        // Write/refresh a doc entry per file (content -> blob), collecting the
+        // authoritative file list. Files stream into the blob store by path;
+        // never load a whole file into memory.
+        let mut files = Vec::with_capacity(scanned.len());
+        let mut live_keys: HashSet<Vec<u8>> = HashSet::new();
+        for sf in &scanned {
+            let arr: [u8; 32] = sf
+                .entry
+                .hash
+                .as_slice()
+                .try_into()
+                .context("scanned hash has wrong length")?;
+            let hash = Hash::from(arr);
+            // Hold the temp tag until the doc entry references the hash, so the
+            // freshly-imported blob can't be reclaimed in between.
+            let _tag = self
+                .blobs
+                .blobs()
+                .add_path(&sf.abs_path)
+                .temp_tag()
+                .await
+                .with_context(|| format!("import {}", sf.abs_path.display()))?;
+            self.doc
+                .set_hash(
+                    self.author,
+                    sf.entry.path.as_bytes().to_vec(),
+                    hash,
+                    sf.entry.size,
+                )
+                .await
+                .with_context(|| format!("set doc entry {}", sf.entry.path))?;
+            live_keys.insert(sf.entry.path.as_bytes().to_vec());
+            files.push(sf.entry.clone());
+        }
+
+        // GC doc entries for files that no longer exist (cosmetic; the manifest
+        // is authoritative). Skip the manifest control key.
+        let mut existing = std::pin::pin!(self.doc.get_many(Query::all()).await?);
+        let mut stale: Vec<Vec<u8>> = Vec::new();
+        while let Some(entry) = existing.next().await {
+            let entry = entry?;
+            let k = entry.key().to_vec();
+            if k == MANIFEST_KEY {
+                continue;
+            }
+            if !live_keys.contains(&k) {
+                stale.push(k);
+            }
+        }
+        for k in stale {
+            let _ = self.doc.del(self.author, k).await;
+        }
+
+        // Build, sign, and publish the manifest.
+        let seqno = self.last_seqno + 1;
+        let manifest = Manifest::new(
+            self.share_id_bytes.clone(),
+            seqno,
+            now_secs() + MANIFEST_TTL_SECS,
+            files,
+            self.ignore.clone(),
+        );
+        let signed = manifest::sign(&manifest, &self.signing).map_err(|e| anyhow!("sign: {e}"))?;
+        let mut cbor = Vec::new();
+        ciborium::into_writer(&signed, &mut cbor).context("encode signed manifest")?;
+        self.doc
+            .set_bytes(self.author, MANIFEST_KEY.to_vec(), cbor)
+            .await
+            .context("publish manifest")?;
+        Ok(seqno)
+    }
+}
+
 /// In-memory per-share state.
 struct ShareState {
     key: ShareKey,
@@ -141,6 +247,9 @@ struct ShareState {
     last_quick_sig: u64,
     /// When paused, the reconcile loop skips this share.
     paused: bool,
+    /// Set while a [`PublishJob`] for this share is running off-lock, so the
+    /// reconcile loop doesn't start a second concurrent publish of it.
+    publishing: bool,
     /// Live peer membership, updated by the doc event task.
     roster: Arc<StdMutex<PeerRoster>>,
     /// Unix seconds of the last successful publish (master) or applied update
@@ -286,6 +395,7 @@ impl Engine {
             last_seqno,
             last_quick_sig: 0,
             paused,
+            publishing: false,
             roster,
             last_updated: 0,
         })
@@ -396,34 +506,159 @@ impl Engine {
     }
 
     /// Create a brand-new master share for `folder`, returning the (master,
-    /// viewer) key strings. Performs the initial publish.
+    /// viewer) key strings. Performs the initial publish. Convenience wrapper
+    /// that runs every phase under the caller's lock — used by tests and any
+    /// single-threaded caller. The daemon instead drives [`create_open`] →
+    /// [`PublishJob::run`] → [`create_finish`] so the heavy publish runs without
+    /// the engine lock held.
+    ///
+    /// [`create_open`]: Engine::create_open
+    /// [`create_finish`]: Engine::create_finish
     pub async fn create_share(
         &mut self,
         folder: &Path,
         ignore: Vec<String>,
     ) -> anyhow::Result<CreatedShare> {
+        let (created, job) = self.create_open(folder, ignore).await?;
+        match job.run().await {
+            Ok(seqno) => {
+                self.create_finish(&created.share_id, seqno).await?;
+                Ok(created)
+            }
+            Err(e) => {
+                self.finish_publish(&created.share_id, None); // clear the guard
+                Err(e)
+            }
+        }
+    }
+
+    /// Phase 1 of create: mint the key, open the replica, register the share
+    /// (marked publishing), and return a [`PublishJob`] for the initial publish.
+    /// The returned job borrows nothing from `self`, so the caller can drop the
+    /// engine lock before running it.
+    pub async fn create_open(
+        &mut self,
+        folder: &Path,
+        ignore: Vec<String>,
+    ) -> anyhow::Result<(CreatedShare, PublishJob)> {
         let key = ShareKey::generate_master().with_endpoint_id(self.node.endpoint_id_bytes());
         let share_id = key.share_id_hex();
-        tracing::info!(%share_id, "create_share: opening share");
         let state = self
-            .open_share(&key, folder, vec![], ignore.clone(), 0, false)
+            .open_share(&key, folder, vec![], ignore, 0, false)
             .await?;
         self.shares.insert(share_id.clone(), state);
-        tracing::info!(%share_id, "create_share: publishing");
-        self.publish(&share_id).await?; // sets last_seqno
+        let job = self
+            .make_job(&share_id)?
+            .ok_or_else(|| anyhow!("internal: fresh master share is not publishable"))?;
+        Ok((
+            CreatedShare {
+                share_id,
+                master_key: key.encode(),
+                viewer_key: key.encode_viewer(),
+            },
+            job,
+        ))
+    }
 
-        // Persist (with the post-publish seqno), routing the seed to the keystore.
-        let last_seqno = self.shares[&share_id].last_seqno;
-        tracing::info!(%share_id, "create_share: persisting");
-        self.persist_share(&key, folder, ignore, last_seqno, false)
+    /// Phase 3 of create: persist the share (routing the seed to the keystore)
+    /// with the post-publish seqno and clear the publishing guard.
+    pub async fn create_finish(&mut self, share_id: &str, seqno: u64) -> anyhow::Result<()> {
+        let (key, folder, ignore) = {
+            let s = self
+                .shares
+                .get(share_id)
+                .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
+            (s.key.clone(), s.folder.clone(), s.ignore.clone())
+        };
+        self.persist_share(&key, &folder, ignore, seqno, false)
             .await?;
-        tracing::info!(%share_id, "create_share: done");
+        self.finish_publish(share_id, Some(seqno));
+        Ok(())
+    }
 
-        Ok(CreatedShare {
-            share_id,
-            master_key: key.encode(),
-            viewer_key: key.encode_viewer(),
-        })
+    /// Build a [`PublishJob`] for a master share, marking it publishing so the
+    /// reconcile loop won't start a second concurrent publish. Returns `None`
+    /// for an unknown, paused, already-publishing, or viewer (non-master) share.
+    fn make_job(&mut self, share_id: &str) -> anyhow::Result<Option<PublishJob>> {
+        let blobs = self.node.blobs.clone();
+        let author = self.author;
+        let Some(state) = self.shares.get_mut(share_id) else {
+            return Ok(None);
+        };
+        if state.paused || state.publishing {
+            return Ok(None);
+        }
+        let Some(signing) = state.key.signing_key() else {
+            return Ok(None); // viewer: nothing to publish
+        };
+        state.publishing = true;
+        Ok(Some(PublishJob {
+            share_id: share_id.to_string(),
+            folder: state.folder.clone(),
+            ignore: state.ignore.clone(),
+            doc: state.doc.clone(),
+            blobs,
+            signing,
+            share_id_bytes: state.key.share_id().to_vec(),
+            author,
+            last_seqno: state.last_seqno,
+        }))
+    }
+
+    /// Record the result of a [`PublishJob`] and clear its publishing guard.
+    /// `new_seqno` is `Some` on success (advances the watermark + persists the
+    /// seqno) and `None` on failure (just clears the guard).
+    pub fn finish_publish(&mut self, share_id: &str, new_seqno: Option<u64>) {
+        let Some(state) = self.shares.get_mut(share_id) else {
+            return;
+        };
+        state.publishing = false;
+        let Some(seqno) = new_seqno else {
+            return;
+        };
+        state.last_seqno = seqno;
+        state.last_updated = now_secs();
+        let (ig, _) = IgnoreSet::compile(&state.ignore);
+        state.last_quick_sig = scan::quick_signature(&state.folder, &ig);
+        let _ = self.db.set_seqno(share_id, seqno);
+    }
+
+    /// Plan the master shares that need a republish (folder changed since last
+    /// publish), marking each publishing. The returned jobs borrow nothing from
+    /// `self`, so the caller drops the engine lock before running them.
+    pub fn plan_publishes(&mut self) -> Vec<PublishJob> {
+        let due: Vec<String> = self
+            .shares
+            .iter()
+            .filter(|(_, s)| !s.paused && !s.publishing && matches!(s.key.role, Role::Master))
+            .filter(|(_, s)| {
+                let (ig, _) = IgnoreSet::compile(&s.ignore);
+                scan::quick_signature(&s.folder, &ig) != s.last_quick_sig
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        due.into_iter()
+            .filter_map(|id| self.make_job(&id).ok().flatten())
+            .collect()
+    }
+
+    /// Reconcile every (non-paused) viewer share against its latest manifest.
+    /// Returns the ids that changed. Viewers' content download/export streams
+    /// via the blob store, but this still holds the engine lock for now.
+    pub async fn apply_all_viewers(&mut self) -> Vec<String> {
+        let ids: Vec<String> = self
+            .shares
+            .iter()
+            .filter(|(_, s)| !s.paused && matches!(s.key.role, Role::Viewer))
+            .map(|(id, _)| id.clone())
+            .collect();
+        let mut changed = Vec::new();
+        for id in ids {
+            if self.apply(&id).await.unwrap_or(false) {
+                changed.push(id);
+            }
+        }
+        changed
     }
 
     /// Persist a share to the DB, storing a master seed in the OS keystore when
@@ -481,102 +716,21 @@ impl Engine {
     }
 
     /// (Master) Scan the folder and publish a new signed manifest + content.
+    /// Convenience wrapper that runs the whole publish under the caller's lock;
+    /// used by tests and the manual `Publish` IPC. No-op for an unknown, paused,
+    /// already-publishing, or viewer share. The daemon's reconcile loop instead
+    /// uses [`plan_publishes`] + [`PublishJob::run`] + [`finish_publish`] to keep
+    /// the heavy work off the engine lock.
+    ///
+    /// [`plan_publishes`]: Engine::plan_publishes
+    /// [`finish_publish`]: Engine::finish_publish
     pub async fn publish(&mut self, share_id: &str) -> anyhow::Result<()> {
-        let author = self.author;
-        let state = self
-            .shares
-            .get_mut(share_id)
-            .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
-        let signing = state
-            .key
-            .signing_key()
-            .ok_or_else(|| anyhow!("cannot publish: not a master share"))?;
-
-        let ignore = state.ignore_set();
-        let scanned = scan::scan(&state.folder, &ignore).context("scan folder")?;
-
-        // Write/refresh a doc entry per file (content -> blob), and collect the
-        // authoritative file list.
-        let mut files = Vec::with_capacity(scanned.len());
-        let mut live_keys: HashSet<Vec<u8>> = HashSet::new();
-        for sf in &scanned {
-            // Stream the file into the blob store *by path* and record the doc
-            // entry by hash. Never `std::fs::read` the whole file: a shared
-            // folder can hold multi-GB files, and slurping one into a Vec would
-            // blow memory and (under the engine lock) wedge the whole daemon.
-            // `scan` already hashed the file with the same BLAKE3 the blob store
-            // uses, so the imported blob's hash matches `sf.entry.hash`.
-            let arr: [u8; 32] = sf
-                .entry
-                .hash
-                .as_slice()
-                .try_into()
-                .context("scanned hash has wrong length")?;
-            let hash = Hash::from(arr);
-            // Hold the temp tag until the doc entry references the hash, so the
-            // freshly-imported blob can't be reclaimed in between.
-            let _tag = self
-                .node
-                .blobs
-                .blobs()
-                .add_path(&sf.abs_path)
-                .temp_tag()
-                .await
-                .with_context(|| format!("import {}", sf.abs_path.display()))?;
-            state
-                .doc
-                .set_hash(
-                    author,
-                    sf.entry.path.as_bytes().to_vec(),
-                    hash,
-                    sf.entry.size,
-                )
-                .await
-                .with_context(|| format!("set doc entry {}", sf.entry.path))?;
-            live_keys.insert(sf.entry.path.as_bytes().to_vec());
-            files.push(sf.entry.clone());
-        }
-
-        // GC doc entries for files that no longer exist (cosmetic; the manifest
-        // is authoritative). Skip the manifest control key.
-        let mut existing = std::pin::pin!(state.doc.get_many(Query::all()).await?);
-        let mut stale: Vec<Vec<u8>> = Vec::new();
-        while let Some(entry) = existing.next().await {
-            let entry = entry?;
-            let k = entry.key().to_vec();
-            if k == MANIFEST_KEY {
-                continue;
-            }
-            if !live_keys.contains(&k) {
-                stale.push(k);
-            }
-        }
-        for k in stale {
-            let _ = state.doc.del(author, k).await;
-        }
-
-        // Build, sign, and publish the manifest.
-        let seqno = state.last_seqno + 1;
-        let manifest = Manifest::new(
-            state.key.share_id().to_vec(),
-            seqno,
-            now_secs() + MANIFEST_TTL_SECS,
-            files,
-            state.ignore.clone(),
-        );
-        let signed = manifest::sign(&manifest, &signing).map_err(|e| anyhow!("sign: {e}"))?;
-        let mut cbor = Vec::new();
-        ciborium::into_writer(&signed, &mut cbor).context("encode signed manifest")?;
-        state
-            .doc
-            .set_bytes(author, MANIFEST_KEY.to_vec(), cbor)
-            .await
-            .context("publish manifest")?;
-        state.last_seqno = seqno;
-        state.last_quick_sig = scan::quick_signature(&state.folder, &ignore);
-        state.last_updated = now_secs();
-        self.db.set_seqno(share_id, seqno)?;
-        Ok(())
+        let Some(job) = self.make_job(share_id)? else {
+            return Ok(());
+        };
+        let result = job.run().await;
+        self.finish_publish(share_id, result.as_ref().ok().copied());
+        result.map(|_| ())
     }
 
     /// (Master) Publish only if the folder changed since the last publish, using
