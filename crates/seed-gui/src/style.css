@@ -1,0 +1,10 @@
+/* Base styling for all platforms.
+ *
+ * Frameless look: merge the header bar into the window background so the app
+ * reads as one solid surface instead of "a title bar above a contrasted content
+ * panel". The header keeps its controls but loses its distinct band + shadow. */
+
+headerbar {
+  background-color: @window_bg_color;
+  box-shadow: none;
+}

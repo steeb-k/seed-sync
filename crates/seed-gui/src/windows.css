@@ -1,0 +1,25 @@
+/* Windows 11 leaning overrides (layered on top of style.css on Windows only).
+ *
+ * Segoe UI typeface, the Windows accent blue, and slightly rounder controls so
+ * the libadwaita UI feels closer to native Win11 Fluent. */
+
+window,
+popover,
+tooltip {
+  font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+}
+
+/* Windows 11 default accent (blue). Redefining libadwaita's named colors at
+ * application priority recolors accents, switches, progress, etc. */
+@define-color accent_color #005fb8;
+@define-color accent_bg_color #005fb8;
+@define-color accent_fg_color #ffffff;
+
+button {
+  border-radius: 6px;
+}
+
+entry,
+.boxed-list {
+  border-radius: 8px;
+}

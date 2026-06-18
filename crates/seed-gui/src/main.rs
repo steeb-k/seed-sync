@@ -26,11 +26,9 @@ const APP_ID: &str = "io.github.steeb_k.SeedSync";
 /// Messages from the IO side to the UI side.
 enum UiMsg {
     Shares(Vec<ShareSummary>),
-    Created {
-        master: String,
-        viewer: String,
-        bootstrap: String,
-    },
+    /// A share finished being created. Keys are no longer shown automatically —
+    /// the user reveals them on demand from the share's ⋮ menu.
+    Created,
     Keys {
         master: Option<String>,
         viewer: String,
@@ -168,7 +166,27 @@ fn main() -> glib::ExitCode {
     app.run_with_args::<&str>(&[])
 }
 
+/// Install the app stylesheet: a base "frameless" look on every platform, plus a
+/// Windows 11-leaning layer (Segoe UI, accent, rounding) on Windows.
+fn load_css() {
+    let Some(display) = gtk::gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk::CssProvider::new();
+    #[allow(unused_mut)]
+    let mut css = String::from(include_str!("style.css"));
+    #[cfg(windows)]
+    css.push_str(include_str!("windows.css"));
+    provider.load_from_data(&css);
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
 fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
+    load_css();
     let (tx, rx) = async_channel::unbounded::<UiMsg>();
     let net = Net { handle, socket, tx };
 
@@ -196,15 +214,6 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
     add_popover.set_child(Some(&add_box));
     add_btn.set_popover(Some(&add_popover));
     header.pack_start(&add_btn);
-
-    // Folder button (opens the selected share's folder — wired via row buttons;
-    // here it's a convenience that opens the data dir is omitted for now).
-    let folder_btn = gtk::Button::builder()
-        .icon_name("folder-symbolic")
-        .tooltip_text("Open share folder (select a share)")
-        .sensitive(false)
-        .build();
-    header.pack_start(&folder_btn);
 
     // Gear menu: node address + quit.
     let gear_btn = gtk::MenuButton::builder()
@@ -270,7 +279,6 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&header);
     content.append(&scroller);
-    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content.append(&status_bar);
     toast_overlay.set_child(Some(&content));
     window.set_content(Some(&toast_overlay));
@@ -323,13 +331,16 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
                                 updated_lbl.set_text(&format!("Last updated: {}", fmt_time(ts)));
                             }
                         }
-                        rebuild_list(&listbox, &shares, &net);
+                        rebuild_list(&listbox, &shares, &net, &window);
                     }
-                    UiMsg::Created {
-                        master,
-                        viewer,
-                        bootstrap,
-                    } => show_keys_dialog(&window, Some(&master), &viewer, Some(&bootstrap)),
+                    UiMsg::Created => {
+                        // Don't pop the keys dialog automatically — a large folder
+                        // can index for a long time and this is jarring. The keys
+                        // stay available on demand via each share's ⋮ menu.
+                        toast_overlay.add_toast(adw::Toast::new(
+                            "Share created — use its ⋮ menu to reveal the keys",
+                        ));
+                    }
                     UiMsg::Keys { master, viewer } => {
                         show_keys_dialog(&window, master.as_deref(), &viewer, None)
                     }
@@ -372,16 +383,21 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
 }
 
 /// Rebuild the share list rows from the latest summaries.
-fn rebuild_list(listbox: &gtk::ListBox, shares: &[ShareSummary], net: &Net) {
+fn rebuild_list(
+    listbox: &gtk::ListBox,
+    shares: &[ShareSummary],
+    net: &Net,
+    window: &adw::ApplicationWindow,
+) {
     while let Some(child) = listbox.first_child() {
         listbox.remove(&child);
     }
     for s in shares {
-        listbox.append(&share_row(s, net));
+        listbox.append(&share_row(s, net, window));
     }
 }
 
-fn share_row(s: &ShareSummary, net: &Net) -> gtk::ListBoxRow {
+fn share_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> gtk::ListBoxRow {
     let row = gtk::ListBoxRow::new();
     let hbox = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -407,17 +423,24 @@ fn share_row(s: &ShareSummary, net: &Net) -> gtk::ListBoxRow {
     {
         let net = net.clone();
         let id = s.share_id.clone();
+        let name = s.name.clone();
         pause_btn.connect_clicked(move |_| {
-            let req = if paused {
-                IpcRequest::Resume {
-                    share_id: id.clone(),
-                }
+            let (req, msg) = if paused {
+                (
+                    IpcRequest::Resume {
+                        share_id: id.clone(),
+                    },
+                    format!("Resumed “{name}”"),
+                )
             } else {
-                IpcRequest::Pause {
-                    share_id: id.clone(),
-                }
+                (
+                    IpcRequest::Pause {
+                        share_id: id.clone(),
+                    },
+                    format!("Paused “{name}”"),
+                )
             };
-            net.send(req, |_| Some(UiMsg::Toast("updated".into())));
+            net.send(req, move |_| Some(UiMsg::Toast(msg.clone())));
             net.refresh();
         });
     }
@@ -498,17 +521,23 @@ fn share_row(s: &ShareSummary, net: &Net) -> gtk::ListBoxRow {
     }
     hbox.append(&members);
 
-    // reveal keys (master only)
+    // per-share actions menu (⋮): reveal keys (master only) + delete.
+    let menu_btn = gtk::MenuButton::builder()
+        .icon_name("view-more-symbolic")
+        .tooltip_text("Share actions")
+        .css_classes(["flat"])
+        .valign(gtk::Align::Center)
+        .build();
+    let menu_pop = gtk::Popover::new();
+    let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+
     if matches!(s.role, Role::Master) {
-        let key_btn = gtk::Button::builder()
-            .icon_name("dialog-password-symbolic")
-            .tooltip_text("Reveal keys")
-            .css_classes(["flat"])
-            .valign(gtk::Align::Center)
-            .build();
+        let keys_item = flat_button("Reveal keys…");
         let net = net.clone();
         let id = s.share_id.clone();
-        key_btn.connect_clicked(move |_| {
+        let pop = menu_pop.clone();
+        keys_item.connect_clicked(move |_| {
+            pop.popdown();
             net.send(
                 IpcRequest::RevealKeys {
                     share_id: id.clone(),
@@ -525,8 +554,52 @@ fn share_row(s: &ShareSummary, net: &Net) -> gtk::ListBoxRow {
                 },
             );
         });
-        hbox.append(&key_btn);
+        menu_box.append(&keys_item);
     }
+
+    let del_item = flat_button("Delete share…");
+    del_item.add_css_class("destructive-action");
+    {
+        let net = net.clone();
+        let id = s.share_id.clone();
+        let name = s.name.clone();
+        let window = window.clone();
+        let pop = menu_pop.clone();
+        del_item.connect_clicked(move |_| {
+            pop.popdown();
+            let dialog = gtk::AlertDialog::builder()
+                .modal(true)
+                .message(format!("Remove “{name}”?"))
+                .detail("The share stops syncing and leaves the list. Your local files are kept on disk.")
+                .buttons(["Cancel", "Remove"])
+                .cancel_button(0)
+                .default_button(0)
+                .build();
+            let net = net.clone();
+            let id = id.clone();
+            let name = name.clone();
+            dialog.choose(Some(&window), gio::Cancellable::NONE, move |res| {
+                if matches!(res, Ok(1)) {
+                    net.send(
+                        IpcRequest::RemoveShare {
+                            share_id: id.clone(),
+                            delete_files: false,
+                        },
+                        move |r| match r {
+                            Ok(IpcResponse::Ok) => Some(UiMsg::Toast(format!("Removed “{name}”"))),
+                            _ => Some(UiMsg::Toast("could not remove share".into())),
+                        },
+                    );
+                    net.refresh();
+                }
+            });
+        });
+    }
+    menu_box.append(&del_item);
+
+    menu_pop.set_child(Some(&menu_box));
+    menu_btn.set_popover(Some(&menu_pop));
+    hbox.append(&menu_btn);
 
     row.set_child(Some(&hbox));
     row
@@ -629,30 +702,10 @@ fn submit_create(net: &Net, folder: PathBuf, ignore: Vec<String>) {
             generate_ignore: false,
             ignore,
         },
-        {
-            let net = net.clone();
-            move |res| match res {
-                Ok(IpcResponse::ShareCreated {
-                    master_key,
-                    viewer_key,
-                    ..
-                }) => {
-                    net.send(IpcRequest::NodeAddr, move |r| {
-                        let bootstrap = match r {
-                            Ok(IpcResponse::NodeAddr(a)) => a,
-                            _ => String::new(),
-                        };
-                        Some(UiMsg::Created {
-                            master: master_key,
-                            viewer: viewer_key,
-                            bootstrap,
-                        })
-                    });
-                    None
-                }
-                Ok(IpcResponse::Err(e)) => Some(UiMsg::Toast(format!("create failed: {e}"))),
-                _ => Some(UiMsg::Toast("create failed".into())),
-            }
+        |res| match res {
+            Ok(IpcResponse::ShareCreated { .. }) => Some(UiMsg::Created),
+            Ok(IpcResponse::Err(e)) => Some(UiMsg::Toast(format!("create failed: {e}"))),
+            _ => Some(UiMsg::Toast("create failed".into())),
         },
     );
 }

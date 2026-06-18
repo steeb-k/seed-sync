@@ -478,6 +478,9 @@ impl Engine {
                     (seed_ipc::ShareStatus::Syncing, 0, 0, 0)
                 };
                 let (online, total) = s.roster.lock().map(|r| r.counts()).unwrap_or((0, 0));
+                // Count this device itself as a peer (always present + online), so
+                // a share with no remote peers reads "1 of 1" rather than "0 of 0".
+                let (online, total) = (online + 1, total + 1);
                 seed_ipc::ShareSummary {
                     share_id: id.clone(),
                     name,
@@ -496,13 +499,26 @@ impl Engine {
             .collect()
     }
 
-    /// Peer membership for a share (for the GUI's "view peers" dialog).
+    /// Peer membership for a share (for the GUI's "view peers" dialog). The list
+    /// is led by this device itself so it's consistent with the "1 of 1" count.
     pub fn peers(&self, share_id: &str) -> anyhow::Result<Vec<seed_ipc::PeerInfo>> {
         let state = self
             .shares
             .get(share_id)
             .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
-        Ok(state.roster.lock().map(|r| r.infos()).unwrap_or_default())
+        let role = match state.key.role {
+            Role::Master => seed_ipc::Role::Master,
+            Role::Viewer => seed_ipc::Role::Viewer,
+        };
+        let mut out = vec![seed_ipc::PeerInfo {
+            node_id: "This device".into(),
+            role,
+            online: true,
+            last_seen: now_secs(),
+            have_seqno: state.last_seqno,
+        }];
+        out.extend(state.roster.lock().map(|r| r.infos()).unwrap_or_default());
+        Ok(out)
     }
 
     /// Reveal the keys for a share. Returns the master key only when this node
