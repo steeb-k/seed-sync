@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use seed_core::{identity::Role, Engine};
+use seed_core::Engine;
 use seed_ipc::transport::{self, read_frame, write_frame};
 use seed_ipc::{Frame, IpcEvent, IpcRequest, IpcResponse, Message};
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -142,20 +142,11 @@ async fn reconcile_loop(daemon: Daemon) {
     loop {
         tick.tick().await;
         let mut engine = daemon.engine.lock().await;
-        let mut any_change = false;
-        for (id, role) in engine.shares_roles() {
-            let changed = match role {
-                Role::Viewer => engine.apply(&id).await.unwrap_or(false),
-                Role::Master => engine.publish_if_changed(&id).await.unwrap_or(false),
-            };
-            if changed {
-                any_change = true;
-                let _ = daemon.events.send(IpcEvent::ShareListChanged);
-            }
-        }
+        let changed = engine.reconcile_all().await;
         drop(engine);
-        if any_change {
-            tracing::debug!("reconcile produced changes");
+        if !changed.is_empty() {
+            let _ = daemon.events.send(IpcEvent::ShareListChanged);
+            tracing::debug!("reconcile changed {} share(s)", changed.len());
         }
     }
 }
@@ -285,11 +276,30 @@ async fn handle_request(daemon: &Daemon, req: IpcRequest) -> anyhow::Result<IpcR
                 viewer_key,
             }
         }
-        // Stubbed in M2; fleshed out with the GUI in M3.
-        IpcRequest::Pause { .. }
-        | IpcRequest::Resume { .. }
-        | IpcRequest::RemoveShare { .. }
-        | IpcRequest::SetSettings(_) => IpcResponse::Ok,
+        IpcRequest::Pause { share_id } => {
+            daemon.engine.lock().await.set_paused(&share_id, true)?;
+            let _ = daemon.events.send(IpcEvent::ShareListChanged);
+            IpcResponse::Ok
+        }
+        IpcRequest::Resume { share_id } => {
+            daemon.engine.lock().await.set_paused(&share_id, false)?;
+            let _ = daemon.events.send(IpcEvent::ShareListChanged);
+            IpcResponse::Ok
+        }
+        IpcRequest::RemoveShare {
+            share_id,
+            delete_files,
+        } => {
+            daemon
+                .engine
+                .lock()
+                .await
+                .remove_share(&share_id, delete_files)
+                .await?;
+            let _ = daemon.events.send(IpcEvent::ShareListChanged);
+            IpcResponse::Ok
+        }
+        IpcRequest::SetSettings(_) => IpcResponse::Ok,
         IpcRequest::GetPeers { .. } => IpcResponse::Peers(vec![]),
         IpcRequest::GetSettings => IpcResponse::Settings(seed_ipc::Settings::default()),
         IpcRequest::Subscribe => IpcResponse::Ok, // handled before dispatch

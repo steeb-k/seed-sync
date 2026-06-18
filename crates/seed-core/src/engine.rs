@@ -60,6 +60,8 @@ struct ShareState {
     /// Cheap (path,size,mtime) signature of the last published folder state,
     /// used by the master reconcile loop to skip unchanged ticks.
     last_quick_sig: u64,
+    /// When paused, the reconcile loop skips this share.
+    paused: bool,
 }
 
 impl ShareState {
@@ -76,17 +78,101 @@ pub struct Engine {
     node: IrohNode,
     author: AuthorId,
     shares: HashMap<String, ShareState>,
+    db: crate::db::Db,
 }
 
 impl Engine {
-    /// Bootstrap the engine against a data directory.
+    /// Bootstrap the engine against a data directory, reloading any persisted
+    /// shares (so the daemon is restart-safe).
     pub async fn new(data_dir: &Path) -> anyhow::Result<Self> {
         let node = IrohNode::spawn(data_dir).await?;
         let author = node.docs_api().author_default().await?;
-        Ok(Self {
+        let db = crate::db::Db::open(&data_dir.join("state.db"))?;
+        let mut engine = Self {
             node,
             author,
             shares: HashMap::new(),
+            db,
+        };
+        engine.reload_shares().await?;
+        Ok(engine)
+    }
+
+    /// Re-open every persisted share's replica and resume sync. Folder content
+    /// is restored from the persisted local doc/blob stores even before peers
+    /// reconnect.
+    async fn reload_shares(&mut self) -> anyhow::Result<()> {
+        for rec in self.db.load_all()? {
+            let key = match ShareKey::decode(&rec.key) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!("skipping unreadable share {}: {e}", rec.share_id);
+                    continue;
+                }
+            };
+            let state = self
+                .open_share(
+                    &key,
+                    &PathBuf::from(&rec.folder),
+                    vec![],
+                    rec.ignore,
+                    rec.last_seqno,
+                    rec.paused,
+                )
+                .await?;
+            self.shares.insert(rec.share_id, state);
+        }
+        if !self.shares.is_empty() {
+            tracing::info!("reloaded {} share(s)", self.shares.len());
+        }
+        Ok(())
+    }
+
+    /// Open (import + start serving/syncing) a share's replica and build its
+    /// in-memory state. Shared by create, add, and reload.
+    async fn open_share(
+        &self,
+        key: &ShareKey,
+        folder: &Path,
+        bootstrap: Vec<iroh::EndpointAddr>,
+        ignore: Vec<String>,
+        last_seqno: u64,
+        paused: bool,
+    ) -> anyhow::Result<ShareState> {
+        let capability = match key.role {
+            Role::Master => {
+                let seed = key
+                    .seed_bytes()
+                    .ok_or_else(|| anyhow!("master key missing seed"))?;
+                Capability::Write(NamespaceSecret::from_bytes(&seed))
+            }
+            Role::Viewer => {
+                let ns = NamespaceId::from(
+                    iroh_docs::NamespacePublicKey::from_bytes(&key.master_pub_bytes())
+                        .map_err(|e| anyhow!("bad namespace key: {e}"))?,
+                );
+                Capability::Read(ns)
+            }
+        };
+        let doc = self
+            .node
+            .docs_api()
+            .import_namespace(capability)
+            .await
+            .context("import namespace")?;
+        std::fs::create_dir_all(folder)?;
+        // Subscribe (keeps live sync alive) and register the namespace for
+        // serving + connect to any bootstrap peers.
+        spawn_drain(&doc).await?;
+        doc.start_sync(bootstrap).await.context("start sync")?;
+        Ok(ShareState {
+            key: key.clone(),
+            folder: folder.to_path_buf(),
+            doc,
+            ignore,
+            last_seqno,
+            last_quick_sig: 0,
+            paused,
         })
     }
 
@@ -130,7 +216,9 @@ impl Engine {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| id.clone());
-                let status = if s.last_seqno > 0 {
+                let status = if s.paused {
+                    seed_ipc::ShareStatus::Paused
+                } else if s.last_seqno > 0 {
                     seed_ipc::ShareStatus::Healthy
                 } else {
                     seed_ipc::ShareStatus::Syncing
@@ -144,7 +232,7 @@ impl Engine {
                     percent: if s.last_seqno > 0 { 100 } else { 0 },
                     online: 0,
                     total: 0,
-                    paused: false,
+                    paused: s.paused,
                 }
             })
             .collect()
@@ -192,33 +280,24 @@ impl Engine {
         ignore: Vec<String>,
     ) -> anyhow::Result<CreatedShare> {
         let key = ShareKey::generate_master().with_endpoint_id(self.node.endpoint_id_bytes());
-        let seed = key.seed_bytes().expect("fresh master has a seed");
-        let namespace = NamespaceSecret::from_bytes(&seed);
-        let doc = self
-            .node
-            .docs_api()
-            .import_namespace(Capability::Write(namespace))
-            .await
-            .context("create writable namespace")?;
-
         let share_id = key.share_id_hex();
-        // Keep a live subscription, and register the namespace in the sync set
-        // (via start_sync) so the master *serves* incoming sync requests —
-        // without this, peers get "NotFound".
-        spawn_drain(&doc).await?;
-        doc.start_sync(vec![])
-            .await
-            .context("enable sync serving")?;
-        let state = ShareState {
-            key: key.clone(),
-            folder: folder.to_path_buf(),
-            doc,
-            ignore,
-            last_seqno: 0,
-            last_quick_sig: 0,
-        };
+        let state = self
+            .open_share(&key, folder, vec![], ignore.clone(), 0, false)
+            .await?;
         self.shares.insert(share_id.clone(), state);
-        self.publish(&share_id).await?;
+        self.publish(&share_id).await?; // sets last_seqno
+
+        // Persist (with the post-publish seqno).
+        let last_seqno = self.shares[&share_id].last_seqno;
+        self.db.upsert_share(&crate::db::ShareRecord {
+            share_id: share_id.clone(),
+            key: key.encode(),
+            folder: folder.to_string_lossy().into_owned(),
+            role_master: true,
+            ignore,
+            last_seqno,
+            paused: false,
+        })?;
 
         Ok(CreatedShare {
             share_id,
@@ -237,51 +316,22 @@ impl Engine {
         bootstrap: Vec<iroh::EndpointAddr>,
     ) -> anyhow::Result<String> {
         let key = ShareKey::decode(key_str).context("decode share key")?;
-        let capability = match key.role {
-            Role::Master => {
-                let seed = key
-                    .seed_bytes()
-                    .ok_or_else(|| anyhow!("master key missing seed"))?;
-                Capability::Write(NamespaceSecret::from_bytes(&seed))
-            }
-            Role::Viewer => {
-                let ns = NamespaceId::from(
-                    iroh_docs::NamespacePublicKey::from_bytes(&key.master_pub_bytes())
-                        .map_err(|e| anyhow!("bad namespace key: {e}"))?,
-                );
-                Capability::Read(ns)
-            }
-        };
-
-        let doc = self
-            .node
-            .docs_api()
-            .import_namespace(capability)
-            .await
-            .context("import namespace")?;
-
-        std::fs::create_dir_all(folder)?;
-        // Subscribe before starting sync so the live session is established and
-        // no initial events are missed (mirrors `import_and_subscribe`). The
-        // daemon will consume these events for status; for now we just drain
-        // them to keep the subscription — and thus live sync — alive.
-        spawn_drain(&doc).await?;
-        // Always start_sync (registers the namespace for serving + connects to
-        // any bootstrap peers). Empty peers still registers it.
-        doc.start_sync(bootstrap).await.context("start sync")?;
-
         let share_id = key.share_id_hex();
-        self.shares.insert(
-            share_id.clone(),
-            ShareState {
-                key,
-                folder: folder.to_path_buf(),
-                doc,
-                ignore: vec![],
-                last_seqno: 0,
-                last_quick_sig: 0,
-            },
-        );
+        let state = self
+            .open_share(&key, folder, bootstrap, vec![], 0, false)
+            .await?;
+        let role_master = matches!(key.role, Role::Master);
+        self.shares.insert(share_id.clone(), state);
+
+        self.db.upsert_share(&crate::db::ShareRecord {
+            share_id: share_id.clone(),
+            key: key.encode(),
+            folder: folder.to_string_lossy().into_owned(),
+            role_master,
+            ignore: vec![],
+            last_seqno: 0,
+            paused: false,
+        })?;
         Ok(share_id)
     }
 
@@ -353,6 +403,7 @@ impl Engine {
             .context("publish manifest")?;
         state.last_seqno = seqno;
         state.last_quick_sig = scan::quick_signature(&state.folder, &ignore);
+        self.db.set_seqno(share_id, seqno)?;
         Ok(())
     }
 
@@ -456,8 +507,60 @@ impl Engine {
         }
         prune_empty_dirs(&state.folder);
 
-        state.last_seqno = manifest.seqno;
+        if is_new {
+            state.last_seqno = manifest.seqno;
+            let seqno = manifest.seqno;
+            self.db.set_seqno(share_id, seqno)?;
+        }
         Ok(is_new)
+    }
+
+    /// Reconcile every (non-paused) share: viewers apply, masters publish on
+    /// change. Returns the ids of shares that changed (for status events).
+    pub async fn reconcile_all(&mut self) -> Vec<String> {
+        let plan: Vec<(String, Role, bool)> = self
+            .shares
+            .iter()
+            .map(|(id, s)| (id.clone(), s.key.role, s.paused))
+            .collect();
+        let mut changed = Vec::new();
+        for (id, role, paused) in plan {
+            if paused {
+                continue;
+            }
+            let did = match role {
+                Role::Viewer => self.apply(&id).await.unwrap_or(false),
+                Role::Master => self.publish_if_changed(&id).await.unwrap_or(false),
+            };
+            if did {
+                changed.push(id);
+            }
+        }
+        changed
+    }
+
+    /// Pause or resume a share (persisted; the reconcile loop skips paused shares).
+    pub fn set_paused(&mut self, share_id: &str, paused: bool) -> anyhow::Result<()> {
+        let state = self
+            .shares
+            .get_mut(share_id)
+            .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
+        state.paused = paused;
+        self.db.set_paused(share_id, paused)?;
+        Ok(())
+    }
+
+    /// Remove a share from the engine and persistence. Optionally delete its
+    /// local folder contents.
+    pub async fn remove_share(&mut self, share_id: &str, delete_files: bool) -> anyhow::Result<()> {
+        if let Some(state) = self.shares.remove(share_id) {
+            let _ = state.doc.leave().await;
+            if delete_files {
+                let _ = std::fs::remove_dir_all(&state.folder);
+            }
+        }
+        self.db.remove_share(share_id)?;
+        Ok(())
     }
 
     /// Endpoint address for a peer to dial (used by tests to bootstrap).

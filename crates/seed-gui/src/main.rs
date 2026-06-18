@@ -104,11 +104,7 @@ fn main() -> glib::ExitCode {
 
 fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
     let (tx, rx) = async_channel::unbounded::<UiMsg>();
-    let net = Net {
-        handle,
-        socket,
-        tx,
-    };
+    let net = Net { handle, socket, tx };
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -511,7 +507,9 @@ fn show_add_dialog(window: &adw::ApplicationWindow, net: &Net) {
         let folder_lbl = folder_lbl.clone();
         let dialog = dialog.clone();
         folder_btn.connect_clicked(move |_| {
-            let fd = gtk::FileDialog::builder().title("Choose local folder").build();
+            let fd = gtk::FileDialog::builder()
+                .title("Choose local folder")
+                .build();
             let chosen = chosen.clone();
             let folder_lbl = folder_lbl.clone();
             fd.select_folder(Some(&dialog), gio::Cancellable::NONE, move |res| {
@@ -567,7 +565,12 @@ fn show_add_dialog(window: &adw::ApplicationWindow, net: &Net) {
         });
     }
 
-    vbox.append(&gtk::Label::builder().label("Key").halign(gtk::Align::Start).build());
+    vbox.append(
+        &gtk::Label::builder()
+            .label("Key")
+            .halign(gtk::Align::Start)
+            .build(),
+    );
     vbox.append(&key_entry);
     vbox.append(&boot_entry);
     let folder_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);

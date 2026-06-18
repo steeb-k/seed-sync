@@ -8,6 +8,7 @@
 //! encoding ([`identity`]) come first and are fully testable without iroh; the
 //! networked [`engine`] is layered on top.
 
+pub mod db;
 pub mod engine;
 pub mod identity;
 pub mod manifest;
