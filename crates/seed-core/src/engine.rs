@@ -171,13 +171,27 @@ impl Engine {
     /// reconnect.
     async fn reload_shares(&mut self) -> anyhow::Result<()> {
         for rec in self.db.load_all()? {
-            let key = match ShareKey::decode(&rec.key) {
+            let mut key = match ShareKey::decode(&rec.key) {
                 Ok(k) => k,
                 Err(e) => {
                     tracing::warn!("skipping unreadable share {}: {e}", rec.share_id);
                     continue;
                 }
             };
+            // Master shares keep their seed in the OS keystore; load it to
+            // restore write capability. If it's unavailable, run read-only.
+            if rec.role_master && rec.seed_in_keyring {
+                match crate::secrets::load_seed(&rec.share_id) {
+                    Ok(seed) => {
+                        key = ShareKey::from_master_seed(seed)
+                            .with_endpoint_id(self.node.endpoint_id_bytes())
+                    }
+                    Err(e) => tracing::warn!(
+                        "master seed for {} unavailable from keystore; running read-only: {e}",
+                        rec.share_id
+                    ),
+                }
+            }
             let state = self
                 .open_share(
                     &key,
@@ -380,23 +394,50 @@ impl Engine {
         self.shares.insert(share_id.clone(), state);
         self.publish(&share_id).await?; // sets last_seqno
 
-        // Persist (with the post-publish seqno).
+        // Persist (with the post-publish seqno), routing the seed to the keystore.
         let last_seqno = self.shares[&share_id].last_seqno;
-        self.db.upsert_share(&crate::db::ShareRecord {
-            share_id: share_id.clone(),
-            key: key.encode(),
-            folder: folder.to_string_lossy().into_owned(),
-            role_master: true,
-            ignore,
-            last_seqno,
-            paused: false,
-        })?;
+        self.persist_share(&key, folder, ignore, last_seqno, false)?;
 
         Ok(CreatedShare {
             share_id,
             master_key: key.encode(),
             viewer_key: key.encode_viewer(),
         })
+    }
+
+    /// Persist a share to the DB, storing a master seed in the OS keystore when
+    /// available (DB then holds only the seedless viewer key); otherwise falls
+    /// back to storing the full key in the DB.
+    fn persist_share(
+        &self,
+        key: &ShareKey,
+        folder: &Path,
+        ignore: Vec<String>,
+        last_seqno: u64,
+        paused: bool,
+    ) -> anyhow::Result<()> {
+        let share_id = key.share_id_hex();
+        let (db_key, seed_in_keyring) = match (key.role, key.seed_bytes()) {
+            (Role::Master, Some(seed)) => match crate::secrets::store_seed(&share_id, &seed) {
+                Ok(()) => (key.encode_viewer(), true),
+                Err(e) => {
+                    tracing::warn!("OS keystore unavailable; storing key in DB instead: {e}");
+                    (key.encode(), false)
+                }
+            },
+            _ => (key.encode_viewer(), false),
+        };
+        self.db.upsert_share(&crate::db::ShareRecord {
+            share_id,
+            key: db_key,
+            folder: folder.to_string_lossy().into_owned(),
+            role_master: matches!(key.role, Role::Master),
+            ignore,
+            last_seqno,
+            paused,
+            seed_in_keyring,
+        })?;
+        Ok(())
     }
 
     /// Add an existing share from a key string, syncing into `folder`. Optional
@@ -413,18 +454,8 @@ impl Engine {
         let state = self
             .open_share(&key, folder, bootstrap, vec![], 0, false)
             .await?;
-        let role_master = matches!(key.role, Role::Master);
         self.shares.insert(share_id.clone(), state);
-
-        self.db.upsert_share(&crate::db::ShareRecord {
-            share_id: share_id.clone(),
-            key: key.encode(),
-            folder: folder.to_string_lossy().into_owned(),
-            role_master,
-            ignore: vec![],
-            last_seqno: 0,
-            paused: false,
-        })?;
+        self.persist_share(&key, folder, vec![], 0, false)?;
         Ok(share_id)
     }
 
@@ -654,6 +685,7 @@ impl Engine {
                 let _ = std::fs::remove_dir_all(&state.folder);
             }
         }
+        crate::secrets::delete_seed(share_id);
         self.db.remove_share(share_id)?;
         Ok(())
     }

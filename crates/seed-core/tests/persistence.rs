@@ -49,6 +49,41 @@ async fn apply_until(
     )
 }
 
+/// A master keeps its write capability across a restart: the seed is reloaded
+/// (from the OS keystore where available, else the DB fallback) and the master
+/// key + publish still work.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn master_keeps_write_capability_after_restart() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let data = tmp.path().join("m-data");
+    let folder = tmp.path().join("m-folder");
+    std::fs::create_dir_all(&data)?;
+    std::fs::create_dir_all(&folder)?;
+    std::fs::write(folder.join("a.txt"), b"one")?;
+
+    let (share_id, master_key) = {
+        let mut m = Engine::new(&data).await?;
+        let c = m.create_share(&folder, vec![]).await?;
+        m.shutdown().await?;
+        (c.share_id, c.master_key)
+    };
+
+    // Restart on the same data dir.
+    let mut m2 = Engine::new(&data).await?;
+    let (revealed_master, _viewer) = m2.reveal_keys(&share_id)?;
+    assert_eq!(
+        revealed_master.as_deref(),
+        Some(master_key.as_str()),
+        "master key must survive restart"
+    );
+    // Write capability still works (would error if reloaded read-only).
+    std::fs::write(folder.join("b.txt"), b"two")?;
+    m2.publish(&share_id).await?;
+    m2.shutdown().await?;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "opens real iroh endpoints; run with --ignored"]
 async fn viewer_restores_from_local_store_after_restart() -> anyhow::Result<()> {

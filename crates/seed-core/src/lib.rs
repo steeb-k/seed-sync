@@ -14,6 +14,7 @@ pub mod identity;
 pub mod manifest;
 pub mod node;
 pub mod scan;
+pub mod secrets;
 
 pub use engine::Engine;
 pub use identity::{Role, ShareKey};

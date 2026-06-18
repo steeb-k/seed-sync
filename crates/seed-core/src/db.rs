@@ -24,6 +24,10 @@ pub struct ShareRecord {
     pub ignore: Vec<String>,
     pub last_seqno: u64,
     pub paused: bool,
+    /// True when the master seed lives in the OS keystore and `key` is the
+    /// seedless viewer key. False means `key` is self-contained (a viewer key,
+    /// or a full master key in the keystore-unavailable fallback).
+    pub seed_in_keyring: bool,
 }
 
 /// `Connection` is `Send` but not `Sync`; wrap it so the `Db` (and thus the
@@ -45,7 +49,8 @@ impl Db {
                  role_master INTEGER NOT NULL,
                  ignore     TEXT NOT NULL DEFAULT '',
                  last_seqno INTEGER NOT NULL DEFAULT 0,
-                 paused     INTEGER NOT NULL DEFAULT 0
+                 paused     INTEGER NOT NULL DEFAULT 0,
+                 seed_in_keyring INTEGER NOT NULL DEFAULT 0
              );",
         )?;
         Ok(Self {
@@ -60,11 +65,12 @@ impl Db {
     /// Insert or replace a share row (used on create/add).
     pub fn upsert_share(&self, r: &ShareRecord) -> anyhow::Result<()> {
         self.lock().execute(
-            "INSERT INTO shares (share_id, key, folder, role_master, ignore, last_seqno, paused)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO shares (share_id, key, folder, role_master, ignore, last_seqno, paused, seed_in_keyring)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(share_id) DO UPDATE SET
                  key=excluded.key, folder=excluded.folder, role_master=excluded.role_master,
-                 ignore=excluded.ignore, last_seqno=excluded.last_seqno, paused=excluded.paused",
+                 ignore=excluded.ignore, last_seqno=excluded.last_seqno, paused=excluded.paused,
+                 seed_in_keyring=excluded.seed_in_keyring",
             rusqlite::params![
                 r.share_id,
                 r.key,
@@ -73,6 +79,7 @@ impl Db {
                 r.ignore.join("\n"),
                 r.last_seqno as i64,
                 r.paused as i64,
+                r.seed_in_keyring as i64,
             ],
         )?;
         Ok(())
@@ -107,7 +114,7 @@ impl Db {
     pub fn load_all(&self) -> anyhow::Result<Vec<ShareRecord>> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT share_id, key, folder, role_master, ignore, last_seqno, paused FROM shares",
+            "SELECT share_id, key, folder, role_master, ignore, last_seqno, paused, seed_in_keyring FROM shares",
         )?;
         let rows = stmt.query_map([], |row| {
             let ignore_str: String = row.get(4)?;
@@ -123,6 +130,7 @@ impl Db {
                 },
                 last_seqno: row.get::<_, i64>(5)? as u64,
                 paused: row.get::<_, i64>(6)? != 0,
+                seed_in_keyring: row.get::<_, i64>(7)? != 0,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
@@ -145,6 +153,7 @@ mod tests {
             ignore: vec!["*.tmp".into(), "node_modules".into()],
             last_seqno: 3,
             paused: false,
+            seed_in_keyring: false,
         };
         db.upsert_share(&rec).unwrap();
         db.set_seqno("abc", 7).unwrap();

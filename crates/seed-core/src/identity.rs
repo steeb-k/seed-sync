@@ -87,6 +87,18 @@ impl ShareKey {
         }
     }
 
+    /// Reconstruct a master key from its 32-byte signing seed (e.g. loaded from
+    /// the OS keystore). The public key is derived from the seed.
+    pub fn from_master_seed(seed: [u8; 32]) -> Self {
+        let signing = SigningKey::from_bytes(&seed);
+        Self {
+            role: Role::Master,
+            master_pub: signing.verifying_key(),
+            seed: Some(seed),
+            endpoint_id: None,
+        }
+    }
+
     /// Raw 32-byte public key (== iroh `NamespaceId` bytes for the share's doc).
     pub fn master_pub_bytes(&self) -> [u8; 32] {
         self.master_pub.to_bytes()
