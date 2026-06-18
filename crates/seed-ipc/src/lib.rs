@@ -145,6 +145,8 @@ pub struct ShareSummary {
     pub online: u32,
     pub total: u32,
     pub paused: bool,
+    /// Unix seconds of the last successful sync/publish for this share (0 if never).
+    pub last_updated: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

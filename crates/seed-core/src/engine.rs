@@ -127,6 +127,9 @@ struct ShareState {
     paused: bool,
     /// Live peer membership, updated by the doc event task.
     roster: Arc<StdMutex<PeerRoster>>,
+    /// Unix seconds of the last successful publish (master) or applied update
+    /// (viewer); 0 if none yet this session.
+    last_updated: i64,
 }
 
 impl ShareState {
@@ -240,6 +243,7 @@ impl Engine {
             last_quick_sig: 0,
             paused,
             roster,
+            last_updated: 0,
         })
     }
 
@@ -293,6 +297,7 @@ impl Engine {
                     online,
                     total,
                     paused: s.paused,
+                    last_updated: s.last_updated,
                 }
             })
             .collect()
@@ -325,6 +330,11 @@ impl Engine {
     /// Wait until this engine's endpoint is online (has a complete address).
     pub async fn wait_online(&self) {
         self.node.wait_online().await;
+    }
+
+    /// Cumulative (bytes_sent, bytes_received) for throughput sampling.
+    pub fn byte_totals(&self) -> (u64, u64) {
+        self.node.byte_totals()
     }
 
     /// Diagnostic: list the doc keys currently visible for a share.
@@ -472,6 +482,7 @@ impl Engine {
             .context("publish manifest")?;
         state.last_seqno = seqno;
         state.last_quick_sig = scan::quick_signature(&state.folder, &ignore);
+        state.last_updated = now_secs();
         self.db.set_seqno(share_id, seqno)?;
         Ok(())
     }
@@ -578,6 +589,7 @@ impl Engine {
 
         if is_new {
             state.last_seqno = manifest.seqno;
+            state.last_updated = now_secs();
             let seqno = manifest.seqno;
             self.db.set_seqno(share_id, seqno)?;
         }

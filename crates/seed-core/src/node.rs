@@ -87,6 +87,19 @@ impl IrohNode {
         self.endpoint.online().await;
     }
 
+    /// Cumulative (bytes_sent, bytes_received) across all transports (IPv4/IPv6/
+    /// relay). Sample over time and diff to get throughput. This is endpoint-wide
+    /// (all shares combined), matching the GUI's global speed indicator.
+    pub fn byte_totals(&self) -> (u64, u64) {
+        let m = &self.endpoint.metrics().socket;
+        let sent = m.send_ipv4.get() + m.send_ipv6.get() + m.send_relay.get();
+        let recv = m.recv_data_ipv4.get()
+            + m.recv_data_ipv6.get()
+            + m.recv_data_relay.get()
+            + m.recv_data_custom.get();
+        (sent, recv)
+    }
+
     pub async fn shutdown(self) -> anyhow::Result<()> {
         self.router.shutdown().await?;
         Ok(())

@@ -15,8 +15,10 @@ use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
-use seed_ipc::transport::oneshot_request;
-use seed_ipc::{IpcRequest, IpcResponse, PeerInfo, Role, ShareStatus, ShareSummary};
+use seed_ipc::transport::{self, oneshot_request, read_frame, write_frame};
+use seed_ipc::{
+    Frame, IpcEvent, IpcRequest, IpcResponse, Message, PeerInfo, Role, ShareStatus, ShareSummary,
+};
 use tokio::runtime::Handle;
 
 const APP_ID: &str = "io.github.steeb_k.SeedSync";
@@ -35,6 +37,12 @@ enum UiMsg {
     },
     NodeAddr(String),
     Peers(Vec<PeerInfo>),
+    Throughput {
+        down: u64,
+        up: u64,
+    },
+    LastUpdated(i64),
+    Refresh,
     Toast(String),
 }
 
@@ -71,6 +79,54 @@ impl Net {
             _ => None,
         });
     }
+
+    /// Maintain a long-lived subscription to daemon events (throughput, status,
+    /// last-updated), reconnecting if the daemon restarts.
+    fn subscribe_loop(&self) {
+        let socket = self.socket.clone();
+        let tx = self.tx.clone();
+        self.handle.spawn(async move {
+            loop {
+                let _ = stream_events(&socket, &tx).await;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
+}
+
+/// Connect, subscribe, and forward events as [`UiMsg`]s until the connection drops.
+async fn stream_events(
+    socket: &std::path::Path,
+    tx: &async_channel::Sender<UiMsg>,
+) -> std::io::Result<()> {
+    let stream = transport::connect(socket).await?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    write_frame(
+        &mut writer,
+        &Frame {
+            id: 2,
+            body: Message::Request(IpcRequest::Subscribe),
+        },
+    )
+    .await?;
+    while let Some(frame) = read_frame(&mut reader).await? {
+        if let Message::Event(ev) = frame.body {
+            let msg = match ev {
+                IpcEvent::Throughput { down_bps, up_bps } => UiMsg::Throughput {
+                    down: down_bps,
+                    up: up_bps,
+                },
+                IpcEvent::LastUpdated { ts, .. } => UiMsg::LastUpdated(ts),
+                IpcEvent::ShareListChanged
+                | IpcEvent::Membership { .. }
+                | IpcEvent::ShareStatus { .. } => UiMsg::Refresh,
+            };
+            if tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn default_socket() -> PathBuf {
@@ -246,10 +302,20 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
         let toast_overlay = toast_overlay.clone();
         let window = window.clone();
         let net = net.clone();
+        let down_lbl = down_lbl.clone();
+        let up_lbl = up_lbl.clone();
+        let updated_lbl = updated_lbl.clone();
         glib::spawn_future_local(async move {
             while let Ok(msg) = rx.recv().await {
                 match msg {
-                    UiMsg::Shares(shares) => rebuild_list(&listbox, &shares, &net),
+                    UiMsg::Shares(shares) => {
+                        if let Some(ts) = shares.iter().map(|s| s.last_updated).max() {
+                            if ts > 0 {
+                                updated_lbl.set_text(&format!("Last updated: {}", fmt_time(ts)));
+                            }
+                        }
+                        rebuild_list(&listbox, &shares, &net);
+                    }
                     UiMsg::Created {
                         master,
                         viewer,
@@ -265,17 +331,26 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
                         &a,
                     ),
                     UiMsg::Peers(peers) => show_peers_dialog(&window, &peers),
+                    UiMsg::Throughput { down, up } => {
+                        down_lbl.set_text(&format!("↓ {}", fmt_speed(down)));
+                        up_lbl.set_text(&format!("↑ {}", fmt_speed(up)));
+                    }
+                    UiMsg::LastUpdated(ts) => {
+                        updated_lbl.set_text(&format!("Last updated: {}", fmt_time(ts)));
+                    }
+                    UiMsg::Refresh => net.refresh(),
                     UiMsg::Toast(t) => toast_overlay.add_toast(adw::Toast::new(&t)),
                 }
             }
         });
     }
 
-    // --- periodic refresh ---
+    // --- live event subscription + periodic refresh fallback ---
+    net.subscribe_loop();
     {
         let net = net.clone();
         net.refresh();
-        glib::timeout_add_local(Duration::from_millis(1500), move || {
+        glib::timeout_add_local(Duration::from_millis(2000), move || {
             net.refresh();
             glib::ControlFlow::Continue
         });
@@ -764,6 +839,24 @@ fn key_field(label: &str, value: &str) -> gtk::Box {
     row.append(&copy);
     outer.append(&row);
     outer
+}
+
+/// Format a byte/sec rate as a human bit-rate (Mbps/Kbps).
+fn fmt_speed(bytes_per_sec: u64) -> String {
+    let bits = bytes_per_sec as f64 * 8.0;
+    if bits >= 1_000_000.0 {
+        format!("{:.1} Mbps", bits / 1_000_000.0)
+    } else {
+        format!("{:.0} Kbps", bits / 1_000.0)
+    }
+}
+
+/// Format a unix timestamp as a short local time-of-day (best effort).
+fn fmt_time(ts: i64) -> String {
+    let dt = glib::DateTime::from_unix_local(ts).ok();
+    dt.and_then(|d| d.format("%H:%M:%S").ok())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| ts.to_string())
 }
 
 fn flat_button(label: &str) -> gtk::Button {

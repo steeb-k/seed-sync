@@ -114,6 +114,7 @@ fn run(data_dir: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<()>
         };
 
         tokio::spawn(reconcile_loop(daemon.clone()));
+        tokio::spawn(throughput_loop(daemon.clone()));
 
         let listener = transport::bind(&socket)?;
         tracing::info!("seed-daemon listening on {}", socket.display());
@@ -146,8 +147,42 @@ async fn reconcile_loop(daemon: Daemon) {
         drop(engine);
         if !changed.is_empty() {
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
+            let ts = now_unix();
+            for share_id in &changed {
+                let _ = daemon.events.send(IpcEvent::LastUpdated {
+                    share_id: share_id.clone(),
+                    ts,
+                });
+            }
             tracing::debug!("reconcile changed {} share(s)", changed.len());
         }
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Sample endpoint byte counters once a second and broadcast the throughput.
+async fn throughput_loop(daemon: Daemon) {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut last: Option<(u64, u64)> = None;
+    loop {
+        tick.tick().await;
+        let (sent, recv) = daemon.engine.lock().await.byte_totals();
+        if let Some((psent, precv)) = last {
+            // Counters are monotonic; saturating_sub guards a reset.
+            let up = sent.saturating_sub(psent);
+            let down = recv.saturating_sub(precv);
+            let _ = daemon.events.send(IpcEvent::Throughput {
+                down_bps: down,
+                up_bps: up,
+            });
+        }
+        last = Some((sent, recv));
     }
 }
 
