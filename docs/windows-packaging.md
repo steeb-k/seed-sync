@@ -50,18 +50,25 @@ seed-daemon.exe stop
 seed-daemon.exe uninstall
 ```
 
-### Open questions to validate here (flagged in the code)
-- **Service account & IPC reachability.** The service installs as **LocalSystem**;
-  the GUI runs as the logged-in user. Confirm the user can reach the daemon's IPC
-  endpoint. Options: run the service as the user, or set a permissive DACL on the
-  pipe. Decide and implement.
-- **Named-pipe naming.** ✅ Resolved (commit `368382b`). `transport.rs` now uses a
-  `socket_name(path)` helper: `GenericFilePath` on Unix, `GenericNamespaced` on
-  Windows (hashing the `--socket` path into a legal pipe name). `bind`/`connect`
-  share it. Confirmed working via `two_daemons_sync_over_ipc` on Windows.
-- **Data dir under LocalSystem.** `directories` resolves the data dir to the
-  service account's profile; ensure the GUI (user) and service agree on the socket
-  path, or pass an explicit machine-wide `--data-dir` (e.g. `%PROGRAMDATA%\SeedSync`).
+### Open questions — resolved (commit `0638ade`)
+The service stays **LocalSystem**; the GUI/CLI run as the user. They meet via:
+- **Machine-wide socket.** Both sides default to `%PROGRAMDATA%\SeedSync\seed.sock`
+  on Windows (`seed_ipc::machine_data_dir`/`machine_socket`, used by the daemon's
+  `default_data_dir` and the GUI's `default_socket`) — same path ⇒ same pipe name.
+- **Permissive pipe DACL.** `transport::bind` creates the pipe with an SDDL DACL
+  (`D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;AU)`): SYSTEM/Admins full, Authenticated
+  Users read/write (connect + IO, not create-instance). Lets the user GUI open the
+  service's pipe. Verified: daemon started with no args is reachable via
+  `seed-cli --socket %PROGRAMDATA%\SeedSync\seed.sock list`.
+- **Named-pipe naming.** ✅ Resolved (commit `368382b`): `socket_name(path)` uses
+  `GenericFilePath` on Unix, `GenericNamespaced` (hashed path) on Windows.
+- **Keystore note.** Seeds the daemon stores live in the **service account's**
+  Credential Manager vault (SYSTEM); only the daemon needs them, so that's fine.
+  A daemon run in *console* mode (as the user) uses the user vault instead — so
+  shares created in console mode aren't visible to the service and vice-versa.
+
+Still to validate live: install/start the service from an **elevated** prompt and
+confirm the user-run GUI connects (cross-account, the real test vs. same-user CLI).
 
 ## 3. MSI installer (cargo-wix)
 
