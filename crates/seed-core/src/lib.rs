@@ -10,6 +10,7 @@
 
 pub mod identity;
 pub mod manifest;
+pub mod scan;
 
 pub use identity::{Role, ShareKey};
 pub use manifest::{Manifest, SignedManifest, VerifyContext};

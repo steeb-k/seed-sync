@@ -113,7 +113,8 @@ impl Manifest {
 
     fn to_canonical_cbor(&self) -> Result<Vec<u8>, ManifestError> {
         let mut buf = Vec::new();
-        ciborium::into_writer(self, &mut buf).map_err(|e| ManifestError::Encoding(e.to_string()))?;
+        ciborium::into_writer(self, &mut buf)
+            .map_err(|e| ManifestError::Encoding(e.to_string()))?;
         Ok(buf)
     }
 
