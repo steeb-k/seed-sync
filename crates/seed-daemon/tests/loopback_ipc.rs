@@ -100,12 +100,12 @@ async fn request(socket: &Path, req: IpcRequest) -> anyhow::Result<IpcResponse> 
 }
 
 async fn wait_for_socket(socket: &Path) -> anyhow::Result<()> {
+    // Poll by actually talking to the daemon rather than checking the path: a
+    // Windows named pipe has no filesystem entry, so `socket.exists()` would
+    // never become true. `request` fails fast until the listener is up.
     for _ in 0..120 {
-        if socket.exists() {
-            // Confirm it actually answers.
-            if request(socket, IpcRequest::ListShares).await.is_ok() {
-                return Ok(());
-            }
+        if request(socket, IpcRequest::ListShares).await.is_ok() {
+            return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

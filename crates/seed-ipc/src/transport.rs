@@ -10,7 +10,11 @@ use std::io;
 use std::path::Path;
 
 use interprocess::local_socket::tokio::prelude::*;
-use interprocess::local_socket::{GenericFilePath, ListenerOptions, ToFsName};
+#[cfg(unix)]
+use interprocess::local_socket::{GenericFilePath, ToFsName};
+#[cfg(windows)]
+use interprocess::local_socket::{GenericNamespaced, ToNsName};
+use interprocess::local_socket::{ListenerOptions, Name};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{decode, encode, Frame};
@@ -43,10 +47,35 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> io::Result<Option<Fr
     Ok(Some(frame))
 }
 
+/// Derive the platform socket [`Name`] from the `--socket` path.
+///
+/// On Unix the daemon listens on a Unix domain socket, so the name *is* the
+/// filesystem path. On Windows a named pipe lives in a flat namespace
+/// (`\\.\pipe\<name>`), not the filesystem, so a raw path is not a valid pipe
+/// name; we hash the requested path into a stable, legal name. `bind` and
+/// `connect` both call this, so the daemon and its clients always agree on the
+/// pipe name as long as they were launched with the same `--socket` argument.
+#[cfg(unix)]
+fn socket_name(path: &Path) -> io::Result<Name<'_>> {
+    path.to_fs_name::<GenericFilePath>()
+}
+
+#[cfg(windows)]
+fn socket_name(path: &Path) -> io::Result<Name<'static>> {
+    // FNV-1a over the path's bytes: deterministic across binaries and toolchains
+    // (unlike `DefaultHasher`, whose keys aren't a stability guarantee), so a
+    // separately-built GUI and daemon resolve the same pipe from the same path.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.to_string_lossy().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("seed-sync-{hash:016x}.sock").to_ns_name::<GenericNamespaced>()
+}
+
 /// Connect to a daemon listening on the socket at `path`.
 pub async fn connect(path: &Path) -> io::Result<Stream> {
-    let name = path.to_fs_name::<GenericFilePath>()?;
-    Stream::connect(name).await
+    Stream::connect(socket_name(path)?).await
 }
 
 /// Bind a listener at the socket `path`. On Unix a stale socket file from a
@@ -58,8 +87,9 @@ pub fn bind(path: &Path) -> io::Result<Listener> {
             let _ = std::fs::remove_file(path);
         }
     }
-    let name = path.to_fs_name::<GenericFilePath>()?;
-    ListenerOptions::new().name(name).create_tokio()
+    ListenerOptions::new()
+        .name(socket_name(path)?)
+        .create_tokio()
 }
 
 /// Accept the next incoming connection (wraps the prelude trait method so

@@ -90,7 +90,7 @@ mod service;
 fn platform_service_cmd(cmd: &str) -> anyhow::Result<()> {
     #[cfg(windows)]
     {
-        return service::manage(cmd).map_err(Into::into);
+        service::manage(cmd).map_err(Into::into)
     }
     #[cfg(not(windows))]
     {
