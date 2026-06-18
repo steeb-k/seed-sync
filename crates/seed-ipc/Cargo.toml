@@ -5,8 +5,16 @@ edition.workspace = true
 license.workspace = true
 description = "Wire types + framing for the Seed Sync GUI<->daemon IPC channel"
 
+[features]
+# Off by default so pure consumers (e.g. anything only needing the types) stay
+# dependency-light. The daemon, CLI, and GUI enable it for the async transport.
+transport = ["dep:tokio", "dep:interprocess"]
+
 [dependencies]
 serde.workspace = true
 serde_bytes.workspace = true
 ciborium.workspace = true
 thiserror.workspace = true
+
+tokio = { workspace = true, optional = true }
+interprocess = { workspace = true, optional = true }

@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 seed-core = { path = "../seed-core" }
-seed-ipc = { path = "../seed-ipc" }
+seed-ipc = { path = "../seed-ipc", features = ["transport"] }
 tokio.workspace = true
 tokio-util.workspace = true
 interprocess.workspace = true
@@ -21,3 +21,6 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 directories.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

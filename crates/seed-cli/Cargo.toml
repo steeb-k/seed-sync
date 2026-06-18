@@ -10,7 +10,7 @@ name = "seed-cli"
 path = "src/main.rs"
 
 [dependencies]
-seed-ipc = { path = "../seed-ipc" }
+seed-ipc = { path = "../seed-ipc", features = ["transport"] }
 tokio.workspace = true
 tokio-util.workspace = true
 interprocess.workspace = true

@@ -102,6 +102,53 @@ pub fn hash_file(path: &Path) -> std::io::Result<(Vec<u8>, u64)> {
     Ok((hasher.finalize().as_bytes().to_vec(), n))
 }
 
+/// A cheap change signature over `root`: a hash of the sorted
+/// `(relative path, size, mtime)` tuples, without reading file contents. The
+/// master's reconcile loop compares this between ticks and only does a full
+/// scan + republish when it changes.
+pub fn quick_signature(root: &Path, ignore: &IgnoreSet) -> u64 {
+    use std::time::UNIX_EPOCH;
+    let mut entries: Vec<(String, u64, u128)> = Vec::new();
+    for dent in WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        if !dent.file_type().is_file() {
+            continue;
+        }
+        let Some(rel) = rel_posix(root, dent.path()) else {
+            continue;
+        };
+        if ignore.is_ignored(&rel) {
+            continue;
+        }
+        let (size, mtime) = dent
+            .metadata()
+            .ok()
+            .map(|m| {
+                let mt = m
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                (m.len(), mt)
+            })
+            .unwrap_or((0, 0));
+        entries.push((rel, size, mtime));
+    }
+    entries.sort();
+    let mut hasher = blake3::Hasher::new();
+    for (path, size, mtime) in &entries {
+        hasher.update(path.as_bytes());
+        hasher.update(&size.to_le_bytes());
+        hasher.update(&mtime.to_le_bytes());
+    }
+    let bytes = hasher.finalize();
+    u64::from_le_bytes(bytes.as_bytes()[..8].try_into().unwrap())
+}
+
 /// Walk `root`, skipping ignored paths, and produce the live (non-deleted)
 /// file set. Symlinks are not followed. Hidden control dirs (e.g. our own
 /// `.seed`) should be passed in `ignore`.

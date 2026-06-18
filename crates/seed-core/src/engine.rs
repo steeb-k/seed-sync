@@ -57,6 +57,9 @@ struct ShareState {
     ignore: Vec<String>,
     /// Highest manifest seqno accepted (anti-rollback watermark).
     last_seqno: u64,
+    /// Cheap (path,size,mtime) signature of the last published folder state,
+    /// used by the master reconcile loop to skip unchanged ticks.
+    last_quick_sig: u64,
 }
 
 impl ShareState {
@@ -89,6 +92,77 @@ impl Engine {
 
     pub fn endpoint_addr(&self) -> iroh::EndpointAddr {
         self.node.addr()
+    }
+
+    /// This node's dialable address as an endpoint-ticket string, for handing to
+    /// a peer as a bootstrap hint.
+    pub fn endpoint_ticket(&self) -> String {
+        iroh_tickets::endpoint::EndpointTicket::from(self.node.addr()).to_string()
+    }
+
+    /// Parse an endpoint-ticket string into a dialable address.
+    pub fn parse_bootstrap(s: &str) -> anyhow::Result<iroh::EndpointAddr> {
+        use std::str::FromStr;
+        let ticket = iroh_tickets::endpoint::EndpointTicket::from_str(s)
+            .map_err(|e| anyhow!("bad bootstrap ticket: {e}"))?;
+        Ok(ticket.endpoint_addr().clone())
+    }
+
+    /// IDs and roles of all loaded shares (for the daemon's reconcile loop).
+    pub fn shares_roles(&self) -> Vec<(String, Role)> {
+        self.shares
+            .iter()
+            .map(|(id, s)| (id.clone(), s.key.role))
+            .collect()
+    }
+
+    /// Build IPC summaries for all shares.
+    pub fn list_summaries(&self) -> Vec<seed_ipc::ShareSummary> {
+        self.shares
+            .iter()
+            .map(|(id, s)| {
+                let role = match s.key.role {
+                    Role::Master => seed_ipc::Role::Master,
+                    Role::Viewer => seed_ipc::Role::Viewer,
+                };
+                let name = s
+                    .folder
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| id.clone());
+                let status = if s.last_seqno > 0 {
+                    seed_ipc::ShareStatus::Healthy
+                } else {
+                    seed_ipc::ShareStatus::Syncing
+                };
+                seed_ipc::ShareSummary {
+                    share_id: id.clone(),
+                    name,
+                    folder: s.folder.to_string_lossy().into_owned(),
+                    role,
+                    status,
+                    percent: if s.last_seqno > 0 { 100 } else { 0 },
+                    online: 0,
+                    total: 0,
+                    paused: false,
+                }
+            })
+            .collect()
+    }
+
+    /// Reveal the keys for a share. Returns the master key only when this node
+    /// holds master role for the share.
+    pub fn reveal_keys(&self, share_id: &str) -> anyhow::Result<(Option<String>, String)> {
+        let state = self
+            .shares
+            .get(share_id)
+            .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
+        let viewer = state.key.encode_viewer();
+        let master = match state.key.role {
+            Role::Master => Some(state.key.encode()),
+            Role::Viewer => None,
+        };
+        Ok((master, viewer))
     }
 
     /// Wait until this engine's endpoint is online (has a complete address).
@@ -141,6 +215,7 @@ impl Engine {
             doc,
             ignore,
             last_seqno: 0,
+            last_quick_sig: 0,
         };
         self.shares.insert(share_id.clone(), state);
         self.publish(&share_id).await?;
@@ -204,6 +279,7 @@ impl Engine {
                 doc,
                 ignore: vec![],
                 last_seqno: 0,
+                last_quick_sig: 0,
             },
         );
         Ok(share_id)
@@ -276,7 +352,25 @@ impl Engine {
             .await
             .context("publish manifest")?;
         state.last_seqno = seqno;
+        state.last_quick_sig = scan::quick_signature(&state.folder, &ignore);
         Ok(())
+    }
+
+    /// (Master) Publish only if the folder changed since the last publish, using
+    /// a cheap (path,size,mtime) signature. Returns whether a publish happened.
+    pub async fn publish_if_changed(&mut self, share_id: &str) -> anyhow::Result<bool> {
+        let changed = {
+            let state = self
+                .shares
+                .get(share_id)
+                .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
+            let sig = scan::quick_signature(&state.folder, &state.ignore_set());
+            sig != state.last_quick_sig
+        };
+        if changed {
+            self.publish(share_id).await?;
+        }
+        Ok(changed)
     }
 
     /// (Viewer/mirror) Reconcile the local folder to the latest verified

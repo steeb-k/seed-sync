@@ -4613,6 +4613,7 @@ dependencies = [
  "iroh-blobs",
  "iroh-docs",
  "iroh-gossip",
+ "iroh-tickets",
  "keyring",
  "notify",
  "rand 0.8.6",
@@ -4638,6 +4639,7 @@ dependencies = [
  "interprocess",
  "seed-core",
  "seed-ipc",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
@@ -4667,9 +4669,11 @@ name = "seed-ipc"
 version = "0.1.0"
 dependencies = [
  "ciborium",
+ "interprocess",
  "serde",
  "serde_bytes",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

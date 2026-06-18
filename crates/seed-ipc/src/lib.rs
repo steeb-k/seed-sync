@@ -7,6 +7,9 @@
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "transport")]
+pub mod transport;
+
 /// Opaque 32-byte share identifier (`BLAKE3(master_pubkey)`), hex-encoded for display.
 pub type ShareId = String;
 
@@ -37,7 +40,17 @@ pub enum IpcRequest {
     AddShare {
         key: String,
         folder: String,
+        /// Optional dialable bootstrap address (an iroh endpoint-ticket string)
+        /// for the joining peer, used when DNS discovery isn't available.
+        bootstrap: Option<String>,
     },
+    /// Trigger a master republish (rescan + sign) for a share.
+    Publish {
+        share_id: ShareId,
+    },
+    /// Return this daemon's dialable address as an endpoint-ticket string, so a
+    /// peer can be handed it as `AddShare { bootstrap }`.
+    NodeAddr,
     Pause {
         share_id: ShareId,
     },
@@ -78,6 +91,7 @@ pub enum IpcResponse {
     },
     Peers(Vec<PeerInfo>),
     Settings(Settings),
+    NodeAddr(String),
     Ok,
     Err(String),
 }
@@ -193,6 +207,7 @@ mod tests {
             body: Message::Request(IpcRequest::AddShare {
                 key: "seedv1abc".into(),
                 folder: "/tmp/share".into(),
+                bootstrap: None,
             }),
         };
         let bytes = encode(&frame).unwrap();

@@ -24,6 +24,7 @@ iroh = "1.0"
 iroh-blobs = "0.103"
 iroh-gossip = "0.101"
 iroh-docs = "0.101"
+iroh-tickets = "1.0"
 
 # --- async runtime / utils ---
 tokio = { version = "1", features = ["full"] }
