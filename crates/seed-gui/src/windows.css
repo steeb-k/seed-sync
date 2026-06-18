@@ -23,3 +23,30 @@ entry,
 .boxed-list {
   border-radius: 8px;
 }
+
+/* Window control buttons: Windows 11 style — rectangular, full title-bar height,
+ * subtle hover, and a red close button. (Restyles GTK's client-side controls
+ * rather than the GNOME-ish circular default.) */
+windowcontrols > button.titlebutton {
+  border-radius: 0;
+  min-width: 44px;
+  min-height: 34px;
+  margin: 0;
+  padding: 0;
+  background-color: transparent;
+  box-shadow: none;
+}
+
+windowcontrols > button.titlebutton:hover {
+  background-color: alpha(@window_fg_color, 0.09);
+}
+
+windowcontrols > button.titlebutton.close:hover {
+  background-color: #c42b1c;
+  color: #ffffff;
+}
+
+windowcontrols > button.titlebutton.close:active {
+  background-color: #b0271a;
+  color: #ffffff;
+}

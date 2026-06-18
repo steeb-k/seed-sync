@@ -10,7 +10,10 @@
 
 mod tray;
 
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -322,6 +325,7 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
         let down_lbl = down_lbl.clone();
         let up_lbl = up_lbl.clone();
         let updated_lbl = updated_lbl.clone();
+        let rows: Rc<RefCell<HashMap<String, RowWidgets>>> = Rc::new(RefCell::new(HashMap::new()));
         glib::spawn_future_local(async move {
             while let Ok(msg) = rx.recv().await {
                 match msg {
@@ -331,7 +335,7 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
                                 updated_lbl.set_text(&format!("Last updated: {}", fmt_time(ts)));
                             }
                         }
-                        rebuild_list(&listbox, &shares, &net, &window);
+                        update_list(&listbox, &shares, &net, &window, &rows);
                     }
                     UiMsg::Created => {
                         // Don't pop the keys dialog automatically — a large folder
@@ -382,22 +386,94 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
     window.present();
 }
 
-/// Rebuild the share list rows from the latest summaries.
-fn rebuild_list(
+/// Per-row widgets we mutate in place on refresh. Keeping the rows alive (rather
+/// than tearing down and rebuilding the whole list every update) is what lets an
+/// open ⋮ popover survive the once-a-second refresh during indexing; it also
+/// stops the list from flickering and reordering on each refresh.
+struct RowWidgets {
+    row: gtk::ListBoxRow,
+    name: gtk::Label,
+    sub: gtk::Label,
+    status: gtk::Label,
+    members: gtk::Button,
+    pause_btn: gtk::Button,
+    paused: Rc<Cell<bool>>,
+}
+
+fn role_str(role: Role) -> &'static str {
+    match role {
+        Role::Master => "master",
+        Role::Viewer => "viewer",
+    }
+}
+
+fn status_text(s: &ShareSummary) -> String {
+    match s.status {
+        ShareStatus::Healthy => format!("Healthy {}%", s.percent),
+        ShareStatus::Syncing => format!("Syncing {}%", s.percent),
+        ShareStatus::Indexing => {
+            // Show "Indexing 13.4/29.0 GB (46%)", picking GB vs MB off the total.
+            let (div, unit) = if s.index_total >= 1 << 30 {
+                (1u64 << 30, "GB")
+            } else {
+                (1u64 << 20, "MB")
+            };
+            let v = |b: u64| b as f64 / div as f64;
+            format!(
+                "Indexing {:.1}/{:.1} {} ({}%)",
+                v(s.indexed_bytes),
+                v(s.index_total),
+                unit,
+                s.percent
+            )
+        }
+        ShareStatus::Paused => "Paused".into(),
+        ShareStatus::Error => "Error".into(),
+    }
+}
+
+/// Reconcile the list with the latest summaries *in place*, keyed by share id:
+/// refresh existing rows' labels, add rows for new shares, drop removed ones.
+fn update_list(
     listbox: &gtk::ListBox,
     shares: &[ShareSummary],
     net: &Net,
     window: &adw::ApplicationWindow,
+    rows: &Rc<RefCell<HashMap<String, RowWidgets>>>,
 ) {
-    while let Some(child) = listbox.first_child() {
-        listbox.remove(&child);
-    }
+    let mut rows = rows.borrow_mut();
+    rows.retain(|id, rw| {
+        let keep = shares.iter().any(|s| &s.share_id == id);
+        if !keep {
+            listbox.remove(&rw.row);
+        }
+        keep
+    });
     for s in shares {
-        listbox.append(&share_row(s, net, window));
+        if let Some(rw) = rows.get(&s.share_id) {
+            rw.name.set_label(&s.name);
+            rw.sub
+                .set_label(&format!("{} · {}", role_str(s.role), s.folder));
+            rw.status.set_label(&status_text(s));
+            rw.members
+                .set_label(&format!("{} of {} ▸", s.online, s.total));
+            rw.paused.set(s.paused);
+            rw.pause_btn.set_icon_name(if s.paused {
+                "media-playback-start-symbolic"
+            } else {
+                "media-playback-pause-symbolic"
+            });
+            rw.pause_btn
+                .set_tooltip_text(Some(if s.paused { "Resume" } else { "Pause" }));
+        } else {
+            let rw = build_row(s, net, window);
+            listbox.append(&rw.row);
+            rows.insert(s.share_id.clone(), rw);
+        }
     }
 }
 
-fn share_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> gtk::ListBoxRow {
+fn build_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> RowWidgets {
     let row = gtk::ListBoxRow::new();
     let hbox = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -408,15 +484,16 @@ fn share_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> gt
         .margin_bottom(8)
         .build();
 
-    // pause/resume toggle
-    let paused = s.paused;
+    // pause/resume toggle — reads its state from a cell so the row can be updated
+    // in place (no need to recreate the click handler when paused flips).
+    let paused = Rc::new(Cell::new(s.paused));
     let pause_btn = gtk::Button::builder()
-        .icon_name(if paused {
+        .icon_name(if s.paused {
             "media-playback-start-symbolic"
         } else {
             "media-playback-pause-symbolic"
         })
-        .tooltip_text(if paused { "Resume" } else { "Pause" })
+        .tooltip_text(if s.paused { "Resume" } else { "Pause" })
         .css_classes(["flat"])
         .valign(gtk::Align::Center)
         .build();
@@ -424,8 +501,9 @@ fn share_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> gt
         let net = net.clone();
         let id = s.share_id.clone();
         let name = s.name.clone();
+        let paused = paused.clone();
         pause_btn.connect_clicked(move |_| {
-            let (req, msg) = if paused {
+            let (req, msg) = if paused.get() {
                 (
                     IpcRequest::Resume {
                         share_id: id.clone(),
@@ -453,12 +531,8 @@ fn share_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> gt
         .halign(gtk::Align::Start)
         .css_classes(["heading"])
         .build();
-    let role = match s.role {
-        Role::Master => "master",
-        Role::Viewer => "viewer",
-    };
     let sub = gtk::Label::builder()
-        .label(format!("{role} · {}", s.folder))
+        .label(format!("{} · {}", role_str(s.role), s.folder))
         .halign(gtk::Align::Start)
         .css_classes(["dim-label", "caption"])
         .ellipsize(gtk::pango::EllipsizeMode::Middle)
@@ -469,30 +543,8 @@ fn share_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> gt
     hbox.append(&name_box);
 
     // status
-    let status_txt = match s.status {
-        ShareStatus::Healthy => format!("Healthy {}%", s.percent),
-        ShareStatus::Syncing => format!("Syncing {}%", s.percent),
-        ShareStatus::Indexing => {
-            // Show "Indexing 13.4/29.0 GB (46%)", picking GB vs MB off the total.
-            let (div, unit) = if s.index_total >= 1 << 30 {
-                (1u64 << 30, "GB")
-            } else {
-                (1u64 << 20, "MB")
-            };
-            let v = |b: u64| b as f64 / div as f64;
-            format!(
-                "Indexing {:.1}/{:.1} {} ({}%)",
-                v(s.indexed_bytes),
-                v(s.index_total),
-                unit,
-                s.percent
-            )
-        }
-        ShareStatus::Paused => "Paused".into(),
-        ShareStatus::Error => "Error".into(),
-    };
     let status = gtk::Label::builder()
-        .label(status_txt)
+        .label(status_text(s))
         .halign(gtk::Align::End)
         .build();
     hbox.append(&status);
@@ -602,7 +654,15 @@ fn share_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> gt
     hbox.append(&menu_btn);
 
     row.set_child(Some(&hbox));
-    row
+    RowWidgets {
+        row,
+        name,
+        sub,
+        status,
+        members,
+        pause_btn,
+        paused,
+    }
 }
 
 /// Default ignore patterns offered when creating a share.
