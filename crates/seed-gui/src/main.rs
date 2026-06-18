@@ -130,9 +130,18 @@ async fn stream_events(
 }
 
 fn default_socket() -> PathBuf {
-    directories::ProjectDirs::from("io.github", "steeb_k", "SeedSync")
-        .map(|d| d.data_dir().join("seed.sock"))
-        .unwrap_or_else(|| PathBuf::from(".seed-data/seed.sock"))
+    // Match the daemon's machine-wide socket on Windows so the unprivileged GUI
+    // can reach a daemon that may be running as a LocalSystem service.
+    #[cfg(windows)]
+    {
+        seed_ipc::machine_socket()
+    }
+    #[cfg(not(windows))]
+    {
+        directories::ProjectDirs::from("io.github", "steeb_k", "SeedSync")
+            .map(|d| d.data_dir().join("seed.sock"))
+            .unwrap_or_else(|| PathBuf::from(".seed-data/seed.sock"))
+    }
 }
 
 fn main() -> glib::ExitCode {

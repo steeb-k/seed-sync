@@ -8,7 +8,7 @@ description = "Wire types + framing for the Seed Sync GUI<->daemon IPC channel"
 [features]
 # Off by default so pure consumers (e.g. anything only needing the types) stay
 # dependency-light. The daemon, CLI, and GUI enable it for the async transport.
-transport = ["dep:tokio", "dep:interprocess"]
+transport = ["dep:tokio", "dep:interprocess", "dep:widestring"]
 
 [dependencies]
 serde.workspace = true
@@ -18,3 +18,7 @@ thiserror.workspace = true
 
 tokio = { workspace = true, optional = true }
 interprocess = { workspace = true, optional = true }
+
+# Windows-only: build the named-pipe security descriptor from an SDDL string.
+[target.'cfg(windows)'.dependencies]
+widestring = { version = "1", optional = true }

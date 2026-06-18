@@ -5213,6 +5213,7 @@ dependencies = [
  "serde_bytes",
  "thiserror 1.0.69",
  "tokio",
+ "widestring",
 ]
 
 [[package]]

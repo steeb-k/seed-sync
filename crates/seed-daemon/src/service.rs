@@ -5,10 +5,12 @@
 //! Stop/Shutdown control. `manage` implements the install/uninstall/start/stop
 //! subcommands via the service manager.
 //!
-//! NOTE (validate on Windows): the service is installed to run as LocalSystem; a
-//! GUI running as the logged-in user must be able to reach the IPC pipe and the
-//! daemon must reach user-chosen folders — review the named-pipe naming
-//! (interprocess `GenericFilePath` vs `GenericNamespaced`) and DACLs here.
+//! The service is installed to run as LocalSystem; the GUI runs as the logged-in
+//! user. They meet over the IPC pipe: both derive its path from the machine-wide
+//! data dir (`seed_ipc::machine_data_dir`, `crate::default_data_dir`), and the
+//! pipe is created with a permissive DACL (`seed_ipc::transport`) so the user can
+//! open a pipe the service created. Seeds the daemon stores live in the service
+//! account's credential vault, which is fine — only the daemon needs them.
 
 use std::ffi::{OsStr, OsString};
 use std::sync::Arc;

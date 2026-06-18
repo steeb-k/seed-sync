@@ -78,8 +78,18 @@ pub async fn connect(path: &Path) -> io::Result<Stream> {
     Stream::connect(socket_name(path)?).await
 }
 
+/// Named-pipe DACL applied on Windows: SYSTEM and Administrators get full
+/// control; Authenticated Users get read/write (connect + duplex IO, but *not*
+/// `FILE_CREATE_PIPE_INSTANCE`, so they cannot stand up a rogue server). This is
+/// what lets the logged-in user's unprivileged GUI/CLI open a pipe created by a
+/// daemon running as LocalSystem.
+#[cfg(windows)]
+const PIPE_SDDL: &str = "D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFW;;;AU)";
+
 /// Bind a listener at the socket `path`. On Unix a stale socket file from a
-/// previous run is removed first so rebinding succeeds.
+/// previous run is removed first so rebinding succeeds. On Windows the pipe is
+/// created with a permissive DACL (see [`PIPE_SDDL`]) so cross-account
+/// (service ↔ user) IPC works.
 pub fn bind(path: &Path) -> io::Result<Listener> {
     #[cfg(unix)]
     {
@@ -87,9 +97,15 @@ pub fn bind(path: &Path) -> io::Result<Listener> {
             let _ = std::fs::remove_file(path);
         }
     }
-    ListenerOptions::new()
-        .name(socket_name(path)?)
-        .create_tokio()
+    let opts = ListenerOptions::new().name(socket_name(path)?);
+    #[cfg(windows)]
+    let opts = {
+        use interprocess::os::windows::local_socket::ListenerOptionsExt;
+        use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+        let sddl = widestring::U16CString::from_str(PIPE_SDDL).map_err(io_other)?;
+        opts.security_descriptor(SecurityDescriptor::deserialize(&sddl)?)
+    };
+    opts.create_tokio()
 }
 
 /// Accept the next incoming connection (wraps the prelude trait method so

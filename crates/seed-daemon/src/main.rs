@@ -101,9 +101,19 @@ fn platform_service_cmd(cmd: &str) -> anyhow::Result<()> {
 }
 
 pub(crate) fn default_data_dir() -> PathBuf {
-    directories::ProjectDirs::from("io.github", "steeb_k", "SeedSync")
-        .map(|d| d.data_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from(".seed-data"))
+    // On Windows the daemon and the user-run GUI must agree on a single location
+    // so they derive the same IPC socket/pipe even across the service↔user
+    // account boundary; use the machine-wide dir rather than a per-profile one.
+    #[cfg(windows)]
+    {
+        seed_ipc::machine_data_dir()
+    }
+    #[cfg(not(windows))]
+    {
+        directories::ProjectDirs::from("io.github", "steeb_k", "SeedSync")
+            .map(|d| d.data_dir().to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(".seed-data"))
+    }
 }
 
 pub(crate) fn default_socket(data_dir: &std::path::Path) -> PathBuf {

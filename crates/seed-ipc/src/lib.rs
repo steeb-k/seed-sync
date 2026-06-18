@@ -10,6 +10,29 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "transport")]
 pub mod transport;
 
+/// Machine-wide data directory on Windows: `%PROGRAMDATA%\SeedSync`.
+///
+/// The daemon may run as a LocalSystem service while the GUI/CLI run as the
+/// logged-in user. Per-account profile dirs (what `directories` returns) would
+/// resolve differently for each, so they'd compute different socket paths — and
+/// since the pipe name is hashed from that path, they'd never meet. A fixed
+/// machine-wide location makes both sides derive the *same* socket. The daemon
+/// owns this directory exclusively (DB + iroh store); the GUI only needs the
+/// socket path, never the directory's contents.
+#[cfg(windows)]
+pub fn machine_data_dir() -> std::path::PathBuf {
+    let base = std::env::var_os("ProgramData")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"));
+    base.join("SeedSync")
+}
+
+/// The machine-wide IPC socket path on Windows (`%PROGRAMDATA%\SeedSync\seed.sock`).
+#[cfg(windows)]
+pub fn machine_socket() -> std::path::PathBuf {
+    machine_data_dir().join("seed.sock")
+}
+
 /// Opaque 32-byte share identifier (`BLAKE3(master_pubkey)`), hex-encoded for display.
 pub type ShareId = String;
 
