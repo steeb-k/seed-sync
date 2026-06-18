@@ -229,6 +229,20 @@ impl Engine {
             .await
             .context("import namespace")?;
         std::fs::create_dir_all(folder)?;
+
+        // If no explicit bootstrap was given, a viewer can still reach the
+        // master by its endpoint id (carried in the key) via n0 DNS discovery —
+        // build an address with just the id and let discovery resolve it.
+        let mut bootstrap = bootstrap;
+        if bootstrap.is_empty() && matches!(key.role, Role::Viewer) {
+            if let Some(eid) = key.endpoint_id() {
+                if let Ok(pk) = iroh::EndpointId::from_bytes(&eid) {
+                    tracing::info!("no bootstrap given; using endpoint-id discovery");
+                    bootstrap.push(iroh::EndpointAddr::new(pk));
+                }
+            }
+        }
+
         // Subscribe (keeps live sync alive + feeds the peer roster) and register
         // the namespace for serving + connect to any bootstrap peers.
         let roster = Arc::new(StdMutex::new(PeerRoster::default()));
