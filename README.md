@@ -26,7 +26,9 @@ signed-manifest trust model layered on top.
 Requires the GTK4 and Libadwaita development packages and a stable Rust toolchain.
 
 ```bash
-# Debian/Ubuntu: sudo apt install libgtk-4-dev libadwaita-1-dev
+# Debian/Ubuntu: sudo apt install libgtk-4-dev libadwaita-1-dev libdbus-1-dev
+#   (libdbus is for the Secret Service keystore backend; on Windows/macOS the
+#    native keystore is used and no extra dev lib is needed)
 cargo build --workspace
 cargo test --workspace
 ```
