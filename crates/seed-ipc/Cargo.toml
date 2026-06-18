@@ -1,0 +1,12 @@
+[package]
+name = "seed-ipc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Wire types + framing for the Seed Sync GUI<->daemon IPC channel"
+
+[dependencies]
+serde.workspace = true
+serde_bytes.workspace = true
+ciborium.workspace = true
+thiserror.workspace = true

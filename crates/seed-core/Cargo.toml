@@ -1,0 +1,48 @@
+[package]
+name = "seed-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Seed Sync sync engine: iroh transport + crypto + filesystem mirroring"
+
+[dependencies]
+# iroh stack
+iroh.workspace = true
+iroh-blobs.workspace = true
+iroh-docs.workspace = true
+iroh-gossip.workspace = true
+
+# async / util
+tokio.workspace = true
+futures-lite.workspace = true
+
+# serialization / encoding
+serde.workspace = true
+serde_bytes.workspace = true
+ciborium.workspace = true
+bech32.workspace = true
+data-encoding.workspace = true
+
+# crypto / hashing
+ed25519-dalek.workspace = true
+blake3.workspace = true
+rand.workspace = true
+
+# storage / fs
+rusqlite.workspace = true
+notify.workspace = true
+walkdir.workspace = true
+directories.workspace = true
+keyring.workspace = true
+
+# diagnostics
+tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+
+# shared IPC role/status types reused in summaries
+seed-ipc = { path = "../seed-ipc" }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = "3"

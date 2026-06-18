@@ -1,0 +1,29 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Local runtime data / test scratch
+*.db
+*.db-shm
+*.db-wal
+/.seed-data/
+**/iroh-data/
+/scratch/
+
+# Windows packaging artifacts
+/dist/
+/gtk-runtime/
+*.msi
+*.wixobj
+*.wixpdb
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Secrets / local config
+.env
+.cargo/config.local.toml

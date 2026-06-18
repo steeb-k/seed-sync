@@ -1,0 +1,23 @@
+[package]
+name = "seed-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Seed Sync background sync daemon (console in dev, Windows service in production)"
+
+[[bin]]
+name = "seed-daemon"
+path = "src/main.rs"
+
+[dependencies]
+seed-core = { path = "../seed-core" }
+seed-ipc = { path = "../seed-ipc" }
+tokio.workspace = true
+tokio-util.workspace = true
+interprocess.workspace = true
+futures-lite.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+directories.workspace = true

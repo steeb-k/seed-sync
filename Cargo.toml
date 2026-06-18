@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/seed-ipc",
+    "crates/seed-core",
+    "crates/seed-daemon",
+    "crates/seed-gui",
+    "crates/seed-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/steeb-k/seed-sync-gtk"
+rust-version = "1.85"
+
+# Shared dependency versions. The iroh ecosystem crates must be bumped TOGETHER:
+# they share `iroh-base`, and mixing minors fails to compile. After any bump run
+# `cargo tree -d` and confirm a single `iroh-base` resolves.
+[workspace.dependencies]
+# --- iroh P2P stack (pin together; all resolve to iroh-base 1.0) ---
+iroh = "1.0"
+iroh-blobs = "0.103"
+iroh-gossip = "0.101"
+iroh-docs = "0.101"
+
+# --- async runtime / utils ---
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-lite = "2"
+async-channel = "2"
+
+# --- serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+ciborium = "0.2"          # CBOR (serde)
+data-encoding = "2"       # base32 for key strings
+bech32 = "0.12"
+
+# --- crypto / hashing ---
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+blake3 = "1"
+rand = "0.8"
+
+# --- storage / fs ---
+rusqlite = { version = "0.40", features = ["bundled"] }
+notify = "8"
+walkdir = "2"
+directories = "5"
+keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
+
+# --- gui (binding versions track installed GTK 4.22 / libadwaita 1.9) ---
+gtk = { package = "gtk4", version = "0.11" }
+adw = { package = "libadwaita", version = "0.9" }
+glib = "0.22"
+
+# --- platform / ipc ---
+interprocess = { version = "2", features = ["tokio"] }
+
+# --- diagnostics / cli ---
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

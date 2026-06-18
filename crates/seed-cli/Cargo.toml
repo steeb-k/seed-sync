@@ -1,0 +1,19 @@
+[package]
+name = "seed-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless Seed Sync IPC client for scripted testing (loopback harness)"
+
+[[bin]]
+name = "seed-cli"
+path = "src/main.rs"
+
+[dependencies]
+seed-ipc = { path = "../seed-ipc" }
+tokio.workspace = true
+tokio-util.workspace = true
+interprocess.workspace = true
+futures-lite.workspace = true
+clap.workspace = true
+anyhow.workspace = true
