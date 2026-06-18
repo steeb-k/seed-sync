@@ -42,8 +42,14 @@ pub struct Manifest {
     /// Unix seconds; viewers reject manifests with `expiry < now`.
     pub expiry: i64,
     /// BLAKE3 merkle root over the sorted file set (see [`Manifest::compute_root`]).
+    /// Redundant given `files`, but a compact version identifier and a
+    /// self-consistency check.
     #[serde(with = "serde_bytes")]
     pub merkle_root: Vec<u8>,
+    /// The authoritative live file set. A path's *absence* here means "deleted":
+    /// viewers remove any local file not listed. This is the single source of
+    /// truth the master signs.
+    pub files: Vec<FileEntry>,
     /// Master-defined ignore globs, honored identically by all peers.
     pub ignore: Vec<String>,
     // --- reserved for future multi-master (parsed but unused at format 1) ---
@@ -94,6 +100,29 @@ pub enum ManifestError {
 }
 
 impl Manifest {
+    /// Build an unsigned manifest for `files`, computing the merkle root.
+    pub fn new(
+        share_id: Vec<u8>,
+        seqno: u64,
+        expiry: i64,
+        mut files: Vec<FileEntry>,
+        ignore: Vec<String>,
+    ) -> Self {
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let merkle_root = Self::compute_root(&files);
+        Self {
+            format: MANIFEST_FORMAT,
+            share_id,
+            seqno,
+            expiry,
+            merkle_root,
+            files,
+            ignore,
+            writers: None,
+            revoked: None,
+        }
+    }
+
     /// Compute the BLAKE3 merkle root over a file set. Entries are sorted by path
     /// for a deterministic, order-independent root. Each entry contributes
     /// `path \0 hash size deleted` to a rolling hasher.
@@ -146,17 +175,25 @@ pub struct VerifyContext<'a> {
     pub now: i64,
 }
 
-/// Verify a signed manifest. On success returns the decoded [`Manifest`]; the
-/// caller must still confirm the merkle root against the actual doc/file set via
-/// [`verify_root`].
-pub fn verify(signed: &SignedManifest, ctx: &VerifyContext) -> Result<Manifest, ManifestError> {
+/// Verify everything about a signed manifest *except* the anti-rollback seqno
+/// check: the signer is the pinned master key, the signature is valid, the
+/// format is supported, the share id matches, and it has not expired. Callers
+/// that also need anti-rollback use [`verify`]; callers that want to re-apply
+/// the current manifest (e.g. to revert local drift) use this and compare
+/// seqno themselves.
+pub fn verify_signed(
+    signed: &SignedManifest,
+    pinned_master: &VerifyingKey,
+    expected_share_id: &[u8],
+    now: i64,
+) -> Result<Manifest, ManifestError> {
     // 1. Signer must be the pinned master key.
-    if signed.signer != ctx.pinned_master.to_bytes() {
+    if signed.signer != pinned_master.to_bytes() {
         return Err(ManifestError::WrongSigner);
     }
     // 2. Signature must be valid over the exact bytes that were signed.
     let sig = Signature::from_slice(&signed.sig).map_err(|_| ManifestError::BadSignature)?;
-    ctx.pinned_master
+    pinned_master
         .verify(&signed.manifest_cbor, &sig)
         .map_err(|_| ManifestError::BadSignature)?;
 
@@ -167,21 +204,29 @@ pub fn verify(signed: &SignedManifest, ctx: &VerifyContext) -> Result<Manifest, 
         return Err(ManifestError::UnsupportedFormat(manifest.format));
     }
     // 4. Share id must match.
-    if manifest.share_id != ctx.expected_share_id {
+    if manifest.share_id != expected_share_id {
         return Err(ManifestError::ShareIdMismatch);
     }
-    // 5. Anti-rollback: strictly increasing seqno.
+    // 5. Expiry.
+    if manifest.expiry < now {
+        return Err(ManifestError::Expired {
+            expiry: manifest.expiry,
+            now,
+        });
+    }
+    Ok(manifest)
+}
+
+/// Verify a signed manifest, including the anti-rollback seqno check. On success
+/// returns the decoded [`Manifest`]; the caller must still confirm the merkle
+/// root against the file set via [`verify_root`].
+pub fn verify(signed: &SignedManifest, ctx: &VerifyContext) -> Result<Manifest, ManifestError> {
+    let manifest = verify_signed(signed, ctx.pinned_master, ctx.expected_share_id, ctx.now)?;
+    // Anti-rollback: strictly increasing seqno.
     if manifest.seqno <= ctx.last_seqno {
         return Err(ManifestError::StaleSeqno {
             got: manifest.seqno,
             last: ctx.last_seqno,
-        });
-    }
-    // 6. Expiry.
-    if manifest.expiry < ctx.now {
-        return Err(ManifestError::Expired {
-            expiry: manifest.expiry,
-            now: ctx.now,
         });
     }
     Ok(manifest)
@@ -223,16 +268,7 @@ mod tests {
         let share_id = blake3::hash(&key.verifying_key().to_bytes())
             .as_bytes()
             .to_vec();
-        let manifest = Manifest {
-            format: MANIFEST_FORMAT,
-            share_id,
-            seqno,
-            expiry,
-            merkle_root: Manifest::compute_root(entries),
-            ignore: vec![],
-            writers: None,
-            revoked: None,
-        };
+        let manifest = Manifest::new(share_id, seqno, expiry, entries.to_vec(), vec![]);
         sign(&manifest, key).unwrap()
     }
 

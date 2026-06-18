@@ -37,15 +37,27 @@ struct ShareKeyPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[serde(with = "serde_bytes_opt")]
     master_seed: Option<Vec<u8>>,
+    /// The creating master device's iroh endpoint id (32 bytes), used as a
+    /// discovery bootstrap hint. Optional so older keys still parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(with = "serde_bytes_opt")]
+    endpoint_id: Option<Vec<u8>>,
 }
 
 /// A parsed share key, exposing role-appropriate cryptographic material.
+///
+/// The 32-byte ed25519 material does double duty: as a dalek signing/verifying
+/// key for the manifest trust model, and (via the same bytes) as the iroh-docs
+/// `NamespaceSecret`/`NamespaceId` for the share's document — both derive the
+/// identical public key from the seed, so one secret drives both layers.
 #[derive(Debug, Clone)]
 pub struct ShareKey {
     pub role: Role,
     pub master_pub: VerifyingKey,
     /// `Some` only for master keys.
     seed: Option<[u8; 32]>,
+    /// Creating master device's iroh endpoint id, for discovery bootstrap.
+    endpoint_id: Option<[u8; 32]>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -71,7 +83,29 @@ impl ShareKey {
             role: Role::Master,
             master_pub: signing.verifying_key(),
             seed: Some(signing.to_bytes()),
+            endpoint_id: None,
         }
+    }
+
+    /// Raw 32-byte public key (== iroh `NamespaceId` bytes for the share's doc).
+    pub fn master_pub_bytes(&self) -> [u8; 32] {
+        self.master_pub.to_bytes()
+    }
+
+    /// Raw 32-byte signing seed (== iroh `NamespaceSecret` bytes). Master only.
+    pub fn seed_bytes(&self) -> Option<[u8; 32]> {
+        self.seed
+    }
+
+    /// The discovery bootstrap endpoint id, if the key carried one.
+    pub fn endpoint_id(&self) -> Option<[u8; 32]> {
+        self.endpoint_id
+    }
+
+    /// Attach the creating master device's endpoint id (discovery bootstrap).
+    pub fn with_endpoint_id(mut self, id: [u8; 32]) -> Self {
+        self.endpoint_id = Some(id);
+        self
     }
 
     /// The 32-byte share id = BLAKE3(master_pub).
@@ -95,6 +129,7 @@ impl ShareKey {
         ShareKey {
             role: Role::Viewer,
             master_pub: self.master_pub,
+            endpoint_id: self.endpoint_id,
             seed: None,
         }
     }
@@ -108,6 +143,7 @@ impl ShareKey {
                 Role::Master => self.seed.map(|s| s.to_vec()),
                 Role::Viewer => None,
             },
+            endpoint_id: self.endpoint_id.map(|e| e.to_vec()),
         };
         let mut cbor = Vec::new();
         ciborium::into_writer(&payload, &mut cbor).expect("cbor encode share key");
@@ -153,10 +189,15 @@ impl ShareKey {
             },
             Role::Viewer => None,
         };
+        let endpoint_id = match payload.endpoint_id {
+            Some(e) => Some(e.as_slice().try_into().map_err(|_| KeyError::BadLength)?),
+            None => None,
+        };
         Ok(ShareKey {
             role,
             master_pub,
             seed,
+            endpoint_id,
         })
     }
 }

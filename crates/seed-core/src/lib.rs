@@ -8,12 +8,16 @@
 //! encoding ([`identity`]) come first and are fully testable without iroh; the
 //! networked [`engine`] is layered on top.
 
+pub mod engine;
 pub mod identity;
 pub mod manifest;
+pub mod node;
 pub mod scan;
 
+pub use engine::Engine;
 pub use identity::{Role, ShareKey};
 pub use manifest::{Manifest, SignedManifest, VerifyContext};
+pub use node::IrohNode;
 
 /// Crate-wide result alias.
 pub type Result<T> = anyhow::Result<T>;

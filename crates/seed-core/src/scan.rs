@@ -176,15 +176,8 @@ mod tests {
     #[test]
     fn empty_dir_scans_clean() {
         let dir = tempfile::tempdir().unwrap();
-        let (ig, _) = IgnoreSet::default_with(&[]);
+        let (ig, _) = IgnoreSet::compile(&[]);
         let files = scan(dir.path(), &ig).unwrap();
         assert!(files.is_empty());
-    }
-}
-
-impl IgnoreSet {
-    /// Convenience for tests/callers: compile, discarding the bad-pattern list.
-    pub fn default_with(patterns: &[String]) -> (Self, Vec<String>) {
-        Self::compile(patterns)
     }
 }
