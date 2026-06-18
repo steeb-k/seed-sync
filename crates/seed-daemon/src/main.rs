@@ -35,7 +35,7 @@ struct Cli {
     socket: Option<PathBuf>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Clone)]
 enum Command {
     /// Run the daemon in the foreground.
     Run,
@@ -59,15 +59,11 @@ struct Daemon {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "seed_daemon=info,seed_core=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
-    match cli.command.unwrap_or(Command::Run) {
+    let command = cli.command.clone().unwrap_or(Command::Run);
+    init_logging(&command, cli.data_dir.clone());
+
+    match command {
         Command::Run => run(cli.data_dir, cli.socket),
         Command::Service => {
             #[cfg(windows)]
@@ -82,6 +78,39 @@ fn main() -> anyhow::Result<()> {
         Command::Start => platform_service_cmd("start"),
         Command::Stop => platform_service_cmd("stop"),
     }
+}
+
+fn env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| "seed_daemon=info,seed_core=info".into())
+}
+
+/// Console commands (`run`, install/start/…) log to stderr. The SCM-launched
+/// `service` has no console, so it logs to `<data_dir>\daemon.log` instead —
+/// otherwise its diagnostics (e.g. a failed `create_share`) vanish.
+fn init_logging(command: &Command, data_dir_override: Option<PathBuf>) {
+    let _ = command;
+    let _ = &data_dir_override;
+    #[cfg(windows)]
+    if matches!(command, Command::Service) {
+        let dir = data_dir_override.unwrap_or_else(default_data_dir);
+        let _ = std::fs::create_dir_all(&dir);
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("daemon.log"))
+        {
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_env_filter(env_filter())
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+            return;
+        }
+    }
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter())
+        .init();
 }
 
 #[cfg(windows)]
@@ -296,7 +325,13 @@ async fn handle_conn(daemon: Daemon, stream: transport::Stream) -> anyhow::Resul
 async fn dispatch(daemon: &Daemon, req: IpcRequest) -> IpcResponse {
     match handle_request(daemon, req).await {
         Ok(resp) => resp,
-        Err(e) => IpcResponse::Err(e.to_string()),
+        Err(e) => {
+            // `{e:#}` prints the full anyhow context chain (e.g. "scan folder:
+            // Access is denied."), which is what we need to diagnose failures
+            // under the service where there's no console.
+            tracing::warn!("request failed: {e:#}");
+            IpcResponse::Err(e.to_string())
+        }
     }
 }
 
