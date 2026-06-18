@@ -105,6 +105,22 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// Write a master seed to the OS keystore without letting it block share
+/// creation. The keystore call is synchronous and, under the Windows
+/// LocalSystem service (session 0), the Credential Manager API can hang
+/// indefinitely. Run it on a blocking thread and abandon it after a short
+/// timeout so [`Engine::persist_share`] falls back to storing the key in the DB
+/// rather than wedging the whole request.
+async fn store_seed_bounded(share_id: &str, seed: [u8; 32]) -> anyhow::Result<()> {
+    let share_id = share_id.to_owned();
+    let handle = tokio::task::spawn_blocking(move || crate::secrets::store_seed(&share_id, &seed));
+    match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(join_err)) => Err(anyhow!("keystore task failed: {join_err}")),
+        Err(_) => Err(anyhow!("keystore write timed out after 5s")),
+    }
+}
+
 /// Returned by [`Engine::create_share`].
 pub struct CreatedShare {
     pub share_id: String,
@@ -388,15 +404,20 @@ impl Engine {
     ) -> anyhow::Result<CreatedShare> {
         let key = ShareKey::generate_master().with_endpoint_id(self.node.endpoint_id_bytes());
         let share_id = key.share_id_hex();
+        tracing::info!(%share_id, "create_share: opening share");
         let state = self
             .open_share(&key, folder, vec![], ignore.clone(), 0, false)
             .await?;
         self.shares.insert(share_id.clone(), state);
+        tracing::info!(%share_id, "create_share: publishing");
         self.publish(&share_id).await?; // sets last_seqno
 
         // Persist (with the post-publish seqno), routing the seed to the keystore.
         let last_seqno = self.shares[&share_id].last_seqno;
-        self.persist_share(&key, folder, ignore, last_seqno, false)?;
+        tracing::info!(%share_id, "create_share: persisting");
+        self.persist_share(&key, folder, ignore, last_seqno, false)
+            .await?;
+        tracing::info!(%share_id, "create_share: done");
 
         Ok(CreatedShare {
             share_id,
@@ -408,7 +429,7 @@ impl Engine {
     /// Persist a share to the DB, storing a master seed in the OS keystore when
     /// available (DB then holds only the seedless viewer key); otherwise falls
     /// back to storing the full key in the DB.
-    fn persist_share(
+    async fn persist_share(
         &self,
         key: &ShareKey,
         folder: &Path,
@@ -418,7 +439,7 @@ impl Engine {
     ) -> anyhow::Result<()> {
         let share_id = key.share_id_hex();
         let (db_key, seed_in_keyring) = match (key.role, key.seed_bytes()) {
-            (Role::Master, Some(seed)) => match crate::secrets::store_seed(&share_id, &seed) {
+            (Role::Master, Some(seed)) => match store_seed_bounded(&share_id, seed).await {
                 Ok(()) => (key.encode_viewer(), true),
                 Err(e) => {
                     tracing::warn!("OS keystore unavailable; storing key in DB instead: {e}");
@@ -455,7 +476,7 @@ impl Engine {
             .open_share(&key, folder, bootstrap, vec![], 0, false)
             .await?;
         self.shares.insert(share_id.clone(), state);
-        self.persist_share(&key, folder, vec![], 0, false)?;
+        self.persist_share(&key, folder, vec![], 0, false).await?;
         Ok(share_id)
     }
 
@@ -479,11 +500,37 @@ impl Engine {
         let mut files = Vec::with_capacity(scanned.len());
         let mut live_keys: HashSet<Vec<u8>> = HashSet::new();
         for sf in &scanned {
-            let content = std::fs::read(&sf.abs_path)
-                .with_context(|| format!("read {}", sf.abs_path.display()))?;
+            // Stream the file into the blob store *by path* and record the doc
+            // entry by hash. Never `std::fs::read` the whole file: a shared
+            // folder can hold multi-GB files, and slurping one into a Vec would
+            // blow memory and (under the engine lock) wedge the whole daemon.
+            // `scan` already hashed the file with the same BLAKE3 the blob store
+            // uses, so the imported blob's hash matches `sf.entry.hash`.
+            let arr: [u8; 32] = sf
+                .entry
+                .hash
+                .as_slice()
+                .try_into()
+                .context("scanned hash has wrong length")?;
+            let hash = Hash::from(arr);
+            // Hold the temp tag until the doc entry references the hash, so the
+            // freshly-imported blob can't be reclaimed in between.
+            let _tag = self
+                .node
+                .blobs
+                .blobs()
+                .add_path(&sf.abs_path)
+                .temp_tag()
+                .await
+                .with_context(|| format!("import {}", sf.abs_path.display()))?;
             state
                 .doc
-                .set_bytes(author, sf.entry.path.as_bytes().to_vec(), content)
+                .set_hash(
+                    author,
+                    sf.entry.path.as_bytes().to_vec(),
+                    hash,
+                    sf.entry.size,
+                )
                 .await
                 .with_context(|| format!("set doc entry {}", sf.entry.path))?;
             live_keys.insert(sf.entry.path.as_bytes().to_vec());
