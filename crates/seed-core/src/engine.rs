@@ -22,7 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context};
 use ed25519_dalek::SigningKey;
 use futures_lite::StreamExt;
-use iroh_blobs::{store::fs::FsStore, Hash};
+use iroh_blobs::api::blobs::{AddPathOptions, ImportMode};
+use iroh_blobs::{store::fs::FsStore, BlobFormat, Hash};
 use iroh_docs::{
     api::Doc, engine::LiveEvent, store::Query, sync::Capability, AuthorId, NamespaceId,
     NamespaceSecret,
@@ -184,13 +185,26 @@ impl PublishJob {
         let mut files = Vec::with_capacity(listed.len());
         let mut live_keys: HashSet<Vec<u8>> = HashSet::new();
         for f in &listed {
-            // The import hashes the content; take that hash for the doc entry +
-            // manifest. Hold the temp tag until the doc references the hash so
-            // the freshly-imported blob can't be reclaimed in between.
+            // Import by *reference*, not copy: the blob store keeps only the
+            // outboard (hash tree) and points at the file in place, instead of
+            // duplicating the content into `…/blobs`. This is what stops a shared
+            // folder from doubling on disk. The import still hashes the file to
+            // build the outboard, so we get the content hash for the doc entry +
+            // manifest. Hold the temp tag until the doc references the hash so the
+            // freshly-imported blob can't be reclaimed in between.
+            //
+            // Tradeoff: if the master later edits/moves the file, the referenced
+            // blob goes stale — but the reconcile loop re-imports changed files
+            // (new hash + outboard) and republishes, so peers move to the new
+            // blob and a stale read just fails verification rather than corrupts.
             let tag = self
                 .blobs
                 .blobs()
-                .add_path(&f.abs)
+                .add_path_with_opts(AddPathOptions {
+                    path: f.abs.clone(),
+                    format: BlobFormat::Raw,
+                    mode: ImportMode::TryReference,
+                })
                 .temp_tag()
                 .await
                 .with_context(|| format!("import {}", f.abs.display()))?;
