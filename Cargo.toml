@@ -60,6 +60,7 @@ glib = "0.22"
 # --- platform / ipc ---
 interprocess = { version = "2", features = ["tokio"] }
 tray-icon = "0.24"
+windows-service = "0.8"
 
 # --- diagnostics / cli ---
 tracing = "0.1"

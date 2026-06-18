@@ -72,55 +72,90 @@ fn main() -> anyhow::Result<()> {
         Command::Service => {
             #[cfg(windows)]
             {
-                anyhow::bail!("service mode not yet implemented");
+                service::run_as_service().map_err(Into::into)
             }
             #[cfg(not(windows))]
             anyhow::bail!("`service` mode is Windows-only; use `run`");
         }
-        Command::Install | Command::Uninstall | Command::Start | Command::Stop => {
-            #[cfg(not(windows))]
-            {
-                tracing::warn!("service management is a no-op on this platform");
-                Ok(())
-            }
-            #[cfg(windows)]
-            anyhow::bail!("service management not yet implemented");
-        }
+        Command::Install => platform_service_cmd("install"),
+        Command::Uninstall => platform_service_cmd("uninstall"),
+        Command::Start => platform_service_cmd("start"),
+        Command::Stop => platform_service_cmd("stop"),
     }
 }
 
-fn default_data_dir() -> PathBuf {
+#[cfg(windows)]
+mod service;
+
+fn platform_service_cmd(cmd: &str) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        return service::manage(cmd).map_err(Into::into);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = cmd;
+        tracing::warn!("service management is Windows-only; no-op on this platform");
+        Ok(())
+    }
+}
+
+pub(crate) fn default_data_dir() -> PathBuf {
     directories::ProjectDirs::from("io.github", "steeb_k", "SeedSync")
         .map(|d| d.data_dir().to_path_buf())
         .unwrap_or_else(|| PathBuf::from(".seed-data"))
+}
+
+pub(crate) fn default_socket(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("seed.sock")
 }
 
 fn run(data_dir: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async move {
         let data_dir = data_dir.unwrap_or_else(default_data_dir);
-        std::fs::create_dir_all(&data_dir)?;
-        let socket = socket.unwrap_or_else(|| data_dir.join("seed.sock"));
+        let socket = socket.unwrap_or_else(|| default_socket(&data_dir));
+        // Console mode: run until Ctrl-C.
+        serve(data_dir, socket, async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+    })
+}
 
-        let engine = Engine::new(&data_dir).await?;
-        // Wait (briefly) for a complete address so NodeAddr is useful, but don't
-        // block startup forever if relays are unreachable.
-        let _ = tokio::time::timeout(Duration::from_secs(10), engine.wait_online()).await;
+/// Run the daemon until `shutdown` resolves. Shared by console (`run`) and the
+/// Windows service entry point.
+pub(crate) async fn serve(
+    data_dir: PathBuf,
+    socket: PathBuf,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&data_dir)?;
+    let engine = Engine::new(&data_dir).await?;
+    // Wait (briefly) for a complete address so NodeAddr is useful, but don't
+    // block startup forever if relays are unreachable.
+    let _ = tokio::time::timeout(Duration::from_secs(10), engine.wait_online()).await;
 
-        let (events, _) = broadcast::channel::<IpcEvent>(128);
-        let daemon = Daemon {
-            engine: Arc::new(Mutex::new(engine)),
-            events,
-        };
+    let (events, _) = broadcast::channel::<IpcEvent>(128);
+    let daemon = Daemon {
+        engine: Arc::new(Mutex::new(engine)),
+        events,
+    };
 
-        tokio::spawn(reconcile_loop(daemon.clone()));
-        tokio::spawn(throughput_loop(daemon.clone()));
+    tokio::spawn(reconcile_loop(daemon.clone()));
+    tokio::spawn(throughput_loop(daemon.clone()));
 
-        let listener = transport::bind(&socket)?;
-        tracing::info!("seed-daemon listening on {}", socket.display());
+    let listener = transport::bind(&socket)?;
+    tracing::info!("seed-daemon listening on {}", socket.display());
 
-        loop {
-            match transport::accept(&listener).await {
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => {
+                tracing::info!("shutdown requested");
+                break;
+            }
+            res = transport::accept(&listener) => match res {
                 Ok(stream) => {
                     let d = daemon.clone();
                     tokio::spawn(async move {
@@ -129,12 +164,11 @@ fn run(data_dir: Option<PathBuf>, socket: Option<PathBuf>) -> anyhow::Result<()>
                         }
                     });
                 }
-                Err(e) => {
-                    tracing::warn!("accept error: {e}");
-                }
+                Err(e) => tracing::warn!("accept error: {e}"),
             }
         }
-    })
+    }
+    Ok(())
 }
 
 /// Periodically apply updates to viewer shares and republish changed masters.
