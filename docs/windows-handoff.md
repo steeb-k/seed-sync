@@ -28,16 +28,17 @@ cargo test --workspace -- --ignored
 2. **Smoke test the daemon in console mode** before bothering with the service:
    `seed-daemon.exe run` + `seed-gui.exe` (set `SEED_SOCKET` to match if needed).
 
-## ⚠️ The one thing most likely to break: the IPC named pipe
+## ✅ Fixed: the IPC named pipe (was the most likely thing to break)
 
-`crates/seed-ipc/src/transport.rs` builds the socket name with
-`path.to_fs_name::<GenericFilePath>()`. That's correct for Unix domain sockets,
-but on **Windows a named pipe wants `\\.\pipe\<name>`** — a *namespaced* name, not
-a filesystem path. **Expect the daemon's `transport::bind` to fail on Windows as
-written.** Fix: on Windows, derive a namespaced name and use
-`to_ns_name::<GenericNamespaced>()`; on Unix keep `GenericFilePath`. Make `bind`
-and `connect` derive the **same** name from the `--socket` arg so the GUI/CLI and
-daemon agree. This is the first real Windows bug to fix — do it before the service.
+`crates/seed-ipc/src/transport.rs` used to build the socket name with
+`path.to_fs_name::<GenericFilePath>()` — correct for Unix domain sockets, but on
+**Windows a named pipe wants `\\.\pipe\<name>`** (a *namespaced* name, not a
+filesystem path), so `transport::bind` failed. Fixed in commit `368382b`: a
+single `socket_name(path)` helper keeps `GenericFilePath` on Unix and, on
+Windows, hashes the `--socket` path (FNV-1a, stable across separately built
+binaries) into a legal namespaced pipe name via `to_ns_name::<GenericNamespaced>()`.
+`bind` and `connect` share the helper so the daemon and GUI/CLI agree. Verified:
+the `two_daemons_sync_over_ipc` integration test passes on Windows over real iroh.
 
 ## Other open questions (flagged in code + windows-packaging.md §2)
 

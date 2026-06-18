@@ -55,10 +55,10 @@ seed-daemon.exe uninstall
   the GUI runs as the logged-in user. Confirm the user can reach the daemon's IPC
   endpoint. Options: run the service as the user, or set a permissive DACL on the
   pipe. Decide and implement.
-- **Named-pipe naming.** The transport currently builds the socket name via
-  interprocess `GenericFilePath` (correct for Unix domain sockets). On Windows a
-  named pipe wants `\\.\pipe\...`; verify `GenericFilePath` works or switch to
-  `GenericNamespaced` on Windows in `crates/seed-ipc/src/transport.rs`.
+- **Named-pipe naming.** ✅ Resolved (commit `368382b`). `transport.rs` now uses a
+  `socket_name(path)` helper: `GenericFilePath` on Unix, `GenericNamespaced` on
+  Windows (hashing the `--socket` path into a legal pipe name). `bind`/`connect`
+  share it. Confirmed working via `two_daemons_sync_over_ipc` on Windows.
 - **Data dir under LocalSystem.** `directories` resolves the data dir to the
   service account's profile; ensure the GUI (user) and service agree on the socket
   path, or pass an explicit machine-wide `--data-dir` (e.g. `%PROGRAMDATA%\SeedSync`).
