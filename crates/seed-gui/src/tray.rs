@@ -4,31 +4,73 @@
 //! GTK3 + libappindicator, which conflicts with this GTK4 application, so the
 //! Linux tray is intentionally a no-op for now — to be revisited with a pure
 //! StatusNotifier (`ksni`) implementation run on its own event loop.
+//!
+//! The tray lives for the whole process, and closing the window hides it rather
+//! than quitting (see `main`), so the icon persists in the background. Double-
+//! clicking it (or the "Open" menu item) re-shows the window; "Quit" exits.
 
 #[cfg(any(windows, target_os = "macos"))]
-pub fn install(_app: &adw::Application) {
-    use tray_icon::menu::{Menu, MenuItem};
-    use tray_icon::TrayIconBuilder;
+pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
+    use adw::prelude::*;
+    use gtk::glib;
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+    use tray_icon::{TrayIconBuilder, TrayIconEvent};
 
+    let open = MenuItem::new("Open Seed Sync", true, None);
+    let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
-    let _ = menu.append(&MenuItem::new("Show Seed Sync", true, None));
-    let _ = menu.append(&MenuItem::new("Quit", true, None));
+    let _ = menu.append(&open);
+    let _ = menu.append(&quit);
+    let open_id = open.id().clone();
+    let quit_id = quit.id().clone();
 
-    match TrayIconBuilder::new()
+    let icon = match TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("Seed Sync")
         .build()
     {
-        Ok(icon) => {
-            // Keep the icon alive for the process lifetime.
-            Box::leak(Box::new(icon));
-            tracing::info!("system tray installed");
+        Ok(icon) => icon,
+        Err(e) => {
+            tracing::warn!("tray unavailable: {e}");
+            return;
         }
-        Err(e) => tracing::warn!("tray unavailable: {e}"),
-    }
+    };
+    // Keep the icon alive for the process lifetime.
+    Box::leak(Box::new(icon));
+    tracing::info!("system tray installed");
+
+    // tray-icon delivers clicks and menu picks on global channels; poll them on
+    // the GTK main loop (where we can touch the window/app). 250 ms is plenty for
+    // a tray and keeps the idle cost negligible.
+    let app = app.clone();
+    let window = window.clone();
+    glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+        let mut open_window = false;
+        let mut quit_app = false;
+        while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
+            if matches!(ev, TrayIconEvent::DoubleClick { .. }) {
+                open_window = true;
+            }
+        }
+        while let Ok(ev) = MenuEvent::receiver().try_recv() {
+            if ev.id == open_id {
+                open_window = true;
+            } else if ev.id == quit_id {
+                quit_app = true;
+            }
+        }
+        if open_window {
+            window.set_visible(true);
+            window.present();
+        }
+        if quit_app {
+            app.quit();
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub fn install(_app: &adw::Application) {
+pub fn install(_app: &adw::Application, _window: &adw::ApplicationWindow) {
     tracing::info!("tray not enabled on this platform build (Linux: planned via ksni)");
 }

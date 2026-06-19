@@ -210,9 +210,13 @@ fn main() -> glib::ExitCode {
     let handle = rt.handle().clone();
     Box::leak(Box::new(rt));
 
+    // The autostart entry launches us with `--hidden`: start in the tray with no
+    // window shown.
+    let hidden = std::env::args().any(|a| a == "--hidden");
+
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(move |app| build_ui(app, handle.clone(), socket.clone()));
-    // No CLI args of our own.
+    app.connect_activate(move |app| build_ui(app, handle.clone(), socket.clone(), hidden));
+    // We parse our own args (above); don't hand them to GApplication.
     app.run_with_args::<&str>(&[])
 }
 
@@ -235,7 +239,7 @@ fn load_css() {
     );
 }
 
-fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
+fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf, hidden: bool) {
     load_css();
     let (tx, rx) = async_channel::unbounded::<UiMsg>();
     let net = Net { handle, socket, tx };
@@ -429,11 +433,55 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf) {
         });
     }
 
-    // --- system tray (best effort; ignored if no StatusNotifier host) ---
-    tray::install(app);
+    // Closing the window hides it to the tray instead of quitting, so the app
+    // (and its tray icon) keeps running in the background.
+    window.connect_close_request(|w| {
+        w.set_visible(false);
+        glib::Propagation::Stop
+    });
 
-    window.present();
+    // --- system tray (best effort; ignored if no StatusNotifier host) ---
+    tray::install(app, &window);
+
+    // Be present in the tray from login (Windows): a `--hidden` autostart entry.
+    ensure_autostart();
+
+    // Autostart launches us hidden (tray only); otherwise show the window.
+    if !hidden {
+        window.present();
+    }
 }
+
+/// Register a per-user autostart entry so the tray is available from login,
+/// launching the GUI with `--hidden` (tray only, no window). Idempotent; a
+/// LocalSystem service can't own a tray (session 0), so the user-session GUI
+/// carries it. No-op off Windows.
+#[cfg(windows)]
+fn ensure_autostart() {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let value = format!("\"{}\" --hidden", exe.display());
+    let _ = std::process::Command::new("reg")
+        .args([
+            "add",
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "/v",
+            "SeedSync",
+            "/t",
+            "REG_SZ",
+            "/d",
+            &value,
+            "/f",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+#[cfg(not(windows))]
+fn ensure_autostart() {}
 
 /// Per-row widgets we mutate in place on refresh. Keeping the rows alive (rather
 /// than tearing down and rebuilding the whole list every update) is what lets an
