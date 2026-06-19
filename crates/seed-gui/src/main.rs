@@ -495,6 +495,8 @@ struct RowWidgets {
     members: gtk::Button,
     pause_btn: gtk::Button,
     paused: Rc<Cell<bool>>,
+    /// "View keys…" menu item, disabled while the share is indexing.
+    keys_item: gtk::Button,
 }
 
 fn role_str(role: Role) -> &'static str {
@@ -562,6 +564,8 @@ fn update_list(
             });
             rw.pause_btn
                 .set_tooltip_text(Some(if s.paused { "Resume" } else { "Pause" }));
+            rw.keys_item
+                .set_sensitive(!matches!(s.status, ShareStatus::Indexing));
         } else {
             let rw = build_row(s, net, window);
             listbox.append(&rw.row);
@@ -696,8 +700,11 @@ fn build_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> Ro
     // View keys — for every share, not just masters: a master sees both its
     // master (write) and viewer (read) keys; a viewer sees the viewer key it can
     // hand to further peers (which is the only way to share it from the UI).
+    // Disabled while the share is still indexing — it isn't ready to hand out
+    // yet; the refresh keeps this in sync as the status changes.
+    let keys_item = flat_button("View keys…");
+    keys_item.set_sensitive(!matches!(s.status, ShareStatus::Indexing));
     {
-        let keys_item = flat_button("View keys…");
         let net = net.clone();
         let id = s.share_id.clone();
         let pop = menu_pop.clone();
@@ -719,8 +726,8 @@ fn build_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> Ro
                 },
             );
         });
-        menu_box.append(&keys_item);
     }
+    menu_box.append(&keys_item);
 
     let del_item = flat_button("Delete share…");
     del_item.add_css_class("destructive-action");
@@ -732,19 +739,24 @@ fn build_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> Ro
         let pop = menu_pop.clone();
         del_item.connect_clicked(move |_| {
             pop.popdown();
-            let dialog = gtk::AlertDialog::builder()
-                .modal(true)
-                .message(format!("Remove “{name}”?"))
-                .detail("The share stops syncing and leaves the list. Your local files are kept on disk.")
-                .buttons(["Cancel", "Remove"])
-                .cancel_button(0)
-                .default_button(0)
-                .build();
+            // Frameless, modal confirmation (libadwaita message dialog — no
+            // titlebar or window controls), centered over the main window.
+            let dialog = adw::MessageDialog::new(
+                Some(&window),
+                Some(&format!("Remove “{name}”?")),
+                Some("The share stops syncing and leaves the list. Your local files are kept on disk."),
+            );
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("remove", "Remove");
+            dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+            dialog.set_default_response(Some("cancel"));
+            dialog.set_close_response("cancel");
             let net = net.clone();
             let id = id.clone();
             let name = name.clone();
-            dialog.choose(Some(&window), gio::Cancellable::NONE, move |res| {
-                if matches!(res, Ok(1)) {
+            dialog.connect_response(None, move |_, resp| {
+                if resp == "remove" {
+                    let name = name.clone();
                     net.send(
                         IpcRequest::RemoveShare {
                             share_id: id.clone(),
@@ -758,6 +770,7 @@ fn build_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> Ro
                     net.refresh();
                 }
             });
+            dialog.present();
         });
     }
     menu_box.append(&del_item);
@@ -775,6 +788,7 @@ fn build_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> Ro
         members,
         pause_btn,
         paused,
+        keys_item,
     }
 }
 
