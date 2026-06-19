@@ -16,12 +16,14 @@ Legend: ✅ pass · ❌ fail/bug · ⏳ not yet tested
 
 | Check | Linux→Win | Win→Linux |
 |---|---|---|
-| Mirrors all files, sizes exact | ✅ | ⏳ |
-| Cross-OS path (`/`↔`\`) + unicode names | ✅ | ⏳ |
-| Self-heal (corrupt mirror → auto-restore) | ✅ ~6s | ⏳ |
-| Viewer 1× dedup, **same volume** | ✅ (local) | ✅ (Linux local) |
+| Mirrors all files, sizes exact | ✅ | ✅ |
+| Cross-OS path (`/`↔`\`) + unicode names | ✅ | ✅ |
+| Self-heal (corrupt mirror → auto-restore) | ✅ ~6s | ✅ ~3s |
+| Viewer 1× dedup, **same volume** | ✅ (local) | ✅ 1.9GB→8MB |
 | Viewer 1× dedup, **cross volume** | ✅ fixed (#1) | ✅ Linux 1× native (#1 Win-only) |
 | Deletion / update propagation | ✅ | ⏳ |
+| Empty (0-byte) + unicode file syncs (`5bdfa4b`) | — | ✅ |
+| Multi-GB file (no doubling, streaming) | ✅ 100MB | ✅ 1.76GB |
 
 ## Open issues
 ### #1 — Cross-volume viewer dedup leaves a 2× copy on Windows  *(FIXED — Option A)*
@@ -147,9 +149,20 @@ change expected, just confirmation.
 - ✅ **Delete/update propagation Linux→Win (2026-06-18):** on the live Linux master, updated
   `readme.txt`, deleted `docs/unicode-name.txt`, added `added-on-linux.txt` — all three landed on
   the Windows viewer within a few seconds. Direction 1 fully green.
-- ⏳ **Win→Linux sync:** in progress — Linux viewer added against a Windows share.
-- ⏳ **Publish of a file being written / empty / unicode-named doesn't wedge (see [WIN] 2026-06-19):**
-  pending the Win→Linux run with such files.
+- ✅ **Win→Linux sync (2026-06-19):** Linux viewer added a Windows share with **no bootstrap**
+  (auto-discovery resolved Win→Linux in ~45s to Healthy 100%). Share = `café.txt` (0-byte, unicode),
+  `dolphin-…-x86_64.exe` (118 MB), `newFolder/Big Doc.txt` (subfolder + spaces), `WinRx_11.bak…iso`
+  (**1.76 GB**). All present, sizes exact. Path/unicode/space conversion (`\`→`/`) intact.
+- ✅ **Empty + unicode file (`5bdfa4b` confirmed cross-OS):** `café.txt` (0 bytes) synced from the
+  Windows master without wedging the publish — the manifest-only empty-file path works Win→Linux.
+- ✅ **1× dedup on the Linux receiving side, multi-GB:** 1.9 GB mirror content → **8.1 MB** blob
+  store (outboards only: 7.1 MB .iso obao + 456 KB .exe obao + db). Verified AFTER the in-flight
+  `.data` fully exported — measuring mid-transfer is meaningless (the owned blob is full-size until
+  reference-export completes; learned this the hard way on the first run).
+- ✅ **Self-heal Win→Linux (~3s):** corrupted `Big Doc.txt` (920→65 B) → auto-restored to exact
+  original SHA256 in ~3s, no user action.
+- ⏳ **Delete/update propagation Win→Linux:** pending — need the Windows master to delete/update a
+  file so the Linux viewer can confirm it propagates.
 - Note: **empty directories are not synced** (manifest tracks files only); deleting a folder's last
   file leaves the empty dir on the master but the viewer never materializes it. Benign; `diff -r`
   flags it. (Empty *files* now ride the signed manifest per `5bdfa4b` — separate from empty dirs.)
