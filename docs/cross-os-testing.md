@@ -106,15 +106,16 @@ Two master-publish bugs found while sharing from Windows, both fixed in shared
   being copied/downloaded in changed every tick → endless re-index (healthy → 0%
   → healthy). Added a **debounce**: only publish once the signature has held steady
   across a reconcile tick (~750 ms).
-- **Publish wedged on a size/hash mismatch** (`9ce5672`): a file still being
-  written reports a **stale 0 size** in the Windows directory entry, but `add_path`
-  hashes the real content, so `set_hash` got `(non-empty hash, len 0)` — which
-  iroh-docs rejects (`Attempted to insert an empty entry`) — failing the publish on
-  that one file and retrying every tick (share stuck "indexing"). Now the publish
-  takes the size from the blob iroh just imported (`blobs().status → Complete{size}`),
-  which is hashed from the same bytes and always agrees with the hash. Empty files
-  still work; mid-write files no longer wedge. (Surfaced as an "error about a unicode
-  filename" — `café.txt` — but the name was incidental; it was just the file in flight.)
+- **Publish wedged on an empty (0-byte) file** (`5bdfa4b`, **cross-platform**): a
+  genuinely empty `café.txt` failed `set_hash` with `Attempted to insert an empty
+  entry`, failing and endlessly retrying the whole publish (share stuck "indexing").
+  Root cause: **iroh-docs can't carry an empty file** — a len-0 content entry must
+  use its all-zeros empty *sentinel* hash, but a real 0-byte file hashes to
+  `BLAKE3("")`, which iroh-docs rejects. (The unicode name was incidental; the file
+  was just the only 0-byte one.) Fix: empty files ride the **signed manifest only**
+  (no per-file doc entry, no blob transfer) and the viewer's `apply()` creates them
+  directly. Test `empty_files_sync` covers it. **This affects Linux identically** —
+  any 0-byte file in a shared folder would have wedged the publish there too.
 
 **[LINUX] please confirm:** the stale-0-size is a Windows directory-entry quirk, but the
 size/hash mismatch can also happen from a genuine write-during-scan race on any OS — so
