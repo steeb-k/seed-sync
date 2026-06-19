@@ -98,6 +98,30 @@ in-process delete must be retried). Wrote a reclaim-retry queue (`reclaim_pendin
 export never succeeds so nothing gets queued. Need decision A vs B (see issue #1).
 **Likely Windows-only — Linux to confirm cross-fs is 1×.**
 
+### [WIN] 2026-06-19 — more daemon fixes (publish robustness)
+Two master-publish bugs found while sharing from Windows, both fixed in shared
+`seed-core` (so they apply on Linux too once pulled):
+- **Publish flap on a still-copying file** (`a4e4b4a`): the master republishes
+  whenever the folder's `(path,size,mtime)` signature changes, so a large file
+  being copied/downloaded in changed every tick → endless re-index (healthy → 0%
+  → healthy). Added a **debounce**: only publish once the signature has held steady
+  across a reconcile tick (~750 ms).
+- **Publish wedged on a size/hash mismatch** (`9ce5672`): a file still being
+  written reports a **stale 0 size** in the Windows directory entry, but `add_path`
+  hashes the real content, so `set_hash` got `(non-empty hash, len 0)` — which
+  iroh-docs rejects (`Attempted to insert an empty entry`) — failing the publish on
+  that one file and retrying every tick (share stuck "indexing"). Now the publish
+  takes the size from the blob iroh just imported (`blobs().status → Complete{size}`),
+  which is hashed from the same bytes and always agrees with the hash. Empty files
+  still work; mid-write files no longer wedge. (Surfaced as an "error about a unicode
+  filename" — `café.txt` — but the name was incidental; it was just the file in flight.)
+
+**[LINUX] please confirm:** the stale-0-size is a Windows directory-entry quirk, but the
+size/hash mismatch can also happen from a genuine write-during-scan race on any OS — so
+verify a Win→Linux (or local) sync of a file that's actively being written doesn't wedge,
+and that empty + unicode-named files round-trip. The fix is in shared code; no Linux-side
+change expected, just confirmation.
+
 ### [WIN] notes / environment
 - Windows build: GTK4 via gvsbuild at `C:\gtk`; MSI via WiX 5 (`scripts\build-msi.ps1`).
 - The MSI is x64, installs to `C:\Program Files\SeedSync`, registers the LocalSystem
@@ -109,3 +133,4 @@ export never succeeds so nothing gets queued. Need decision A vs B (see issue #1
 - Regression pass results (`cargo test --workspace -- --include-ignored`):
 - Win→Linux sync:
 - Cross-filesystem dedup check (issue #1):
+- Publish of a file being written / empty / unicode-named doesn't wedge (see 2026-06-19):
