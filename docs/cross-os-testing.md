@@ -19,8 +19,8 @@ Legend: ✅ pass · ❌ fail/bug · ⏳ not yet tested
 | Mirrors all files, sizes exact | ✅ | ⏳ |
 | Cross-OS path (`/`↔`\`) + unicode names | ✅ | ⏳ |
 | Self-heal (corrupt mirror → auto-restore) | ✅ ~6s | ⏳ |
-| Viewer 1× dedup, **same volume** | ✅ (local) | ⏳ |
-| Viewer 1× dedup, **cross volume** | ✅ fixed (#1) | ⏳ |
+| Viewer 1× dedup, **same volume** | ✅ (local) | ✅ (Linux local) |
+| Viewer 1× dedup, **cross volume** | ✅ fixed (#1) | ✅ Linux 1× native (#1 Win-only) |
 | Deletion / update propagation | ⏳ | ⏳ |
 
 ## Open issues
@@ -62,8 +62,9 @@ Same-volume is fine (1×).
   users pick mirror folders on other drives. Defeats "no disk doubling" there.
 - Repro (Windows, local 2-daemon): viewer data on `C:`, mirror on `D:`, 100 MB file
   → viewer `blobs` = **100.91 MB** (vs **0.91 MB** same-volume).
-- **[LINUX] please confirm** cross-filesystem is 1× (data dir on `/`, mirror on a
-  different mount). If so this is Windows-only and the fix can be `#[cfg(windows)]`.
+- **[LINUX] CONFIRMED 2026-06-18:** cross-filesystem IS 1× on Linux (data dir `/dev/shm`,
+  mirror `/tmp`, EXDEV=18 between them; 100 MB → 936 KB blob store, no self-heal fallback in
+  the log). This is **Windows-only**, exactly as predicted. The fix is correctly inert on Linux.
 - Fix options (deciding):
   - **A. Patch iroh-blobs** to also treat Windows err 17 as cross-volume (1-line; fork
     via `[patch]` or vendor). Then iroh copies + sets `External`, and a reclaim pass
@@ -130,8 +131,23 @@ change expected, just confirmation.
   share/lib MSI layout, x64 arch, same-version upgrades.
 - GUI single-instance: launching a 2nd instance just re-activates the first.
 
-### [LINUX] — (add your entries here)
-- Regression pass results (`cargo test --workspace -- --include-ignored`):
-- Win→Linux sync:
-- Cross-filesystem dedup check (issue #1):
-- Publish of a file being written / empty / unicode-named doesn't wedge (see 2026-06-19):
+### [LINUX] 2026-06-18 — regression pass + cross-fs dedup confirmation
+- ✅ **Regression pass:** `cargo build --workspace` clean; `cargo test --workspace -- --include-ignored`
+  ALL GREEN incl. the 3 Windows-added loopback tests (`viewer_stores_by_reference_not_copy`,
+  `viewer_auto_heals_corrupted_file`, `referenced_viewer_serves_peers`). Built with the vendored
+  `iroh-blobs` fork present (`[patch]` resolves); the err-17 patch is inert on Linux (gets EXDEV=18).
+- ✅ **Issue #1 — cross-filesystem dedup is 1× on Linux (Windows-only confirmed).** Ran a real
+  cross-volume viewer: data dir on `/dev/shm` (tmpfs, dev 26), mirror on `/tmp` (tmpfs, dev 60),
+  EXDEV=18 verified between them. 100 MB share → viewer `blobs` = **936 KB (0.91 MB), 1×**
+  (vs Windows' pre-fix 100.91 MB). Daemon log shows **no** `reference-export failed`/self-heal
+  fallback — the EXDEV→copy path succeeds and iroh unlinks the owned `.data` immediately (Linux
+  unlinks open files). So #1's fix can stay effectively Windows-only; Linux never had the bug.
+- ✅ **Real-binary dry-run (Linux loopback, auto-discovery, no bootstrap):** sync (~1s), 1× dedup
+  (9 MiB content → 576 KB store), self-heal (~2s), update (~3s) + delete (~2s) propagation all pass.
+- ⏳ **Win→Linux sync:** in progress — Linux viewer added against a Windows share.
+- ⏳ **Publish of a file being written / empty / unicode-named doesn't wedge (see [WIN] 2026-06-19):**
+  pending the Win→Linux run with such files.
+- Note: **empty directories are not synced** (manifest tracks files only); deleting a folder's last
+  file leaves the empty dir on the master but the viewer never materializes it. Benign; `diff -r`
+  flags it. (Empty *files* now ride the signed manifest per `5bdfa4b` — separate from empty dirs.)
+  Also `seed-cli publish` requires `--share <id>` (reconcile loop auto-republishes anyway).
