@@ -24,29 +24,42 @@ Legend: ✅ pass · ❌ fail/bug · ⏳ not yet tested
 | Deletion / update propagation | ⏳ | ⏳ |
 
 ## Open issues
-### #1 — Cross-volume viewer dedup leaves a 2× copy  *(open, needs engine fix)*
+### #1 — Cross-volume viewer dedup leaves a 2× copy on Windows  *(open; upstream iroh bug)*
 When a viewer's **mirror folder is on a different volume than its data dir**, the
-downloaded blob is **not** reclaimed → the content is stored twice (blob store +
-mirror). Same-volume is fine (1×).
+content is stored twice (auto-downloaded blob in the store **and** the mirror file).
+Same-volume is fine (1×).
 
-- Root cause (confirmed in `iroh-blobs-0.103.0/src/store/fs.rs:1300-1321`):
-  `ExportMode::TryReference` on a previously-owned blob does `rename(source→target)`.
-  Cross-volume that fails with `ERR_CROSS`/`EXDEV` (18) and it falls back to a
-  **copy**, but the owned `data/<hash>.data` file is left behind. The comment claims
-  setting the `External` state deletes it, but with no GC running it persists — and
-  a daemon **restart does not reclaim it** either (verified).
-- Impact: **high** — the Windows service's data dir is always `C:\ProgramData\SeedSync`,
-  and users put mirror folders on other drives, so this is the common case. Defeats
-  the "no disk doubling" guarantee.
-- Repro (Windows, local 2-daemon): viewer data dir on `C:`, mirror on `D:`, sync a
-  100 MB file → viewer `blobs` = **100.91 MB** (vs **0.91 MB** same-volume).
-- **Linux: please verify** the same on a cross-filesystem mirror (e.g. data dir on `/`,
-  mirror on a different mount / tmpfs). Expect the same `EXDEV` fallback → 2×.
-- Fix direction (Windows side, not yet implemented): after a `TryReference` export in
-  `engine.rs::apply()`, if the entry is now `External` but the owned `data/<hash>.data`
-  still exists in the store, delete it (it's orphaned; outboard `.obao4` must stay so
-  the viewer can still serve). Need to confirm this is safe w.r.t. iroh's delete_set.
-  Discuss here before implementing so both platforms stay consistent.
+- **Root cause (refined — it's an upstream iroh-blobs Windows bug):**
+  `ExportMode::TryReference` on an owned blob does `std::fs::rename(source→target)`
+  (`iroh-blobs-0.103.0/src/store/fs.rs:1300-1313`). On a cross-volume move it only
+  falls back to copy when the OS error is `EXDEV` (**18**, Linux). Windows returns
+  `ERROR_NOT_SAME_DEVICE` (**17**), which iroh doesn't match, so it **returns an
+  error instead of falling back** — the export fails outright. Confirmed in the
+  daemon log: `reference-export p.bin failed; will self-heal: Error::Io`. The file
+  is then materialized by **self-heal** (`get_blob` → mirror), and the owned blob
+  that iroh-docs auto-downloaded is never converted to a reference → it lingers.
+- Why the obvious fixes don't work: re-importing the mirror by reference can't help
+  (`entry_state.rs` union prefers `Owned`, so it stays Owned); there's no public
+  single-blob delete; and on Windows the owned `.data` can't be deleted while iroh
+  holds its handle anyway (it releases it ~5 s later — Linux can unlink an open file,
+  so **Linux almost certainly does NOT have this bug**: its cross-fs rename hits
+  `EXDEV`→copy, then iroh unlinks the open owned file fine).
+- Impact: **high on Windows** — the service data dir is always `C:\ProgramData`, and
+  users pick mirror folders on other drives. Defeats "no disk doubling" there.
+- Repro (Windows, local 2-daemon): viewer data on `C:`, mirror on `D:`, 100 MB file
+  → viewer `blobs` = **100.91 MB** (vs **0.91 MB** same-volume).
+- **[LINUX] please confirm** cross-filesystem is 1× (data dir on `/`, mirror on a
+  different mount). If so this is Windows-only and the fix can be `#[cfg(windows)]`.
+- Fix options (deciding):
+  - **A. Patch iroh-blobs** to also treat Windows err 17 as cross-volume (1-line; fork
+    via `[patch]` or vendor). Then iroh copies + sets `External`, and a reclaim pass
+    deletes the leftover owned `.data` once iroh releases the handle. Surgical; keeps
+    the sync architecture; needs a patched dependency.
+  - **B. Never create an owned blob on the viewer:** disable iroh-docs content
+    auto-download and materialize via `get_blob`→mirror + import-by-reference (the
+    self-heal path, generalized). No dependency patch, but a bigger change to the core
+    sync path. *(A reclaim-retry queue in `engine.rs`/`node.rs` is already written for
+    option A's second half; uncommitted pending this decision.)*
 
 ## Findings log
 
@@ -60,6 +73,16 @@ mirror `D:\linuxMasterTest`).
   exact original (size + SHA256) in **~6 s**, no user action. Cross-OS self-heal works.
 - ❌ **Dedup:** can't measure from this run (the store also held an unrelated leftover
   share). Isolated 2-daemon test confirmed **Open issue #1** (cross-volume 2×).
+
+### [WIN] 2026-06-18 — diagnosed issue #1 (cross-volume 2×)
+Traced it to iroh-blobs' `TryReference` export only handling Linux `EXDEV` (18), not
+Windows `ERROR_NOT_SAME_DEVICE` (17) — so cross-volume export fails outright, self-heal
+saves the file, and the auto-downloaded owned blob is never reclaimed. Verified iroh
+releases the owned `.data` handle ~5 s after the op (so an external delete works then;
+in-process delete must be retried). Wrote a reclaim-retry queue (`reclaim_pending` in
+`engine.rs`, `blobs_dir` on `IrohNode`) — correct but insufficient alone, because the
+export never succeeds so nothing gets queued. Need decision A vs B (see issue #1).
+**Likely Windows-only — Linux to confirm cross-fs is 1×.**
 
 ### [WIN] notes / environment
 - Windows build: GTK4 via gvsbuild at `C:\gtk`; MSI via WiX 5 (`scripts\build-msi.ps1`).
