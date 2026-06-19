@@ -20,9 +20,13 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
+use bao_tree::io::BaoContentItem;
 use ed25519_dalek::SigningKey;
 use futures_lite::StreamExt;
-use iroh_blobs::api::blobs::{AddPathOptions, ImportMode};
+use iroh::endpoint::Connection;
+use iroh::{Endpoint, EndpointAddr, EndpointId};
+use iroh_blobs::api::blobs::{AddPathOptions, ExportMode, ExportOptions, ImportMode};
+use iroh_blobs::get::request::{get_blob, GetBlobItem};
 use iroh_blobs::{store::fs::FsStore, BlobFormat, Hash};
 use iroh_docs::{
     api::Doc, engine::LiveEvent, store::Query, sync::Capability, AuthorId, NamespaceId,
@@ -59,6 +63,12 @@ impl PeerRoster {
 
     fn is_online(&self, e: &PeerEntry, now: i64) -> bool {
         e.neighbor || (now - e.last_seen) < PEER_ONLINE_TTL_SECS
+    }
+
+    /// The full peer-id strings currently known, for re-fetching content from
+    /// peers during self-heal.
+    fn peer_ids(&self) -> Vec<String> {
+        self.peers.keys().cloned().collect()
     }
 
     fn counts(&self) -> (u32, u32) {
@@ -121,6 +131,107 @@ async fn store_seed_bounded(share_id: &str, seed: [u8; 32]) -> anyhow::Result<()
         Ok(Err(join_err)) => Err(anyhow!("keystore task failed: {join_err}")),
         Err(_) => Err(anyhow!("keystore write timed out after 5s")),
     }
+}
+
+/// Provider endpoint ids to re-fetch content from during self-heal: the master
+/// (its id is carried in the share key) first, then any peers seen in the roster.
+fn peer_providers(key: &ShareKey, roster: &Arc<StdMutex<PeerRoster>>) -> Vec<EndpointId> {
+    let mut ids = Vec::new();
+    if let Some(eid) = key.endpoint_id() {
+        if let Ok(id) = EndpointId::from_bytes(&eid) {
+            ids.push(id);
+        }
+    }
+    if let Ok(r) = roster.lock() {
+        for s in r.peer_ids() {
+            if let Ok(id) = s.parse::<EndpointId>() {
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
+/// Re-fetch a blob's verified bytes from a peer and atomically rewrite the mirror
+/// file at `target`. Used when a referenced file diverged from its manifest hash
+/// (e.g. a viewer edited it): the local reference is stale and can't self-repair,
+/// so we pull a clean copy from whoever still serves it. Tries each provider in
+/// turn; on total failure returns an error so the next reconcile tick retries.
+async fn self_heal_file(
+    endpoint: &Endpoint,
+    providers: &[EndpointId],
+    hash: Hash,
+    target: &Path,
+) -> anyhow::Result<()> {
+    if providers.is_empty() {
+        anyhow::bail!("no known providers to repair {}", target.display());
+    }
+    let mut last_err = None;
+    for &pid in providers {
+        let conn = match endpoint
+            .connect(EndpointAddr::new(pid), iroh_blobs::ALPN)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = Some(anyhow!("connect {pid}: {e}"));
+                continue;
+            }
+        };
+        match fetch_blob_to_file(&conn, hash, target).await {
+            Ok(()) => {
+                tracing::info!("self-healed {} from {pid}", target.display());
+                return Ok(());
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("self-heal failed for {}", target.display())))
+}
+
+/// Stream a blob from a connection, writing its verified leaves into a temp file
+/// next to `target`, then atomically replace `target`. Streams chunk-by-chunk
+/// (no whole-file in memory), and the content is bao-verified against `hash` as
+/// it arrives, so a bad peer cannot write wrong bytes.
+async fn fetch_blob_to_file(conn: &Connection, hash: Hash, target: &Path) -> anyhow::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let tmp = target.with_extension("seedheal-tmp");
+    let mut file =
+        std::fs::File::create(&tmp).with_context(|| format!("create temp {}", tmp.display()))?;
+    let mut stream = get_blob(conn.clone(), hash);
+    let mut complete = false;
+    while let Some(item) = stream.next().await {
+        match item {
+            GetBlobItem::Item(BaoContentItem::Leaf(leaf)) => {
+                file.seek(SeekFrom::Start(leaf.offset))?;
+                file.write_all(&leaf.data)?;
+            }
+            GetBlobItem::Item(BaoContentItem::Parent(_)) => {} // hash-tree node, no data
+            GetBlobItem::Done(_) => {
+                complete = true;
+                break;
+            }
+            GetBlobItem::Error(e) => {
+                drop(file);
+                let _ = std::fs::remove_file(&tmp);
+                return Err(anyhow!("fetch {hash}: {e}"));
+            }
+        }
+    }
+    file.flush()?;
+    drop(file);
+    if !complete {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!("fetch {hash}: stream ended before completion");
+    }
+    // Replace target (Windows rename fails if the destination exists).
+    if target.exists() {
+        std::fs::remove_file(target)?;
+    }
+    std::fs::rename(&tmp, target).with_context(|| format!("replace {}", target.display()))?;
+    Ok(())
 }
 
 /// Returned by [`Engine::create_share`].
@@ -884,7 +995,15 @@ impl Engine {
             }
         }
 
-        // 4. Write/overwrite listed files whose local content differs.
+        // 4. Materialize each listed file whose local content differs.
+        //    - unchanged file: skipped (steady state).
+        //    - missing file: moved into place by *reference* (the store keeps
+        //      only the outboard and points at the mirror file — 1x on disk),
+        //      so a viewer never holds a second copy of the content.
+        //    - file that exists but diverges (edited/corrupted): its referenced
+        //      blob is now stale and can't self-repair locally, so we re-fetch
+        //      the verified bytes from a peer and rewrite it — fully automatic.
+        let endpoint = self.node.endpoint.clone();
         for fe in &manifest.files {
             let target = state.folder.join(rel_to_native(&fe.path));
             if file_matches(&target, &fe.hash) {
@@ -893,13 +1012,38 @@ impl Engine {
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let arr: [u8; 32] = fe.hash.as_slice().try_into().unwrap();
-            self.node
-                .blobs
-                .blobs()
-                .export(Hash::from(arr), &target)
-                .await
-                .with_context(|| format!("export {}", fe.path))?;
+            let arr: [u8; 32] = fe.hash.as_slice().try_into().context("bad hash len")?;
+            let hash = Hash::from(arr);
+
+            if !target.exists() {
+                // First sync (owned blob) or a deleted file: move the blob into
+                // place by reference. No GC is enabled, so no protecting tag is
+                // needed during the move.
+                if let Err(e) = self
+                    .node
+                    .blobs
+                    .blobs()
+                    .export_with_opts(ExportOptions {
+                        hash,
+                        mode: ExportMode::TryReference,
+                        target: target.clone(),
+                    })
+                    .await
+                {
+                    tracing::debug!("reference-export {} failed; will self-heal: {e}", fe.path);
+                }
+            }
+
+            if !file_matches(&target, &fe.hash) {
+                // Either the export couldn't restore it, or an existing file was
+                // edited/corrupted. Do NOT re-export here: when the store already
+                // references this same path, exporting would copy the corrupt
+                // file onto itself. Re-fetch a verified copy from a peer instead.
+                let providers = peer_providers(&state.key, &state.roster);
+                self_heal_file(&endpoint, &providers, hash, &target)
+                    .await
+                    .with_context(|| format!("self-heal {}", fe.path))?;
+            }
         }
 
         // 5. Delete anything on disk not in the manifest (deletion propagation

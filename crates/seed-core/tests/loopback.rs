@@ -32,6 +32,24 @@ fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
     map
 }
 
+/// Total size in bytes of all files under `root` (used to assert the viewer's
+/// blob store stays outboard-sized rather than holding a second copy).
+fn dir_size(root: &Path) -> u64 {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+        .map(|e| e.metadata().map(|m| m.len()).unwrap_or(0))
+        .sum()
+}
+
+/// Deterministic, varied (non-compressible-ish) bytes of length `n`.
+fn gen_bytes(n: usize) -> Vec<u8> {
+    (0..n as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect()
+}
+
 /// Drive `apply` until the viewer folder matches `want`, or time out.
 async fn sync_until(
     engine: &mut Engine,
@@ -129,5 +147,181 @@ async fn master_viewer_mirror_lifecycle() -> anyhow::Result<()> {
 
     master.shutdown().await?;
     viewer.shutdown().await?;
+    Ok(())
+}
+
+/// A viewer must store synced content ~1x: the blob store keeps only the outboard
+/// and references the mirror file, instead of holding a second copy of the bytes.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn viewer_stores_by_reference_not_copy() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let mut master = Engine::new(a_data.path()).await?;
+    let mut viewer = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        master.wait_online().await;
+        viewer.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    // An 8 MiB file — large enough that a duplicate copy would be unmistakable.
+    let big = gen_bytes(8 * 1024 * 1024);
+    std::fs::write(a_folder.path().join("big.bin"), &big)?;
+
+    let created = master.create_share(a_folder.path(), vec![]).await?;
+    let master_addr = master.endpoint_addr();
+    let share_id = viewer
+        .add_share(&created.viewer_key, b_folder.path(), vec![master_addr])
+        .await?;
+
+    let want = snapshot(a_folder.path());
+    sync_until(&mut viewer, &share_id, b_folder.path(), &want).await?;
+
+    // The mirror file is full size...
+    assert_eq!(
+        std::fs::metadata(b_folder.path().join("big.bin"))?.len(),
+        big.len() as u64
+    );
+    // ...but the blob store holds only the outboard, not a copy of the 8 MiB.
+    let blobs = dir_size(&b_data.path().join("blobs"));
+    assert!(
+        blobs < big.len() as u64 / 4,
+        "viewer blob store is {blobs} bytes; expected outboard-only (<{} ) for an {}-byte file — content is being copied, not referenced",
+        big.len() / 4,
+        big.len()
+    );
+    println!(
+        "1x confirmed: blob store {blobs} bytes for an {}-byte mirrored file",
+        big.len()
+    );
+
+    master.shutdown().await?;
+    viewer.shutdown().await?;
+    Ok(())
+}
+
+/// A viewer whose mirror file is edited/corrupted must repair itself
+/// automatically (re-fetch the verified bytes from a peer) with no user action.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn viewer_auto_heals_corrupted_file() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let mut master = Engine::new(a_data.path()).await?;
+    let mut viewer = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        master.wait_online().await;
+        viewer.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    let content = gen_bytes(300_000);
+    std::fs::write(a_folder.path().join("data.bin"), &content)?;
+    let created = master.create_share(a_folder.path(), vec![]).await?;
+    let master_addr = master.endpoint_addr();
+    let share_id = viewer
+        .add_share(&created.viewer_key, b_folder.path(), vec![master_addr])
+        .await?;
+
+    let want = snapshot(a_folder.path());
+    sync_until(&mut viewer, &share_id, b_folder.path(), &want).await?;
+    assert_eq!(std::fs::read(b_folder.path().join("data.bin"))?, content);
+
+    // Corrupt the referenced mirror file (different size + content). With the
+    // file referenced by the blob store, there is no clean local copy to revert
+    // from — the engine must re-fetch from the master automatically.
+    std::fs::write(b_folder.path().join("data.bin"), b"** locally corrupted **")?;
+
+    // Reconcile (what the daemon's loop does every tick) must restore it.
+    sync_until(&mut viewer, &share_id, b_folder.path(), &want).await?;
+    assert_eq!(
+        std::fs::read(b_folder.path().join("data.bin"))?,
+        content,
+        "corrupted mirror file was not auto-healed"
+    );
+    println!("auto self-heal OK ({} bytes restored)", content.len());
+
+    master.shutdown().await?;
+    viewer.shutdown().await?;
+    Ok(())
+}
+
+/// A viewer that stores content by reference must still re-serve it to other
+/// peers. Sync viewer1 from the master, take the master offline, then have
+/// viewer2 sync using only viewer1 as a bootstrap.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn referenced_viewer_serves_peers() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let c_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+    let c_folder = tempfile::tempdir()?;
+
+    let mut master = Engine::new(a_data.path()).await?;
+    let mut viewer1 = Engine::new(b_data.path()).await?;
+    let mut viewer2 = Engine::new(c_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(25), async {
+        master.wait_online().await;
+        viewer1.wait_online().await;
+        viewer2.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    let content = gen_bytes(1_000_000);
+    std::fs::write(a_folder.path().join("payload.bin"), &content)?;
+    let created = master.create_share(a_folder.path(), vec![]).await?;
+
+    // viewer1 syncs from the master and references the file.
+    let share_id = viewer1
+        .add_share(
+            &created.viewer_key,
+            b_folder.path(),
+            vec![master.endpoint_addr()],
+        )
+        .await?;
+    let want = snapshot(a_folder.path());
+    sync_until(&mut viewer1, &share_id, b_folder.path(), &want).await?;
+
+    // Master goes offline — viewer1 is now the only source.
+    let viewer1_addr = viewer1.endpoint_addr();
+    master.shutdown().await?;
+
+    // viewer2 joins bootstrapped ONLY to viewer1; it must sync the doc + content
+    // (manifest + the referenced file) from viewer1.
+    let share_id2 = viewer2
+        .add_share(&created.viewer_key, c_folder.path(), vec![viewer1_addr])
+        .await?;
+    assert_eq!(share_id2, share_id);
+
+    // viewer1 keeps reconciling (so it stays a live sync peer) while viewer2 pulls.
+    let res = tokio::time::timeout(Duration::from_secs(45), async {
+        loop {
+            let _ = viewer1.apply(&share_id).await;
+            let _ = viewer2.apply(&share_id2).await?;
+            if snapshot(c_folder.path()) == want {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    res.map_err(|_| anyhow::anyhow!("viewer2 did not sync from referenced viewer1"))??;
+    assert_eq!(std::fs::read(c_folder.path().join("payload.bin"))?, content);
+    println!("referenced viewer re-served content to a peer OK");
+
+    viewer1.shutdown().await?;
+    viewer2.shutdown().await?;
     Ok(())
 }

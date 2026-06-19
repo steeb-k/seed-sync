@@ -25,6 +25,8 @@ iroh-blobs = "0.103"
 iroh-gossip = "0.101"
 iroh-docs = "0.101"
 iroh-tickets = "1.0"
+# bao-tree must match the version iroh-blobs pulls in (used for streamed blob repair).
+bao-tree = "0.16"
 
 # --- async runtime / utils ---
 tokio = { version = "1", features = ["full"] }

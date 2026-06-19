@@ -12,6 +12,7 @@ iroh-blobs.workspace = true
 iroh-docs.workspace = true
 iroh-gossip.workspace = true
 iroh-tickets.workspace = true
+bao-tree.workspace = true
 
 # async / util
 tokio.workspace = true
