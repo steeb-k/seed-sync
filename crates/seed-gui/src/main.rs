@@ -443,11 +443,14 @@ fn build_ui(
         .selection_mode(gtk::SelectionMode::None)
         .css_classes(["boxed-list"])
         .build();
-    let placeholder = gtk::Label::builder()
-        .label("No shares yet — use “+” to create or add one.")
-        .css_classes(["dim-label"])
-        .margin_top(24)
-        .margin_bottom(24)
+    // Empty state: the standard libadwaita status page. Its icon is a themed
+    // symbolic from the Adwaita icon set bundled with GTK, so it recolors with
+    // the light/dark theme automatically.
+    let placeholder = adw::StatusPage::builder()
+        .icon_name("folder-remote-symbolic")
+        .title("No shares yet")
+        .description("Use “+” to create or add one.")
+        .css_classes(["empty-state"])
         .build();
     listbox.set_placeholder(Some(&placeholder));
 

@@ -24,3 +24,20 @@ headerbar {
 .health-off {
   color: alpha(@window_fg_color, 0.35);
 }
+
+/* Empty-state status page: bump the description ("Use + to create or add
+ * one.") a few points larger than libadwaita's default. */
+.empty-state .description {
+  font-size: 1.2em;
+}
+
+/* Tighten libadwaita's roomy default spacing so the empty state fits without a
+ * scrollbar — without shrinking the icon or text. The big gap under the icon
+ * (36px by default) and the generous outer margins are the culprits. */
+.empty-state .icon {
+  margin-bottom: 12px;
+}
+.empty-state > scrolledwindow > viewport > box {
+  margin-top: 18px;
+  margin-bottom: 18px;
+}
