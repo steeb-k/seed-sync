@@ -89,9 +89,10 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
 #[cfg(any(windows, target_os = "macos"))]
 fn load_tray_icon() -> Option<tray_icon::Icon> {
     use gtk::gdk_pixbuf::{InterpType, Pixbuf};
+    // High-visibility variant, chosen specifically for the small tray size.
     const PNG: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../icon/appIcon.png"
+        "/../../icon/appIconHiVis.png"
     ));
     let src = Pixbuf::from_read(std::io::Cursor::new(PNG)).ok()?;
     let pb = src.scale_simple(32, 32, InterpType::Bilinear)?;
