@@ -70,27 +70,42 @@ The service stays **LocalSystem**; the GUI/CLI run as the user. They meet via:
 Still to validate live: install/start the service from an **elevated** prompt and
 confirm the user-run GUI connects (cross-account, the real test vs. same-user CLI).
 
-## 3. MSI installer (cargo-wix)
+## 3. MSI installer (WiX 5)
 
-Use **cargo-wix** (WiX Toolset) rather than a hand-written `.wxs`:
+Built with **WiX v5** (the `dotnet tool`), not cargo-wix: cargo-wix wraps the
+EOL WiX v3, while WiX 4+ has the `<Files>` harvesting element (no `heat`) and the
+v6/v7 builds gate behind the Open-Source-Maintenance-Fee EULA — v5 has neither
+problem. Authoring lives in `wix\seedsync.wxs`.
 
 ```pwsh
-cargo install cargo-wix
-cargo wix init          # generates wix\main.wxs from Cargo.toml metadata
-# then customize wix\main.wxs to:
-#   - install the whole dist\SeedSync tree (use `heat` to harvest the GTK runtime)
-#   - add a Start-menu + desktop shortcut to seed-gui.exe
-#   - register the service via a custom action running `seed-daemon.exe install`
-#     on install and `uninstall` on remove (or a ServiceInstall element)
-cargo wix                # builds target\wix\seed-sync-<ver>.msi
+dotnet tool install --global wix --version "5.*"   # one-time
+pwsh -File scripts\build-msi.ps1                    # release build + bundle + wix build
+#   -> target\wix\SeedSync-0.1.0.msi
 ```
 
+`wix\seedsync.wxs` (per-machine, x64):
+- Installs the whole `dist\SeedSync` tree into `C:\Program Files\SeedSync`
+  (`bin\*.dll` globbed via `<Files>`; `share\`/`lib\` harvested; the four exes
+  explicit so the daemon can carry the service).
+- Registers **SeedSyncDaemon** as a LocalSystem, auto-start service via
+  `<ServiceInstall>` + `<ServiceControl>` (`Arguments="service"`, matching
+  `service.rs`); MSI starts it on install and waits for it to stop on
+  uninstall/upgrade before removing files.
+- Start-menu + desktop shortcuts to `seed-gui.exe`; `MajorUpgrade` for in-place
+  upgrades.
+
+The daemon's data still lives machine-wide in `%PROGRAMDATA%\SeedSync` regardless
+of the Program Files install location (see §2).
+
+Not yet done: a custom installer UI (the WixUI extension — currently the default
+basic progress UI) and code signing.
+
 ### Code signing (avoid SmartScreen)
-Sign every exe + DLL + the MSI with an OV/EV certificate:
+Deferred until there's a cert. Sign every exe + DLL **before** `wix build` (they're
+embedded in the MSI), then sign the MSI:
 ```pwsh
 signtool sign /fd SHA256 /a /tr http://timestamp.digicert.com /td SHA256 <file>
 ```
-cargo-wix can invoke SignTool on the MSI; sign the bundled exes before harvesting.
 
 ## 4. Checkpoint #3 (end-to-end)
 

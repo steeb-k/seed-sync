@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Seed Sync MSI (WiX v4+ schema; built with WiX 5).
+
+  Installs the self-contained portable bundle (dist\SeedSync: the three exes plus
+  the whole GTK runtime) into "Program Files\SeedSync", registers + starts the
+  LocalSystem "SeedSyncDaemon" service, and drops Start-menu + desktop shortcuts
+  to the GUI.
+
+  Build (see scripts\build-msi.ps1):
+    wix build wix\seedsync.wxs -d DistDir=dist\SeedSync -o target\wix\SeedSync-<ver>.msi
+
+  The runtime is harvested wholesale with <Files> (no hand-maintained file list).
+  seed-daemon.exe is its own component so the service can be installed/started/
+  stopped/removed declaratively (ServiceInstall + ServiceControl) — the MSI then
+  waits for the service to stop before removing files on uninstall/upgrade. The
+  registration matches a manual `seed-daemon.exe install` (crates\seed-daemon\src\
+  service.rs): LocalSystem, auto-start, "service" launch argument.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Seed Sync"
+           Manufacturer="steeb-k"
+           Version="0.1.0"
+           UpgradeCode="51862F05-49F8-4AB0-BE4A-2831849E2BF6"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <SummaryInformation Description="Seed Sync — P2P mirrored-folder sync" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="$(DistDir)\bin\seed-gui.exe" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="SeedSync">
+        <Directory Id="BinDir" Name="bin" />
+      </Directory>
+    </StandardDirectory>
+
+    <!-- bin\ is only DLLs + four exes (see scripts\bundle-gtk-windows.ps1). The
+         GTK DLLs are globbed; the exes are listed so the daemon can carry the
+         service. (WiX 5's <Files> has no Exclude, hence the explicit split.) -->
+    <ComponentGroup Id="BinDlls" Directory="BinDir">
+      <Files Include="$(DistDir)\bin\*.dll" />
+    </ComponentGroup>
+    <Component Id="GuiExe" Directory="BinDir" Guid="*">
+      <File Id="seed_gui.exe" Source="$(DistDir)\bin\seed-gui.exe" KeyPath="yes" />
+    </Component>
+    <Component Id="CliExe" Directory="BinDir" Guid="*">
+      <File Id="seed_cli.exe" Source="$(DistDir)\bin\seed-cli.exe" KeyPath="yes" />
+    </Component>
+    <Component Id="GdbusExe" Directory="BinDir" Guid="*">
+      <File Id="gdbus.exe" Source="$(DistDir)\bin\gdbus.exe" KeyPath="yes" />
+    </Component>
+
+    <!-- The GTK runtime (schemas, pixbuf loaders, icon themes) preserving its
+         share\ and lib\ subtree under the install root. -->
+    <ComponentGroup Id="RuntimeFiles" Directory="INSTALLFOLDER">
+      <Files Include="$(DistDir)\share\**" />
+      <Files Include="$(DistDir)\lib\**" />
+    </ComponentGroup>
+
+    <!-- The daemon + the Windows service (LocalSystem, auto-start). -->
+    <Component Id="DaemonExe" Directory="BinDir" Guid="*">
+      <File Id="seed_daemon.exe" Source="$(DistDir)\bin\seed-daemon.exe" KeyPath="yes" />
+      <ServiceInstall Id="SeedSyncSvc"
+                      Name="SeedSyncDaemon"
+                      DisplayName="Seed Sync"
+                      Description="Seed Sync P2P mirrored-folder sync daemon"
+                      Type="ownProcess"
+                      Start="auto"
+                      ErrorControl="normal"
+                      Account="LocalSystem"
+                      Arguments="service" />
+      <ServiceControl Id="SeedSyncSvcControl"
+                      Name="SeedSyncDaemon"
+                      Start="install"
+                      Stop="both"
+                      Remove="uninstall"
+                      Wait="yes" />
+    </Component>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartMenuShortcut" Guid="*">
+        <Shortcut Id="GuiStartMenu" Name="Seed Sync"
+                  Description="Open the Seed Sync app"
+                  Target="[INSTALLFOLDER]bin\seed-gui.exe" Icon="AppIcon" />
+        <RegistryValue Root="HKCU" Key="Software\SeedSync" Name="startmenu"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcut" Guid="*">
+        <Shortcut Id="GuiDesktop" Name="Seed Sync"
+                  Description="Open the Seed Sync app"
+                  Target="[INSTALLFOLDER]bin\seed-gui.exe" Icon="AppIcon" />
+        <RegistryValue Root="HKCU" Key="Software\SeedSync" Name="desktop"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Seed Sync" Level="1">
+      <ComponentGroupRef Id="BinDlls" />
+      <ComponentRef Id="GuiExe" />
+      <ComponentRef Id="CliExe" />
+      <ComponentRef Id="GdbusExe" />
+      <ComponentGroupRef Id="RuntimeFiles" />
+      <ComponentRef Id="DaemonExe" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+  </Package>
+</Wix>
