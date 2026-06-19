@@ -496,6 +496,7 @@ fn build_ui(
         let net = net.clone();
         let window = window.clone();
         let device_name = device_name.clone();
+        let add_popover = add_popover.clone();
         new_share_btn.connect_clicked(move |_| {
             add_popover.popdown();
             create_share_flow(&window, &net, &device_name);
@@ -505,7 +506,9 @@ fn build_ui(
         let net = net.clone();
         let window = window.clone();
         let device_name = device_name.clone();
+        let add_popover = add_popover.clone();
         add_share_btn.connect_clicked(move |_| {
+            add_popover.popdown();
             show_add_dialog(&window, &net, &device_name);
         });
     }
@@ -1069,23 +1072,10 @@ fn show_create_dialog(
     folder: PathBuf,
     device_name: &Rc<RefCell<String>>,
 ) {
-    let dialog = gtk::Window::builder()
-        .title("Create share")
-        .transient_for(window)
-        .modal(true)
-        .default_width(480)
-        .default_height(360)
-        .build();
-    let vbox = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_start(16)
-        .margin_end(16)
-        .margin_top(16)
-        .margin_bottom(16)
-        .build();
+    let dialog = adw::MessageDialog::new(Some(window), Some("Create share"), None);
 
-    vbox.append(
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.append(
         &gtk::Label::builder()
             .label(format!("Folder: {}", folder.to_string_lossy()))
             .halign(gtk::Align::Start)
@@ -1094,8 +1084,8 @@ fn show_create_dialog(
             .build(),
     );
     let (name_box, name_entry) = name_field(device_name);
-    vbox.append(&name_box);
-    vbox.append(
+    content.append(&name_box);
+    content.append(
         &gtk::Label::builder()
             .label("Ignore patterns (one glob per line)")
             .halign(gtk::Align::Start)
@@ -1110,17 +1100,22 @@ fn show_create_dialog(
         .min_content_height(140)
         .child(&text)
         .build();
-    vbox.append(&scroller);
+    content.append(&scroller);
 
-    let create = gtk::Button::builder()
-        .label("Create share")
-        .css_classes(["suggested-action"])
-        .build();
+    dialog.set_extra_child(Some(&content));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("create", "Create share");
+    dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("create"));
+    dialog.set_close_response("cancel");
+
     {
         let net = net.clone();
-        let dialog = dialog.clone();
         let device_name = device_name.clone();
-        create.connect_clicked(move |_| {
+        dialog.connect_response(None, move |_, resp| {
+            if resp != "create" {
+                return;
+            }
             apply_device_name(&net, &device_name, &name_entry);
             let buf = text.buffer();
             let body = buf
@@ -1132,11 +1127,9 @@ fn show_create_dialog(
                 .filter(|l| !l.is_empty())
                 .collect();
             submit_create(&net, folder.clone(), ignore);
-            dialog.close();
         });
     }
-    vbox.append(&create);
-    dialog.set_child(Some(&vbox));
+
     dialog.present();
 }
 
