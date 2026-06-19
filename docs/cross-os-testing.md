@@ -111,6 +111,34 @@ Legend: ✅ pass · ❌ fail · ⏳ not yet · 🐧 Linux-doable · 🪟 Windows
 13. ⏳ **Dark tray context menu** follows the app color scheme via `SetPreferredAppMode` (`50f8588`,
     `7095421`). Linux tray is a no-op (tray-icon is Windows/macOS only), so untestable here.
 
+### [WIN] 2026-06-19 — GUI polish **round 2** (Linux: please re-test the 🐧 items)
+More GUI/UX changes after the first pass; commits `6180139`→`1166387` (all GUI-only, no daemon/engine
+or IPC changes — a daemon restart is NOT required, just deploy the new `seed-gui`).
+
+- 🐧 **HiVis tray icon** (`f74cc02`): the Linux **ksni** tray now decodes `icon/appIconHiVis.png`
+  (was `appIcon.png`) — a high-visibility variant tuned for the small tray. Confirm the Linux tray
+  shows the new icon. (Windows/macOS tray switched in `c5a0601`; the Windows **exe** icon also moved
+  to `appIconHiVis.ico` in `ca9e82b` — exe icon is Windows-only via `build.rs`.)
+- 🐧 **Single-instance** (`1ffd99e`): a second `seed-gui` launch should **reveal the existing window,
+  not spawn a second window/tray**. On Linux this rides GApplication's D-Bus uniqueness **plus a new
+  activate-guard** (`app.windows().first().present()`); the Windows half is a named-mutex + event
+  signal (🪟, compiled out on Linux). Please verify a 2nd launch on Linux just re-presents the running
+  window — **including when it's hidden in the tray** (that's the case the activate-guard adds).
+- 🐧 **Create + Add are now frameless modals with Cancel** (`75d4ec8`, `1166387`): `show_add_dialog`
+  and `show_create_dialog` became `adw::MessageDialog`s with **Cancel + action** responses. Because a
+  MessageDialog response always closes, **Add is gated** — its button stays disabled until a key is
+  entered *and* a folder chosen (Create stays enabled; its folder is pre-picked). **Extends item 9**:
+  Create + Add + Address + Keys + Members + Set-name are now all frameless. Confirm Cancel/Esc escapes
+  each, and that Add only enables once valid.
+- 🐧 **＋ dropdown closes on selection** (`1166387`): the "Add existing share" item never called
+  `popdown()`, so the ＋ popover lingered until the next click — now both items pop down. Quick check.
+- 🐧 **`--debug` flag** (`24a9b49`): bumps the default log filter to `seed_gui=debug,seed_ipc=debug`.
+  On **Windows** release builds (now GUI-subsystem = no console by default, 🪟) it *also* allocates the
+  log console. On Linux there's no console-subsystem concept, so `--debug` only changes verbosity;
+  normal launch is unchanged. Sanity-check `seed-gui --debug` still logs on Linux.
+- 🪟 **Dark tray menu — actual fix** (`50f8588`): supersedes the `7095421` `set_theme` approach, which
+  was a no-op for popups (muda only dark-themes menu *bars*). FYI since item 13 referenced the old one.
+
 ## Open issues
 ### #1 — Cross-volume viewer dedup leaves a 2× copy on Windows  *(FIXED — Option A)*
 **Resolution (2026-06-18):** vendored + one-line-patched `iroh-blobs` (`vendor/iroh-blobs`,
