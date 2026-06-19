@@ -59,8 +59,11 @@ Legend: ✅ pass · ❌ fail · ⏳ not yet · 🐧 Linux-doable · 🪟 Windows
 - ✅ **Item 7 (create/add "Your name" prefill):** uses the same `device_name` cache as item 8, so
   prefills once the cache is populated (confirmed working post-restart; create form shares the path).
 - ⏳ **Item 11 ("Open folder" → xdg-open):** menu present; the launch action itself not yet exercised.
-- ⏳ Health-dot **yellow (<100%)** and **gray (offline)** not yet observed live (need a viewer
-  mid-sync / an offline member). Green verified.
+- ✅ **A3 gray (offline) dot, cross-OS:** killed the Linux viewer daemon → on the **Windows** Members
+  dialog the Linux member `steebP14s` flipped to **gray almost instantly** (gossip `NeighborDown`, not a
+  slow heartbeat timeout). The offline member **retains its last-known name** (roster keeps the entry
+  with `online=false`) — correct/intended UX (you want to see *who* is offline). Green + gray verified.
+- ⏳ Health-dot **yellow (<100%)** still not observed live (needs a viewer caught mid-sync).
 - Tooling note: no input-injection on this Wayland/niri session (no ydotool/wtype) — the human
   drives clicks; I focus the window (`niri msg action focus-window --id N`) + screenshot.
 
