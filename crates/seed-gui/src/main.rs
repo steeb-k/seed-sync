@@ -622,7 +622,7 @@ fn build_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> Ro
     }
     hbox.append(&members);
 
-    // per-share actions menu (⋮): reveal keys (master only) + delete.
+    // per-share actions menu (⋮): open folder, view keys, delete.
     let menu_btn = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
         .tooltip_text("Share actions")
@@ -632,8 +632,24 @@ fn build_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> Ro
     let menu_pop = gtk::Popover::new();
     let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
 
-    if matches!(s.role, Role::Master) {
-        let keys_item = flat_button("Reveal keys…");
+    // Open the share's folder in the system file manager.
+    let open_item = flat_button("Open folder");
+    {
+        let folder = s.folder.clone();
+        let pop = menu_pop.clone();
+        open_item.connect_clicked(move |_| {
+            pop.popdown();
+            let uri = gio::File::for_path(&folder).uri();
+            let _ = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
+        });
+    }
+    menu_box.append(&open_item);
+
+    // View keys — for every share, not just masters: a master sees both its
+    // master (write) and viewer (read) keys; a viewer sees the viewer key it can
+    // hand to further peers (which is the only way to share it from the UI).
+    {
+        let keys_item = flat_button("View keys…");
         let net = net.clone();
         let id = s.share_id.clone();
         let pop = menu_pop.clone();
