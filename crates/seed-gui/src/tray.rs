@@ -25,7 +25,7 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
     let quit_id = quit.id().clone();
 
     let icon = match TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
+        .with_menu(Box::new(menu.clone()))
         .with_tooltip("Seed Sync")
         .build()
     {
@@ -35,6 +35,24 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
             return;
         }
     };
+
+    // Match the tray context menu to the app's color scheme. Without this the
+    // popup renders in the OS-default theme via muda's "Auto" (which can't detect
+    // dark for the tray's hidden window), so it shows light even in dark mode.
+    #[cfg(windows)]
+    {
+        let theme = if adw::StyleManager::default().is_dark() {
+            tray_icon::menu::MenuTheme::Dark
+        } else {
+            tray_icon::menu::MenuTheme::Light
+        };
+        let hwnd = icon.window_handle();
+        // SAFETY: `hwnd` is the live tray window from the icon we just built.
+        unsafe {
+            let _ = menu.set_theme_for_hwnd(hwnd as isize, theme);
+        }
+    }
+
     // Keep the icon alive for the process lifetime.
     Box::leak(Box::new(icon));
     tracing::info!("system tray installed");

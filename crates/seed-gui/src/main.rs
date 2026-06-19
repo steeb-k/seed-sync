@@ -718,8 +718,7 @@ fn build_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> Ro
         let pop = menu_pop.clone();
         open_item.connect_clicked(move |_| {
             pop.popdown();
-            let uri = gio::File::for_path(&folder).uri();
-            let _ = gio::AppInfo::launch_default_for_uri(&uri, gio::AppLaunchContext::NONE);
+            open_in_file_manager(&folder);
         });
     }
     menu_box.append(&open_item);
@@ -1280,6 +1279,32 @@ fn fmt_time(ts: i64) -> String {
     dt.and_then(|d| d.format("%H:%M:%S").ok())
         .map(|s| s.to_string())
         .unwrap_or_else(|| ts.to_string())
+}
+
+/// Open a folder in the OS file manager. Shells out to the platform opener —
+/// GIO's `launch_default_for_uri` silently fails for `file://` URIs in the
+/// bundled Windows GTK runtime (no URI handler registered).
+fn open_in_file_manager(path: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        if let Err(e) = std::process::Command::new("explorer")
+            .arg(path)
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+        {
+            tracing::warn!("open folder failed: {e}");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(path).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(path).spawn();
+    }
 }
 
 fn flat_button(label: &str) -> gtk::Button {
