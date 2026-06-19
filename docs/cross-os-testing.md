@@ -139,6 +139,23 @@ or IPC changes — a daemon restart is NOT required, just deploy the new `seed-g
 - 🪟 **Dark tray menu — actual fix** (`50f8588`): supersedes the `7095421` `set_theme` approach, which
   was a no-op for popups (muda only dark-themes menu *bars*). FYI since item 13 referenced the old one.
 
+### [LINUX] GUI polish round 2 — re-test results 2026-06-19
+Rebuilt `seed-gui` clean (round 2 + rebrand `08606f6` + empty-state `c21c04b` all compile on Linux).
+- ✅ **HiVis tray icon** (`f74cc02`): Linux ksni tray now decodes `appIconHiVis.png`; item registers,
+  Title now **"S.E.E.D."**, 4 ARGB sizes served. (Visual hi-vis appearance: human-confirmed icon present.)
+- ✅ **Single-instance** (`1ffd99e`): 2nd `seed-gui` launch exits immediately, leaving 1 process / 1 window
+  — verified BOTH with the window visible AND **while hidden in the tray** (the activate-guard case: the
+  hidden window re-appeared). Close-to-tray re-confirmed in passing (`niri close` → 0 windows, proc alive).
+- ✅ **`--debug`** (`24a9b49`): on Linux it correctly sets the filter to `seed_gui=debug,seed_ipc=debug`
+  and the app logs fine (INFO tray line present), no crash. 0 DEBUG lines is expected — there are no
+  `debug!` call sites in `seed-gui`/`seed-ipc`. Flag is harmless/functional on Linux.
+- ✅ **Rebrand "S.E.E.D."** (`08606f6`): window title "S.E.E.D." + subtitle "Secure Environment Exchange
+  Daemon"; tray title "S.E.E.D." too.
+- ✅ **Empty-state** (`c21c04b`): with no shares the main view shows an `AdwStatusPage` — themed
+  folder-remote icon, "No shares yet", "Use "+" to create or add one." Renders correctly on Linux.
+- ⏳ **Create + Add frameless modals + Add-gating** (`75d4ec8`, `1166387`) and **＋ dropdown popdown**
+  (`1166387`): need GUI clicks (no input-injection on this session) — pending human drive.
+
 ## Open issues
 ### #1 — Cross-volume viewer dedup leaves a 2× copy on Windows  *(FIXED — Option A)*
 **Resolution (2026-06-18):** vendored + one-line-patched `iroh-blobs` (`vendor/iroh-blobs`,
