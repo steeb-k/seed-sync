@@ -8,6 +8,11 @@
 //! by `glib::spawn_future_local`. GTK objects are only ever touched on the main
 //! thread.
 
+// Release builds are a GUI-subsystem app, so launching doesn't pop a console
+// window — the first-run UI is clean. `--debug` allocates a console at runtime
+// for the logs (see `main`). Debug builds keep the console for `cargo run`.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod tray;
 
 use std::cell::{Cell, RefCell};
@@ -195,10 +200,23 @@ fn setup_runtime_env() {}
 
 fn main() -> glib::ExitCode {
     setup_runtime_env();
+
+    // `--debug` reveals the log console (release builds are windowed by default,
+    // so the first-run UI is clean) and bumps the default log verbosity.
+    let debug = std::env::args().any(|a| a == "--debug");
+    #[cfg(windows)]
+    if debug {
+        attach_console();
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "seed_gui=info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                if debug {
+                    "seed_gui=debug,seed_ipc=debug".into()
+                } else {
+                    "seed_gui=info".into()
+                }
+            }),
         )
         .init();
 
@@ -242,6 +260,25 @@ fn main() -> glib::ExitCode {
     });
     // We parse our own args (above); don't hand them to GApplication.
     app.run_with_args::<&str>(&[])
+}
+
+/// Give a GUI-subsystem (windowed) build a console for `--debug` log output:
+/// attach to the launching terminal if there is one, else allocate a dedicated
+/// console window. Runs before the tracing subscriber initializes so its first
+/// write lands on the new console. No-op-ish if a console already exists.
+#[cfg(windows)]
+fn attach_console() {
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFF_FFFF;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn AttachConsole(process_id: u32) -> i32;
+        fn AllocConsole() -> i32;
+    }
+    unsafe {
+        if AttachConsole(ATTACH_PARENT_PROCESS) == 0 {
+            AllocConsole();
+        }
+    }
 }
 
 /// Windows single-instance guard. GApplication's uniqueness is D-Bus-based and a
