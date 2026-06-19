@@ -27,7 +27,10 @@
            Compressed="yes">
 
     <SummaryInformation Description="Seed Sync — P2P mirrored-folder sync" />
-    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <!-- AllowSameVersionUpgrades so reinstalling 0.1.0 (during iteration) replaces
+         any existing install instead of stacking a second registered product. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Icon Id="AppIcon" SourceFile="$(DistDir)\bin\seed-gui.exe" />
