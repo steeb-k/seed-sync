@@ -1,9 +1,10 @@
 //! System tray integration.
 //!
-//! On Windows/macOS we use the `tray-icon` crate. On Linux its backend pulls in
-//! GTK3 + libappindicator, which conflicts with this GTK4 application, so the
-//! Linux tray is intentionally a no-op for now — to be revisited with a pure
-//! StatusNotifier (`ksni`) implementation run on its own event loop.
+//! On Windows/macOS we use the `tray-icon` crate. On Linux that crate's backend
+//! pulls in GTK3 + libappindicator, which clashes with this GTK4 application, so
+//! Linux instead uses a pure-Rust StatusNotifier implementation (`ksni`, no GTK3)
+//! driven by its own tokio runtime on a dedicated thread; tray events are bridged
+//! back to the GTK main loop over an `async-channel`.
 //!
 //! The tray lives for the whole process, and closing the window hides it rather
 //! than quitting (see `main`), so the icon persists in the background. Double-
@@ -113,7 +114,183 @@ fn set_preferred_app_mode(dark: bool) {
     }
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+// ----------------------------------------------------------------------------
+// Linux: StatusNotifier tray via `ksni` (no GTK3/appindicator dependency).
+// ----------------------------------------------------------------------------
+#[cfg(target_os = "linux")]
+mod linux {
+    use adw::prelude::*;
+    use gtk::glib;
+
+    /// What a tray interaction asks the GTK main loop to do.
+    enum TrayCmd {
+        Open,
+        Quit,
+    }
+
+    /// The StatusNotifier item. Holds pre-rendered ARGB icons and a sender that
+    /// hands interactions (run on the ksni thread) back to the GTK main loop.
+    struct SeedTray {
+        icons: Vec<ksni::Icon>,
+        tx: async_channel::Sender<TrayCmd>,
+    }
+
+    impl ksni::Tray for SeedTray {
+        fn id(&self) -> String {
+            "io.github.steeb_k.SeedSync".into()
+        }
+        fn title(&self) -> String {
+            "Seed Sync".into()
+        }
+        fn category(&self) -> ksni::Category {
+            ksni::Category::ApplicationStatus
+        }
+        fn status(&self) -> ksni::Status {
+            ksni::Status::Active
+        }
+        fn icon_pixmap(&self) -> Vec<ksni::Icon> {
+            self.icons.clone()
+        }
+        fn tool_tip(&self) -> ksni::ToolTip {
+            ksni::ToolTip {
+                title: "Seed Sync".into(),
+                description: String::new(),
+                icon_name: String::new(),
+                icon_pixmap: Vec::new(),
+            }
+        }
+        // Left-click (activate) re-shows the window, matching the Windows tray.
+        fn activate(&mut self, _x: i32, _y: i32) {
+            let _ = self.tx.try_send(TrayCmd::Open);
+        }
+        fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
+            use ksni::menu::StandardItem;
+            vec![
+                StandardItem {
+                    label: "Open Seed Sync".into(),
+                    activate: Box::new(|t: &mut Self| {
+                        let _ = t.tx.try_send(TrayCmd::Open);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: "Quit".into(),
+                    activate: Box::new(|t: &mut Self| {
+                        let _ = t.tx.try_send(TrayCmd::Quit);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            ]
+        }
+    }
+
+    /// Decode the embedded app PNG and render a few tray-sized ARGB32 icons
+    /// (StatusNotifier wants pixmaps in network byte order: bytes are A,R,G,B).
+    /// Returns empty if decoding fails, in which case the tray is skipped.
+    fn load_icons() -> Vec<ksni::Icon> {
+        use gtk::gdk_pixbuf::{InterpType, Pixbuf};
+        const PNG: &[u8] = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../icon/appIcon.png"
+        ));
+        let Ok(src) = Pixbuf::from_read(std::io::Cursor::new(PNG)) else {
+            return Vec::new();
+        };
+        [22, 32, 48, 64]
+            .into_iter()
+            .filter_map(|sz| {
+                let pb = src.scale_simple(sz, sz, InterpType::Bilinear)?;
+                let pb = if pb.has_alpha() {
+                    pb
+                } else {
+                    pb.add_alpha(false, 0, 0, 0).ok()?
+                };
+                let (w, h) = (pb.width(), pb.height());
+                let rowstride = pb.rowstride() as usize;
+                let nch = pb.n_channels() as usize;
+                let rgba = pb.read_pixel_bytes();
+                let rgba = rgba.as_ref();
+                let mut data = Vec::with_capacity((w * h * 4) as usize);
+                for y in 0..h as usize {
+                    let row = &rgba[y * rowstride..y * rowstride + w as usize * nch];
+                    for px in row.chunks_exact(nch) {
+                        let a = if nch == 4 { px[3] } else { 255 };
+                        data.extend_from_slice(&[a, px[0], px[1], px[2]]);
+                    }
+                }
+                Some(ksni::Icon {
+                    width: w,
+                    height: h,
+                    data,
+                })
+            })
+            .collect()
+    }
+
+    pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
+        let icons = load_icons();
+        if icons.is_empty() {
+            tracing::warn!("tray icon failed to decode; tray disabled");
+            return;
+        }
+        let (tx, rx) = async_channel::unbounded::<TrayCmd>();
+
+        // Bridge tray interactions (sent from the ksni thread) onto the GTK main
+        // loop, where we can touch the window/app.
+        let app = app.clone();
+        let window = window.clone();
+        glib::spawn_future_local(async move {
+            while let Ok(cmd) = rx.recv().await {
+                match cmd {
+                    TrayCmd::Open => {
+                        window.set_visible(true);
+                        window.present();
+                    }
+                    TrayCmd::Quit => app.quit(),
+                }
+            }
+        });
+
+        // ksni's tokio service runs on its own thread; block_on keeps the runtime
+        // (and the returned handle) alive for the process lifetime.
+        let tray = SeedTray { icons, tx };
+        let spawn = std::thread::Builder::new()
+            .name("seed-tray".into())
+            .spawn(move || {
+                use ksni::TrayMethods;
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::warn!("tray runtime unavailable: {e}");
+                        return;
+                    }
+                };
+                rt.block_on(async move {
+                    match tray.spawn().await {
+                        Ok(_handle) => {
+                            tracing::info!("system tray installed (ksni/StatusNotifier)");
+                            std::future::pending::<()>().await;
+                        }
+                        Err(e) => tracing::warn!("tray unavailable: {e}"),
+                    }
+                });
+            });
+        if let Err(e) = spawn {
+            tracing::warn!("could not start tray thread: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use linux::install;
+
+// Other unixes (e.g. *BSD): no tray backend wired.
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn install(_app: &adw::Application, _window: &adw::ApplicationWindow) {
-    tracing::info!("tray not enabled on this platform build (Linux: planned via ksni)");
+    tracing::info!("tray not enabled on this platform build");
 }

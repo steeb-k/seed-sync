@@ -65,11 +65,15 @@ Legend: ✅ pass · ❌ fail · ⏳ not yet · 🐧 Linux-doable · 🪟 Windows
   with `online=false`) — correct/intended UX (you want to see *who* is offline). Green + gray verified.
 - 🆗 Health-dot **yellow (<100%)**: **called good without a live capture** — same code path as green/gray
   (`health = present/total bytes`, already seen as "Syncing 0%" text during the ISO sync); low risk.
-- ✅ **Linux tray = intentional no-op** (NOT a bug): `tray-icon`'s Linux backend needs GTK3+libappindicator
-  (conflicts with this GTK4 app), so the Linux build logs "tray not enabled on this platform build
-  (Linux: planned via ksni)" and shows no icon. Deferred to a `ksni`/StatusNotifier impl. **Windows tray
-  is a separate item (#12/13, 🪟):** if the Seed Sync icon is missing in the *Windows* tray while other
-  apps show, that's a real Windows bug — check for a `tray unavailable: {e}` warn from `TrayIconBuilder`.
+- ✅ **Linux tray IMPLEMENTED (un-deferred 2026-06-19):** replaced the no-op with a pure-Rust
+  `ksni`/StatusNotifier tray (no GTK3/appindicator), driven by its own tokio runtime on a dedicated
+  thread, events bridged to the GTK main loop over `async-channel`. Icon decoded from the embedded
+  `appIcon.png` via `gdk-pixbuf` → ARGB32 at 22/32/48/64 px. Verified live on niri/quickshell: item
+  registers with the watcher (`org.kde.StatusNotifierItem-<pid>-1`, Title "Seed Sync", 4 icon sizes
+  served), icon renders, and all 4 behaviors work (right-click menu Open/Quit, left-click opens,
+  close-to-tray hides + reopens, Quit exits). **Windows tray is a separate item (#12/13, 🪟):** if the
+  Seed Sync icon is missing in the *Windows* tray while other apps show, check for a `tray unavailable:
+  {e}` warn from `TrayIconBuilder`.
 - Tooling note: no input-injection on this Wayland/niri session (no ydotool/wtype) — the human
   drives clicks; I focus the window (`niri msg action focus-window --id N`) + screenshot.
 

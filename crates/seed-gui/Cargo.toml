@@ -31,3 +31,6 @@ anyhow.workspace = true
 # the Linux tray is a no-op for now (tracked for a later ksni-based pass).
 [target.'cfg(any(windows, target_os = "macos"))'.dependencies]
 tray-icon.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = "0.3.5"
