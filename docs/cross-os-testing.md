@@ -35,6 +35,35 @@ coverage is `seed-core/tests/presence.rs`. So most of this needs the GUI.
 
 Legend: ✅ pass · ❌ fail · ⏳ not yet · 🐧 Linux-doable · 🪟 Windows-only · 🔀 cross-OS (needs both)
 
+### [LINUX] GUI test run 2026-06-19 (results)
+- ✅ **Main window** renders: compact frameless header (＋/gear/title/✕), share row
+  (pause ‖ · name + `viewer · path` · `Healthy 100%` · `N of M ▶` members · ⋮ actions), bottom
+  speed/updated bar. Members count reflects presence (`1 of 2` when Windows offline → `2 of 2` online).
+- ✅ **A1/A2/A4 presence cross-OS (item 6 + 9):** Members dialog shows this device `steebP14s`
+  (hostname default) / **viewer** + the Windows master `sk-devBox` / **master**, both green dots,
+  online. Name + role propagate Win→Linux over gossip live. Dialog is frameless (`adw::MessageDialog`,
+  Close response), big green health dots. Minor cosmetic: local row ellipsizes `steebP14s (this devi…`.
+- ⚠️ **FALSE ALARM "could not load peers":** seen when clicking the members button — caused by a
+  **stale daemon** (the test daemon was launched before the presence commit; new GUI couldn't
+  deserialize old `PeerInfo` which lacks `name`/`percent`, no `#[serde(default)]`). NOT a code bug.
+  Fixed by restarting the daemon on the new binary (data dir preserved, no re-download).
+  **Lesson: restart running daemons after pulling new code before GUI testing.** Consider adding
+  `#[serde(default)]` to new optional IPC fields for forward/backward compat (cheap robustness).
+- ✅ **Item 10 (three-dot actions menu) + gear menu:** render fine (human-verified).
+- ✅ **Item 8 (Set device name… prefill):** after restarting the GUI against the new-binary daemon,
+  the gear dialog prefills with the hostname `steebP14s`. The earlier "empty" was the SAME stale-daemon
+  artifact — the GUI fetches the device name once at startup (`GetDeviceName`), which failed against the
+  pre-presence daemon, leaving the cache empty. **Real robustness gap (for a fix):** GUI never refetches
+  the device name after the one startup call — if the daemon is unavailable at GUI launch (or restarts),
+  the name silently stays empty until GUI relaunch. Suggest refetch-on-reconnect or a retry.
+- ✅ **Item 7 (create/add "Your name" prefill):** uses the same `device_name` cache as item 8, so
+  prefills once the cache is populated (confirmed working post-restart; create form shares the path).
+- ⏳ **Item 11 ("Open folder" → xdg-open):** menu present; the launch action itself not yet exercised.
+- ⏳ Health-dot **yellow (<100%)** and **gray (offline)** not yet observed live (need a viewer
+  mid-sync / an offline member). Green verified.
+- Tooling note: no input-injection on this Wayland/niri session (no ydotool/wtype) — the human
+  drives clicks; I focus the window (`niri msg action focus-window --id N`) + screenshot.
+
 ### 0. Build/automated gate — 🐧 [LINUX done 2026-06-19]
 - ✅ `cargo build --workspace` clean (icon `build.rs` is a no-op off-Windows; presence deps resolve).
 - ✅ Unit tests incl. new `presence::topic_is_deterministic_and_domain_separated`, `presence_roundtrips`,
