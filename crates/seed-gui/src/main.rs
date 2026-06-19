@@ -1129,21 +1129,8 @@ fn show_keys_dialog(
     viewer: &str,
     bootstrap: Option<&str>,
 ) {
-    let dialog = gtk::Window::builder()
-        .title("Share keys")
-        .transient_for(window)
-        .modal(true)
-        .default_width(520)
-        .build();
-    let vbox = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_start(16)
-        .margin_end(16)
-        .margin_top(16)
-        .margin_bottom(16)
-        .build();
-
+    let dialog = adw::MessageDialog::new(Some(window), Some("Share keys"), None);
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
     if let Some(m) = master {
         vbox.append(&key_field("Master key (write — keep secret)", m));
     }
@@ -1153,67 +1140,26 @@ fn show_keys_dialog(
             vbox.append(&key_field("Bootstrap address (this device)", b));
         }
     }
-    let close = gtk::Button::with_label("Close");
-    {
-        let dialog = dialog.clone();
-        close.connect_clicked(move |_| dialog.close());
-    }
-    vbox.append(&close);
-    dialog.set_child(Some(&vbox));
+    dialog.set_extra_child(Some(&vbox));
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("close"));
+    dialog.set_close_response("close");
     dialog.present();
 }
 
 fn show_text_dialog(window: &adw::ApplicationWindow, title: &str, subtitle: &str, text: &str) {
-    let dialog = gtk::Window::builder()
-        .title(title)
-        .transient_for(window)
-        .modal(true)
-        .default_width(520)
-        .build();
-    let vbox = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_start(16)
-        .margin_end(16)
-        .margin_top(16)
-        .margin_bottom(16)
-        .build();
-    vbox.append(
-        &gtk::Label::builder()
-            .label(subtitle)
-            .halign(gtk::Align::Start)
-            .wrap(true)
-            .css_classes(["dim-label"])
-            .build(),
-    );
-    vbox.append(&key_field(title, text));
-    let close = gtk::Button::with_label("Close");
-    {
-        let dialog = dialog.clone();
-        close.connect_clicked(move |_| dialog.close());
-    }
-    vbox.append(&close);
-    dialog.set_child(Some(&vbox));
+    let dialog = adw::MessageDialog::new(Some(window), Some(title), Some(subtitle));
+    dialog.set_extra_child(Some(&key_field(title, text)));
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("close"));
+    dialog.set_close_response("close");
     dialog.present();
 }
 
 /// Show the peers known for a share.
 fn show_peers_dialog(window: &adw::ApplicationWindow, peers: &[PeerInfo]) {
-    let dialog = gtk::Window::builder()
-        .title("Peers")
-        .transient_for(window)
-        .modal(true)
-        .default_width(420)
-        .default_height(320)
-        .build();
-    let vbox = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_start(16)
-        .margin_end(16)
-        .margin_top(16)
-        .margin_bottom(16)
-        .build();
+    let dialog = adw::MessageDialog::new(Some(window), Some("Members"), None);
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
 
     if peers.is_empty() {
         vbox.append(
@@ -1241,6 +1187,7 @@ fn show_peers_dialog(window: &adw::ApplicationWindow, peers: &[PeerInfo]) {
                 ("health-sync", format!("{}% synced", p.percent))
             };
             let dot = gtk::Label::new(Some("●"));
+            dot.add_css_class("health-dot");
             dot.add_css_class(css);
             dot.set_tooltip_text(Some(&tip));
 
@@ -1272,13 +1219,15 @@ fn show_peers_dialog(window: &adw::ApplicationWindow, peers: &[PeerInfo]) {
         vbox.append(&list);
     }
 
-    let close = gtk::Button::with_label("Close");
-    {
-        let dialog = dialog.clone();
-        close.connect_clicked(move |_| dialog.close());
-    }
-    vbox.append(&close);
-    dialog.set_child(Some(&vbox));
+    let scroller = gtk::ScrolledWindow::builder()
+        .propagate_natural_height(true)
+        .max_content_height(360)
+        .child(&vbox)
+        .build();
+    dialog.set_extra_child(Some(&scroller));
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("close"));
+    dialog.set_close_response("close");
     dialog.present();
 }
 
@@ -1334,8 +1283,15 @@ fn fmt_time(ts: i64) -> String {
 }
 
 fn flat_button(label: &str) -> gtk::Button {
-    gtk::Button::builder()
+    // Left-align the label within the full-width button so popover menu items read
+    // as a left-aligned list rather than centered text.
+    let lbl = gtk::Label::builder()
         .label(label)
+        .halign(gtk::Align::Start)
+        .xalign(0.0)
+        .build();
+    gtk::Button::builder()
+        .child(&lbl)
         .css_classes(["flat"])
         .halign(gtk::Align::Fill)
         .build()

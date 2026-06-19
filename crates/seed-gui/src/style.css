@@ -10,7 +10,11 @@ headerbar {
 }
 
 /* Member health dot in the peers list: green = fully synced, yellow = under
- * 100% (downloading or behind), gray = offline. */
+ * 100% (downloading or behind), gray = offline. Enlarged so it's an easy hover
+ * target (the word label shows on hover). */
+.health-dot {
+  font-size: 1.8em;
+}
 .health-ok {
   color: @success_color;
 }
