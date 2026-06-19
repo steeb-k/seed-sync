@@ -26,6 +26,49 @@ Legend: ✅ pass · ❌ fail/bug · ⏳ not yet tested
 | Multi-GB file (no doubling, streaming) | ✅ 100MB | ✅ 1.76GB |
 | File **move** = local relocate, no re-download | — | ✅ 1.76GB |
 
+## GUI + presence feature test plan (M4 polish, 2026-06-19)
+Derived from the post-Checkpoint-#3 commits (no plan was written, so this is reverse-engineered
+from the diffs): `1d9080e` member names + health via gossip presence, `894544f` GUI dialog/dot
+polish, `7095421` Open-folder + dark tray, `50f8588` dark tray app-mode, `103b335` Windows exe icon.
+**Note:** `seed-cli` has NO peers/device-name command — presence is GUI/IPC-only; the only headless
+coverage is `seed-core/tests/presence.rs`. So most of this needs the GUI.
+
+Legend: ✅ pass · ❌ fail · ⏳ not yet · 🐧 Linux-doable · 🪟 Windows-only · 🔀 cross-OS (needs both)
+
+### 0. Build/automated gate — 🐧 [LINUX done 2026-06-19]
+- ✅ `cargo build --workspace` clean (icon `build.rs` is a no-op off-Windows; presence deps resolve).
+- ✅ Unit tests incl. new `presence::topic_is_deterministic_and_domain_separated`, `presence_roundtrips`,
+  IPC `roundtrip_device_name`. ⚠️ `loopback.rs` real-endpoint tests are **timing-flaky** (intermittent
+  timeouts; pass on retry — not a logic regression; aggravated by live daemons + new per-share gossip
+  startup). Treat loopback as retry-on-fail, not a hard gate.
+
+### A. Presence protocol — names + health (`1d9080e`) — 🔀 core feature
+1. ⏳ Device name **defaults to hostname**, and a custom name **persists across daemon restart** (new
+   `settings` table). 🐧 (GUI "Set device name…" or IPC SetDeviceName).
+2. ⏳ Setting a name on one member **propagates over gossip** and shows on the other member. 🔀
+3. ⏳ **Health %**: a viewer mid-sync shows **<100% (yellow dot)**, reaches **100% (green)**; master
+   always 100%; a member that goes offline shows **gray**. 🔀 (health = present/total manifest bytes).
+4. ⏳ Names + health propagate **both directions** Win↔Linux; a **viewer's** name shows on the master
+   (presence rides gossip since viewers can't write doc entries). 🔀
+5. ⏳ Trust model sanity: v1 presence payload is unsigned, trusted by authenticated `delivered_from` —
+   just confirm a member only appears for peers actually in the share. 🔀
+
+### B. Linux GTK GUI visual/interaction (`894544f`, `7095421`, GUI half of `1d9080e`) — 🐧
+6. ⏳ **Members** dialog (was "Peers"): health dots ~1.8× bigger; **hover shows the word label**
+   (synced / <100% / offline); each row shows member **name + role**.
+7. ⏳ **"Your name"** field prefilled with hostname in both **create** and **add** forms.
+8. ⏳ Gear-menu **"Set device name…"** dialog writes the one global device name (reflected in members).
+9. ⏳ Address / keys / Members dialogs are **frameless** (`adw::MessageDialog`, Close response, no
+   titlebar) — matching the Remove dialog.
+10. ⏳ Popover **menu labels left-aligned** (`flat_button`).
+11. ⏳ **"Open folder"** launches the file manager (Linux: `xdg-open`).
+
+### C. Windows-only (🪟 — NOT testable on Linux; Windows side must verify)
+12. ⏳ App icon embedded in the **exe / taskbar / window** + MSI shortcut/ARP icon (`103b335`,
+    `winresource`, `#[cfg(windows)]`).
+13. ⏳ **Dark tray context menu** follows the app color scheme via `SetPreferredAppMode` (`50f8588`,
+    `7095421`). Linux tray is a no-op (tray-icon is Windows/macOS only), so untestable here.
+
 ## Open issues
 ### #1 — Cross-volume viewer dedup leaves a 2× copy on Windows  *(FIXED — Option A)*
 **Resolution (2026-06-18):** vendored + one-line-patched `iroh-blobs` (`vendor/iroh-blobs`,
