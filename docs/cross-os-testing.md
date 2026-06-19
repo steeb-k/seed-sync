@@ -153,8 +153,10 @@ Rebuilt `seed-gui` clean (round 2 + rebrand `08606f6` + empty-state `c21c04b` al
   Daemon"; tray title "S.E.E.D." too.
 - ✅ **Empty-state** (`c21c04b`): with no shares the main view shows an `AdwStatusPage` — themed
   folder-remote icon, "No shares yet", "Use "+" to create or add one." Renders correctly on Linux.
-- ⏳ **Create + Add frameless modals + Add-gating** (`75d4ec8`, `1166387`) and **＋ dropdown popdown**
-  (`1166387`): need GUI clicks (no input-injection on this session) — pending human drive.
+- ✅ **Create + Add frameless modals + Add-gating** (`75d4ec8`, `1166387`): human-verified — both are
+  frameless `adw::MessageDialog`s with Cancel (Esc/Cancel backs out), and Add stays disabled until a key
+  AND a folder are provided. **＋ dropdown popdown** (`1166387`): confirmed — the ＋ popover closes on
+  selecting either item. Round 2 fully green on Linux.
 
 ## Open issues
 ### #1 — Cross-volume viewer dedup leaves a 2× copy on Windows  *(FIXED — Option A)*
