@@ -416,6 +416,10 @@ struct ShareState {
     /// Cheap (path,size,mtime) signature of the last published folder state,
     /// used by the master reconcile loop to skip unchanged ticks.
     last_quick_sig: u64,
+    /// Signature seen on the previous reconcile tick. A republish only fires once
+    /// the folder signature is unchanged across a tick (debounce), so a file still
+    /// being written/copied isn't repeatedly — and partially — published.
+    last_seen_sig: u64,
     /// When paused, the reconcile loop skips this share.
     paused: bool,
     /// Set while a [`PublishJob`] for this share is running off-lock, so the
@@ -579,6 +583,7 @@ impl Engine {
             ignore,
             last_seqno,
             last_quick_sig: 0,
+            last_seen_sig: 0,
             paused,
             publishing: false,
             roster,
@@ -852,16 +857,24 @@ impl Engine {
     /// publish), marking each publishing. The returned jobs borrow nothing from
     /// `self`, so the caller drops the engine lock before running them.
     pub fn plan_publishes(&mut self) -> Vec<PublishJob> {
-        let due: Vec<String> = self
-            .shares
-            .iter()
-            .filter(|(_, s)| !s.paused && !s.publishing && matches!(s.key.role, Role::Master))
-            .filter(|(_, s)| {
-                let (ig, _) = IgnoreSet::compile(&s.ignore);
-                scan::quick_signature(&s.folder, &ig) != s.last_quick_sig
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        let mut due: Vec<String> = Vec::new();
+        for (id, s) in self.shares.iter_mut() {
+            if s.paused || s.publishing || !matches!(s.key.role, Role::Master) {
+                continue;
+            }
+            let (ig, _) = IgnoreSet::compile(&s.ignore);
+            let sig = scan::quick_signature(&s.folder, &ig);
+            // Debounce: only publish once the folder has held the same signature
+            // across a full tick. A file still being written (e.g. a large ISO
+            // copying in) changes its size/mtime every tick, so it never looks
+            // stable and we don't repeatedly re-import a partial file or push
+            // half-written content to viewers — we wait until the copy settles.
+            let stable = sig == s.last_seen_sig;
+            s.last_seen_sig = sig;
+            if sig != s.last_quick_sig && stable {
+                due.push(id.clone());
+            }
+        }
         due.into_iter()
             .filter_map(|id| self.make_job(&id).ok().flatten())
             .collect()
