@@ -21,9 +21,10 @@ Legend: ✅ pass · ❌ fail/bug · ⏳ not yet tested
 | Self-heal (corrupt mirror → auto-restore) | ✅ ~6s | ✅ ~3s |
 | Viewer 1× dedup, **same volume** | ✅ (local) | ✅ 1.9GB→8MB |
 | Viewer 1× dedup, **cross volume** | ✅ fixed (#1) | ✅ Linux 1× native (#1 Win-only) |
-| Deletion / update propagation | ✅ | ⏳ |
+| Deletion / update propagation | ✅ | ✅ |
 | Empty (0-byte) + unicode file syncs (`5bdfa4b`) | — | ✅ |
 | Multi-GB file (no doubling, streaming) | ✅ 100MB | ✅ 1.76GB |
+| File **move** = local relocate, no re-download | — | ✅ 1.76GB |
 
 ## Open issues
 ### #1 — Cross-volume viewer dedup leaves a 2× copy on Windows  *(FIXED — Option A)*
@@ -161,8 +162,17 @@ change expected, just confirmation.
   reference-export completes; learned this the hard way on the first run).
 - ✅ **Self-heal Win→Linux (~3s):** corrupted `Big Doc.txt` (920→65 B) → auto-restored to exact
   original SHA256 in ~3s, no user action.
-- ⏳ **Delete/update propagation Win→Linux:** pending — need the Windows master to delete/update a
-  file so the Linux viewer can confirm it propagates.
+- ✅ **Delete/update/move propagation Win→Linux (2026-06-19):** Windows master (a) added content to
+  `café.txt` (0→4 B "asdf" — empty→non-empty transition), (b) deleted `newFolder/Big Doc.txt`,
+  (c) moved the 1.76 GB ISO from top-level into `newFolder/`. All three reflected on the Linux viewer.
+  **The ISO move did NOT re-download** — blob store stayed 7.7 MB (outboard-only), no in-flight `.data`,
+  ISO size exact, Healthy 100%: the viewer relocated its local mirror file (same-volume rename), not a
+  1.76 GB re-fetch. Efficient move handling confirmed cross-OS.
+
+**>>> Checkpoint #3 COMPLETE — Windows ⇄ Linux sync green in both directions.** All status-board rows
+pass. Auto-discovery (no bootstrap) resolves both ways; reference-import + 1× dedup hold for multi-GB
+files on both ends; self-heal, delete/update/move, empty+unicode files, and cross-OS path conversion
+all verified. Remaining M4 work is non-engine: deferred MSI code-signing + WixUI.
 - Note: **empty directories are not synced** (manifest tracks files only); deleting a folder's last
   file leaves the empty dir on the master but the viewer never materializes it. Benign; `diff -r`
   flags it. (Empty *files* now ride the signed manifest per `5bdfa4b` — separate from empty dirs.)
