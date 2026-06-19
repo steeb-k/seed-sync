@@ -21,7 +21,7 @@ Legend: ✅ pass · ❌ fail/bug · ⏳ not yet tested
 | Self-heal (corrupt mirror → auto-restore) | ✅ ~6s | ⏳ |
 | Viewer 1× dedup, **same volume** | ✅ (local) | ✅ (Linux local) |
 | Viewer 1× dedup, **cross volume** | ✅ fixed (#1) | ✅ Linux 1× native (#1 Win-only) |
-| Deletion / update propagation | ⏳ | ⏳ |
+| Deletion / update propagation | ✅ | ⏳ |
 
 ## Open issues
 ### #1 — Cross-volume viewer dedup leaves a 2× copy on Windows  *(FIXED — Option A)*
@@ -144,6 +144,9 @@ change expected, just confirmation.
   unlinks open files). So #1's fix can stay effectively Windows-only; Linux never had the bug.
 - ✅ **Real-binary dry-run (Linux loopback, auto-discovery, no bootstrap):** sync (~1s), 1× dedup
   (9 MiB content → 576 KB store), self-heal (~2s), update (~3s) + delete (~2s) propagation all pass.
+- ✅ **Delete/update propagation Linux→Win (2026-06-18):** on the live Linux master, updated
+  `readme.txt`, deleted `docs/unicode-name.txt`, added `added-on-linux.txt` — all three landed on
+  the Windows viewer within a few seconds. Direction 1 fully green.
 - ⏳ **Win→Linux sync:** in progress — Linux viewer added against a Windows share.
 - ⏳ **Publish of a file being written / empty / unicode-named doesn't wedge (see [WIN] 2026-06-19):**
   pending the Win→Linux run with such files.
