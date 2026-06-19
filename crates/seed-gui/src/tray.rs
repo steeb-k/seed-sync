@@ -16,6 +16,13 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem};
     use tray_icon::{TrayIconBuilder, TrayIconEvent};
 
+    // Opt the process into dark mode so native popups (the tray's context menu,
+    // a TrackPopupMenu) honor the app's color scheme. muda only dark-themes menu
+    // *bars*, not popups, so its set_theme has no effect on the tray menu — the
+    // popup follows the process app-mode set here.
+    #[cfg(windows)]
+    set_preferred_app_mode(adw::StyleManager::default().is_dark());
+
     let open = MenuItem::new("Open Seed Sync", true, None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
@@ -25,7 +32,7 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
     let quit_id = quit.id().clone();
 
     let icon = match TrayIconBuilder::new()
-        .with_menu(Box::new(menu.clone()))
+        .with_menu(Box::new(menu))
         .with_tooltip("Seed Sync")
         .build()
     {
@@ -35,23 +42,6 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
             return;
         }
     };
-
-    // Match the tray context menu to the app's color scheme. Without this the
-    // popup renders in the OS-default theme via muda's "Auto" (which can't detect
-    // dark for the tray's hidden window), so it shows light even in dark mode.
-    #[cfg(windows)]
-    {
-        let theme = if adw::StyleManager::default().is_dark() {
-            tray_icon::menu::MenuTheme::Dark
-        } else {
-            tray_icon::menu::MenuTheme::Light
-        };
-        let hwnd = icon.window_handle();
-        // SAFETY: `hwnd` is the live tray window from the icon we just built.
-        unsafe {
-            let _ = menu.set_theme_for_hwnd(hwnd as isize, theme);
-        }
-    }
 
     // Keep the icon alive for the process lifetime.
     Box::leak(Box::new(icon));
@@ -86,6 +76,41 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
         }
         glib::ControlFlow::Continue
     });
+}
+
+/// Opt this process into Windows dark mode via the undocumented
+/// `uxtheme.dll#135` (`SetPreferredAppMode`) so native popups — notably the tray
+/// context menu (a `TrackPopupMenu`) — render to match the app: `ForceDark` when
+/// the app is dark, `Default` (follow the OS) otherwise. GTK draws its own
+/// windows, so it never sets this, which is why the tray menu was stuck light.
+#[cfg(windows)]
+fn set_preferred_app_mode(dark: bool) {
+    use std::os::raw::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *const c_void;
+    }
+    // PreferredAppMode: Default=0, AllowDark=1, ForceDark=2, ForceLight=3.
+    let mode: i32 = if dark { 2 } else { 0 };
+    let dll: Vec<u16> = "uxtheme.dll"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let lib = LoadLibraryW(dll.as_ptr());
+        if lib.is_null() {
+            return;
+        }
+        // Ordinal 135 (MAKEINTRESOURCEA: the value's high word must be zero).
+        let proc = GetProcAddress(lib, 135 as *const u8);
+        if proc.is_null() {
+            return;
+        }
+        let set_preferred_app_mode: unsafe extern "system" fn(i32) -> i32 =
+            std::mem::transmute(proc);
+        set_preferred_app_mode(mode);
+    }
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
