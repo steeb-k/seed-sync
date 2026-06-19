@@ -13,6 +13,7 @@ pub mod engine;
 pub mod identity;
 pub mod manifest;
 pub mod node;
+pub mod presence;
 pub mod scan;
 pub mod secrets;
 

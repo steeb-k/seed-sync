@@ -91,6 +91,12 @@ pub enum IpcRequest {
     GetPeers {
         share_id: ShareId,
     },
+    /// This device's display name (default: the machine hostname), shown to the
+    /// other members of every share. One global name per device.
+    GetDeviceName,
+    SetDeviceName {
+        name: String,
+    },
     /// Upgrade this connection to also receive server-pushed [`IpcEvent`]s.
     Subscribe,
     GetSettings,
@@ -113,6 +119,7 @@ pub enum IpcResponse {
         viewer_key: String,
     },
     Peers(Vec<PeerInfo>),
+    DeviceName(String),
     Settings(Settings),
     NodeAddr(String),
     Ok,
@@ -183,12 +190,18 @@ pub struct ShareSummary {
 pub struct PeerInfo {
     /// Short form of the iroh node id.
     pub node_id: String,
+    /// Self-chosen display name from the member's presence; `None` => the GUI
+    /// falls back to `node_id`.
+    pub name: Option<String>,
     pub role: Role,
     pub online: bool,
     /// Unix seconds of last presence heartbeat.
     pub last_seen: i64,
     /// Highest manifest seqno this peer reports having.
     pub have_seqno: u64,
+    /// Sync health 0..=100 (100 = fully caught up; lower while downloading or
+    /// behind on an older version).
+    pub percent: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -246,5 +259,20 @@ mod tests {
         let back = decode(&bytes).unwrap();
         assert_eq!(back.id, 7);
         matches!(back.body, Message::Request(IpcRequest::AddShare { .. }));
+    }
+
+    #[test]
+    fn roundtrip_device_name() {
+        let frame = Frame {
+            id: 9,
+            body: Message::Request(IpcRequest::SetDeviceName {
+                name: "Desktop".into(),
+            }),
+        };
+        let back = decode(&encode(&frame).unwrap()).unwrap();
+        match back.body {
+            Message::Request(IpcRequest::SetDeviceName { name }) => assert_eq!(name, "Desktop"),
+            _ => panic!("wrong variant"),
+        }
     }
 }

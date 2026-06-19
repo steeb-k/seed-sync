@@ -38,6 +38,8 @@ enum UiMsg {
     },
     NodeAddr(String),
     Peers(Vec<PeerInfo>),
+    /// This device's current display name (from the daemon), cached in the GUI.
+    DeviceName(String),
     Throughput {
         down: u64,
         up: u64,
@@ -243,6 +245,9 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf, hidden: boo
     load_css();
     let (tx, rx) = async_channel::unbounded::<UiMsg>();
     let net = Net { handle, socket, tx };
+    // This device's display name, fetched from the daemon at startup and kept in
+    // sync; used to prefill the create/add "Your name" field and the gear dialog.
+    let device_name: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -276,8 +281,10 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf, hidden: boo
         .build();
     let gear_popover = gtk::Popover::new();
     let gear_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    let setname_btn = flat_button("Set device name…");
     let nodeaddr_btn = flat_button("Show this device's address…");
     let quit_btn = flat_button("Quit");
+    gear_box.append(&setname_btn);
     gear_box.append(&nodeaddr_btn);
     gear_box.append(&quit_btn);
     gear_popover.set_child(Some(&gear_box));
@@ -343,22 +350,35 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf, hidden: boo
     {
         let net = net.clone();
         let window = window.clone();
+        let device_name = device_name.clone();
         new_share_btn.connect_clicked(move |_| {
             add_popover.popdown();
-            create_share_flow(&window, &net);
+            create_share_flow(&window, &net, &device_name);
         });
     }
     {
         let net = net.clone();
         let window = window.clone();
+        let device_name = device_name.clone();
         add_share_btn.connect_clicked(move |_| {
-            show_add_dialog(&window, &net);
+            show_add_dialog(&window, &net, &device_name);
         });
     }
     {
         let net = net.clone();
+        let window = window.clone();
+        let device_name = device_name.clone();
+        let pop = gear_popover.clone();
+        setname_btn.connect_clicked(move |_| {
+            pop.popdown();
+            show_set_name_dialog(&window, &net, &device_name);
+        });
+    }
+    {
+        let net = net.clone();
+        let pop = gear_popover.clone();
         nodeaddr_btn.connect_clicked(move |_| {
-            gear_popover.popdown();
+            pop.popdown();
             net.send(IpcRequest::NodeAddr, |res| match res {
                 Ok(IpcResponse::NodeAddr(a)) => Some(UiMsg::NodeAddr(a)),
                 _ => Some(UiMsg::Toast("could not get node address".into())),
@@ -378,6 +398,7 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf, hidden: boo
         let down_lbl = down_lbl.clone();
         let up_lbl = up_lbl.clone();
         let updated_lbl = updated_lbl.clone();
+        let device_name = device_name.clone();
         let rows: Rc<RefCell<HashMap<String, RowWidgets>>> = Rc::new(RefCell::new(HashMap::new()));
         glib::spawn_future_local(async move {
             while let Ok(msg) = rx.recv().await {
@@ -408,6 +429,7 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf, hidden: boo
                         &a,
                     ),
                     UiMsg::Peers(peers) => show_peers_dialog(&window, &peers),
+                    UiMsg::DeviceName(name) => *device_name.borrow_mut() = name,
                     UiMsg::Throughput { down, up } => {
                         down_lbl.set_text(&format!("↓ {}", fmt_speed(down)));
                         up_lbl.set_text(&format!("↑ {}", fmt_speed(up)));
@@ -424,6 +446,11 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf, hidden: boo
 
     // --- live event subscription + periodic refresh fallback ---
     net.subscribe_loop();
+    // Seed the device-name cache once at startup.
+    net.send(IpcRequest::GetDeviceName, |res| match res {
+        Ok(IpcResponse::DeviceName(n)) => Some(UiMsg::DeviceName(n)),
+        _ => None,
+    });
     {
         let net = net.clone();
         net.refresh();
@@ -796,23 +823,98 @@ fn build_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> Ro
 const DEFAULT_IGNORE: &str = ".DS_Store\nThumbs.db\ndesktop.ini\n*.tmp\n*~";
 
 /// Create flow: pick a folder, then show the ignore-list editor before creating.
-fn create_share_flow(window: &adw::ApplicationWindow, net: &Net) {
+fn create_share_flow(
+    window: &adw::ApplicationWindow,
+    net: &Net,
+    device_name: &Rc<RefCell<String>>,
+) {
     let dialog = gtk::FileDialog::builder()
         .title("Choose a folder to share")
         .build();
     let net = net.clone();
     let win = window.clone();
+    let device_name = device_name.clone();
     dialog.select_folder(Some(window), gio::Cancellable::NONE, move |res| {
         if let Ok(folder) = res {
             if let Some(path) = folder.path() {
-                show_create_dialog(&win, &net, path);
+                show_create_dialog(&win, &net, path, &device_name);
             }
         }
     });
 }
 
+/// Apply a (possibly changed) device name from a form entry: persist it to the
+/// daemon and update the GUI cache. No-op when blank or unchanged.
+fn apply_device_name(net: &Net, device_name: &Rc<RefCell<String>>, entry: &gtk::Entry) {
+    let name = entry.text().trim().to_string();
+    if name.is_empty() || name == *device_name.borrow() {
+        return;
+    }
+    *device_name.borrow_mut() = name.clone();
+    net.send(IpcRequest::SetDeviceName { name }, |res| match res {
+        Ok(_) => None,
+        Err(_) => Some(UiMsg::Toast("could not set device name".into())),
+    });
+}
+
+/// A labeled "Your name" entry prefilled with the current device name, for the
+/// create/add forms.
+fn name_field(device_name: &Rc<RefCell<String>>) -> (gtk::Box, gtk::Entry) {
+    let b = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    b.append(
+        &gtk::Label::builder()
+            .label("Your name (shown to other members)")
+            .halign(gtk::Align::Start)
+            .css_classes(["caption-heading"])
+            .build(),
+    );
+    let entry = gtk::Entry::builder()
+        .text(&*device_name.borrow())
+        .placeholder_text("This device")
+        .build();
+    b.append(&entry);
+    (b, entry)
+}
+
+/// Gear-menu dialog to set this device's display name (shown to other members).
+fn show_set_name_dialog(
+    window: &adw::ApplicationWindow,
+    net: &Net,
+    device_name: &Rc<RefCell<String>>,
+) {
+    let dialog = adw::MessageDialog::new(
+        Some(window),
+        Some("Set device name"),
+        Some("How this device is shown to the other members of your shares."),
+    );
+    let entry = gtk::Entry::builder()
+        .text(&*device_name.borrow())
+        .activates_default(true)
+        .build();
+    dialog.set_extra_child(Some(&entry));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("save", "Save");
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.set_close_response("cancel");
+    let net = net.clone();
+    let device_name = device_name.clone();
+    dialog.connect_response(None, move |_, resp| {
+        if resp == "save" {
+            apply_device_name(&net, &device_name, &entry);
+            net.refresh();
+        }
+    });
+    dialog.present();
+}
+
 /// Dialog to review the folder + edit ignore patterns, then create the share.
-fn show_create_dialog(window: &adw::ApplicationWindow, net: &Net, folder: PathBuf) {
+fn show_create_dialog(
+    window: &adw::ApplicationWindow,
+    net: &Net,
+    folder: PathBuf,
+    device_name: &Rc<RefCell<String>>,
+) {
     let dialog = gtk::Window::builder()
         .title("Create share")
         .transient_for(window)
@@ -837,6 +939,8 @@ fn show_create_dialog(window: &adw::ApplicationWindow, net: &Net, folder: PathBu
             .css_classes(["dim-label"])
             .build(),
     );
+    let (name_box, name_entry) = name_field(device_name);
+    vbox.append(&name_box);
     vbox.append(
         &gtk::Label::builder()
             .label("Ignore patterns (one glob per line)")
@@ -861,7 +965,9 @@ fn show_create_dialog(window: &adw::ApplicationWindow, net: &Net, folder: PathBu
     {
         let net = net.clone();
         let dialog = dialog.clone();
+        let device_name = device_name.clone();
         create.connect_clicked(move |_| {
+            apply_device_name(&net, &device_name, &name_entry);
             let buf = text.buffer();
             let body = buf
                 .text(&buf.start_iter(), &buf.end_iter(), false)
@@ -898,7 +1004,7 @@ fn submit_create(net: &Net, folder: PathBuf, ignore: Vec<String>) {
 }
 
 /// Add flow: enter a key (+ optional bootstrap), pick a folder, add the share.
-fn show_add_dialog(window: &adw::ApplicationWindow, net: &Net) {
+fn show_add_dialog(window: &adw::ApplicationWindow, net: &Net, device_name: &Rc<RefCell<String>>) {
     let dialog = gtk::Window::builder()
         .title("Add existing share")
         .transient_for(window)
@@ -950,6 +1056,8 @@ fn show_add_dialog(window: &adw::ApplicationWindow, net: &Net) {
         });
     }
 
+    let (name_box, name_entry) = name_field(device_name);
+
     let add = gtk::Button::builder()
         .label("Add share")
         .css_classes(["suggested-action"])
@@ -960,7 +1068,10 @@ fn show_add_dialog(window: &adw::ApplicationWindow, net: &Net) {
         let boot_entry = boot_entry.clone();
         let chosen = chosen.clone();
         let dialog = dialog.clone();
+        let device_name = device_name.clone();
+        let name_entry = name_entry.clone();
         add.connect_clicked(move |_| {
+            apply_device_name(&net, &device_name, &name_entry);
             let key = key_entry.text().to_string();
             let Some(folder) = chosen.borrow().clone() else {
                 return;
@@ -1004,6 +1115,7 @@ fn show_add_dialog(window: &adw::ApplicationWindow, net: &Net) {
     folder_row.append(&folder_btn);
     folder_row.append(&folder_lbl);
     vbox.append(&folder_row);
+    vbox.append(&name_box);
     vbox.append(&add);
 
     dialog.set_child(Some(&vbox));
@@ -1118,16 +1230,43 @@ fn show_peers_dialog(window: &adw::ApplicationWindow, peers: &[PeerInfo]) {
             row.set_margin_end(8);
             row.set_margin_top(6);
             row.set_margin_bottom(6);
-            let dot = gtk::Label::new(Some(if p.online { "●" } else { "○" }));
-            dot.set_tooltip_text(Some(if p.online { "online" } else { "offline" }));
-            let id = gtk::Label::builder()
-                .label(&p.node_id)
+
+            // One dead-simple health dot: green = fully synced, yellow = under
+            // 100% (downloading or behind), gray = offline. Word label on hover.
+            let (css, tip) = if !p.online {
+                ("health-off", "Offline".to_string())
+            } else if p.percent >= 100 {
+                ("health-ok", "Synced".to_string())
+            } else {
+                ("health-sync", format!("{}% synced", p.percent))
+            };
+            let dot = gtk::Label::new(Some("●"));
+            dot.add_css_class(css);
+            dot.set_tooltip_text(Some(&tip));
+
+            // Name (falls back to the short id); the local row is tagged.
+            let display = p.name.clone().unwrap_or_else(|| p.node_id.clone());
+            let label_text = if p.node_id == "This device" {
+                format!("{display} (this device)")
+            } else {
+                display
+            };
+            let name_lbl = gtk::Label::builder()
+                .label(&label_text)
                 .halign(gtk::Align::Start)
                 .hexpand(true)
-                .css_classes(["monospace"])
+                .ellipsize(gtk::pango::EllipsizeMode::End)
                 .build();
+
+            let role = gtk::Label::builder()
+                .label(role_str(p.role))
+                .halign(gtk::Align::End)
+                .css_classes(["dim-label", "caption"])
+                .build();
+
             row.append(&dot);
-            row.append(&id);
+            row.append(&name_lbl);
+            row.append(&role);
             list.append(&row);
         }
         vbox.append(&list);

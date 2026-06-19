@@ -33,6 +33,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-lite = "2"
 async-channel = "2"
+bytes = "1"
 
 # --- serialization ---
 serde = { version = "1", features = ["derive"] }
@@ -52,6 +53,7 @@ notify = "8"
 walkdir = "2"
 globset = "0.4"
 directories = "5"
+hostname = "0.4"
 keyring = { version = "3.6", features = ["apple-native", "windows-native", "sync-secret-service", "crypto-rust"] }
 
 # --- gui (binding versions track installed GTK 4.22 / libadwaita 1.9) ---

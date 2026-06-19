@@ -218,8 +218,10 @@ pub(crate) async fn serve(
 /// hold the lock.
 async fn reconcile_loop(daemon: Daemon) {
     let mut tick = tokio::time::interval(Duration::from_millis(750));
+    let mut tick_n: u64 = 0;
     loop {
         tick.tick().await;
+        tick_n = tick_n.wrapping_add(1);
         let mut changed = Vec::new();
 
         // Masters: plan (brief lock) -> publish (no lock) -> commit (brief lock).
@@ -240,6 +242,16 @@ async fn reconcile_loop(daemon: Daemon) {
         // Viewers apply under the lock.
         let applied = { daemon.engine.lock().await.apply_all_viewers().await };
         changed.extend(applied);
+
+        // Presence: announce this device's name + health to each share's pool.
+        // Every ~4th tick (~3s), plus immediately whenever a share changed (its
+        // seqno/health just moved). Built under a brief lock, sent off-lock.
+        if tick_n.is_multiple_of(4) || !changed.is_empty() {
+            let jobs = { daemon.engine.lock().await.presence_broadcasts() };
+            for job in jobs {
+                job.send().await;
+            }
+        }
 
         if !changed.is_empty() {
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
@@ -463,6 +475,23 @@ async fn handle_request(daemon: &Daemon, req: IpcRequest) -> anyhow::Result<IpcR
         IpcRequest::GetPeers { share_id } => {
             let engine = daemon.engine.lock().await;
             IpcResponse::Peers(engine.peers(&share_id)?)
+        }
+        IpcRequest::GetDeviceName => {
+            IpcResponse::DeviceName(daemon.engine.lock().await.device_name())
+        }
+        IpcRequest::SetDeviceName { name } => {
+            // Persist the new name and push an immediate presence broadcast so
+            // peers see the rename within a tick rather than the periodic cycle.
+            let jobs = {
+                let engine = daemon.engine.lock().await;
+                engine.set_device_name(&name)?;
+                engine.presence_broadcasts()
+            };
+            for job in jobs {
+                job.send().await;
+            }
+            let _ = daemon.events.send(IpcEvent::ShareListChanged);
+            IpcResponse::Ok
         }
         IpcRequest::GetSettings => IpcResponse::Settings(seed_ipc::Settings::default()),
         IpcRequest::Subscribe => IpcResponse::Ok, // handled before dispatch

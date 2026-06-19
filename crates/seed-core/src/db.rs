@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 /// A persisted share row.
 #[derive(Debug, Clone)]
@@ -56,6 +56,10 @@ impl Db {
                  paused     INTEGER NOT NULL DEFAULT 0,
                  seed_in_keyring INTEGER NOT NULL DEFAULT 0,
                  quick_sig  INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS settings (
+                 k TEXT PRIMARY KEY,
+                 v TEXT NOT NULL
              );",
         )?;
         // Migration for DBs created before `quick_sig` existed; the error when the
@@ -120,6 +124,25 @@ impl Db {
         self.lock().execute(
             "UPDATE shares SET paused=?2 WHERE share_id=?1",
             rusqlite::params![share_id, paused as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Read a global key/value setting, or `None` if unset.
+    pub fn get_setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let conn = self.lock();
+        let v = conn
+            .query_row("SELECT v FROM settings WHERE k=?1", [key], |row| row.get(0))
+            .optional()?;
+        Ok(v)
+    }
+
+    /// Insert or update a global key/value setting.
+    pub fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.lock().execute(
+            "INSERT INTO settings (k, v) VALUES (?1, ?2)
+             ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            rusqlite::params![key, value],
         )?;
         Ok(())
     }
@@ -194,5 +217,22 @@ mod tests {
 
         db.remove_share("abc").unwrap();
         assert!(db.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn settings_get_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("state.db")).unwrap();
+        assert_eq!(db.get_setting("device_name").unwrap(), None);
+        db.set_setting("device_name", "Desktop").unwrap();
+        assert_eq!(
+            db.get_setting("device_name").unwrap(),
+            Some("Desktop".into())
+        );
+        db.set_setting("device_name", "Laptop").unwrap();
+        assert_eq!(
+            db.get_setting("device_name").unwrap(),
+            Some("Laptop".into())
+        );
     }
 }

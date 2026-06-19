@@ -17,6 +17,7 @@ bao-tree.workspace = true
 # async / util
 tokio.workspace = true
 futures-lite.workspace = true
+bytes.workspace = true
 
 # serialization / encoding
 serde.workspace = true
@@ -36,6 +37,7 @@ notify.workspace = true
 walkdir.workspace = true
 globset.workspace = true
 directories.workspace = true
+hostname.workspace = true
 keyring.workspace = true
 
 # diagnostics

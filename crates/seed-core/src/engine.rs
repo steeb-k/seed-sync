@@ -40,25 +40,39 @@ const PEER_ONLINE_TTL_SECS: i64 = 60;
 /// is every distinct peer seen since the daemon started; `online` is those that
 /// are currently connected (a neighbor) or heard-from within the TTL.
 #[derive(Default)]
-struct PeerRoster {
+pub(crate) struct PeerRoster {
     peers: HashMap<String, PeerEntry>,
 }
 
+#[derive(Default)]
 struct PeerEntry {
     neighbor: bool,
     last_seen: i64,
+    /// Filled from presence broadcasts (gossip). Absent until a peer announces.
+    name: Option<String>,
+    role: Option<seed_ipc::Role>,
+    seqno: u64,
+    percent: u8,
 }
 
 impl PeerRoster {
-    fn note(&mut self, id: &str, neighbor: Option<bool>) {
-        let e = self.peers.entry(id.to_string()).or_insert(PeerEntry {
-            neighbor: false,
-            last_seen: 0,
-        });
+    pub(crate) fn note(&mut self, id: &str, neighbor: Option<bool>) {
+        let e = self.peers.entry(id.to_string()).or_default();
         e.last_seen = now_secs();
         if let Some(n) = neighbor {
             e.neighbor = n;
         }
+    }
+
+    /// Fold a presence broadcast into the roster: refresh name/role/health and
+    /// mark the peer heard-from (online for the TTL).
+    pub(crate) fn note_presence(&mut self, id: &str, p: crate::presence::Presence) {
+        let e = self.peers.entry(id.to_string()).or_default();
+        e.last_seen = now_secs();
+        e.name = Some(p.name);
+        e.role = Some(p.role);
+        e.seqno = p.seqno;
+        e.percent = p.percent;
     }
 
     fn is_online(&self, e: &PeerEntry, now: i64) -> bool {
@@ -87,12 +101,12 @@ impl PeerRoster {
             .iter()
             .map(|(id, e)| seed_ipc::PeerInfo {
                 node_id: id.chars().take(16).collect(),
-                // We can't yet tell a peer's role from doc events; reported as
-                // Viewer as a placeholder until presence carries it.
-                role: seed_ipc::Role::Viewer,
+                name: e.name.clone(),
+                role: e.role.unwrap_or(seed_ipc::Role::Viewer),
                 online: self.is_online(e, now),
                 last_seen: e.last_seen,
-                have_seqno: 0,
+                have_seqno: e.seqno,
+                percent: e.percent,
             })
             .collect()
     }
@@ -115,6 +129,16 @@ fn now_secs() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Default display name when the user hasn't set one: the machine hostname.
+fn default_device_name() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Seed device".to_string())
 }
 
 /// Write a master seed to the OS keystore without letting it block share
@@ -450,11 +474,17 @@ struct ShareState {
     /// Set while a [`PublishJob`] for this share is running off-lock, so the
     /// reconcile loop doesn't start a second concurrent publish of it.
     publishing: bool,
-    /// Live peer membership, updated by the doc event task.
+    /// Live peer membership, updated by the doc event task + presence gossip.
     roster: Arc<StdMutex<PeerRoster>>,
     /// Unix seconds of the last successful publish (master) or applied update
     /// (viewer); 0 if none yet this session.
     last_updated: i64,
+    /// This member's own sync health 0..=100, broadcast in presence. A master is
+    /// always 100 (content source); a viewer's is set by [`Engine::apply`].
+    health: u8,
+    /// Presence gossip for this share (broadcasts our name + health, receives
+    /// peers'). `None` if the gossip subscribe failed. Aborted on drop.
+    presence: Option<crate::presence::PresenceHandle>,
 }
 
 impl ShareState {
@@ -480,6 +510,10 @@ pub struct Engine {
     /// export) still needs deleting. Retried each reconcile until iroh releases
     /// the file handle — see [`try_reclaim_owned_data`].
     reclaim_pending: std::collections::HashSet<Hash>,
+    /// This device's display name, broadcast in presence and shown to other
+    /// members. Cached from `settings["device_name"]` (default: hostname) so
+    /// per-tick broadcasts and `peers()` don't hit the DB. One global name.
+    device_name: StdMutex<String>,
 }
 
 impl Engine {
@@ -489,6 +523,10 @@ impl Engine {
         let node = IrohNode::spawn(data_dir).await?;
         let author = node.docs_api().author_default().await?;
         let db = crate::db::Db::open(&data_dir.join("state.db"))?;
+        let device_name = db
+            .get_setting("device_name")?
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(default_device_name);
         let mut engine = Self {
             node,
             author,
@@ -496,9 +534,34 @@ impl Engine {
             db,
             progress: Arc::new(StdMutex::new(HashMap::new())),
             reclaim_pending: std::collections::HashSet::new(),
+            device_name: StdMutex::new(device_name),
         };
         engine.reload_shares().await?;
         Ok(engine)
+    }
+
+    /// This device's display name (cached; default = hostname).
+    pub fn device_name(&self) -> String {
+        self.device_name
+            .lock()
+            .map(|n| n.clone())
+            .unwrap_or_else(|_| default_device_name())
+    }
+
+    /// Set + persist this device's display name (global — shown in every share).
+    /// An empty name resets to the hostname default. Returns the resolved name.
+    pub fn set_device_name(&self, name: &str) -> anyhow::Result<String> {
+        let name = name.trim();
+        let resolved = if name.is_empty() {
+            default_device_name()
+        } else {
+            name.to_string()
+        };
+        self.db.set_setting("device_name", &resolved)?;
+        if let Ok(mut n) = self.device_name.lock() {
+            *n = resolved.clone();
+        }
+        Ok(resolved)
     }
 
     /// Re-open every persisted share's replica and resume sync. Folder content
@@ -600,6 +663,38 @@ impl Engine {
         // the namespace for serving + connect to any bootstrap peers.
         let roster = Arc::new(StdMutex::new(PeerRoster::default()));
         spawn_event_task(&doc, roster.clone()).await?;
+
+        // Presence: a per-share gossip topic carrying each member's name + health.
+        // Bootstrap it with the same peers as the doc (the master endpoint id + any
+        // explicit bootstrap addrs), minus ourselves — a master's key carries its
+        // own endpoint id, and dialing yourself warns. Best-effort: a subscribe
+        // failure must not fail opening the share.
+        let self_id = self.node.endpoint.id();
+        let mut presence_bootstrap: Vec<EndpointId> = bootstrap.iter().map(|a| a.id).collect();
+        if let Some(eid) = key.endpoint_id() {
+            if let Ok(pk) = EndpointId::from_bytes(&eid) {
+                presence_bootstrap.push(pk);
+            }
+        }
+        presence_bootstrap.retain(|id| *id != self_id);
+        presence_bootstrap.sort();
+        presence_bootstrap.dedup();
+        let presence = match crate::presence::spawn_presence(
+            &self.node.gossip,
+            crate::presence::presence_topic(&key.share_id()),
+            presence_bootstrap,
+            self_id,
+            roster.clone(),
+        )
+        .await
+        {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!("presence gossip subscribe failed for share: {e}");
+                None
+            }
+        };
+
         doc.start_sync(bootstrap).await.context("start sync")?;
         Ok(ShareState {
             key: key.clone(),
@@ -613,6 +708,13 @@ impl Engine {
             publishing: false,
             roster,
             last_updated: 0,
+            // Master is always 100 (source); a viewer's is recomputed by apply().
+            health: if matches!(key.role, Role::Master) {
+                100
+            } else {
+                0
+            },
+            presence,
         })
     }
 
@@ -703,13 +805,50 @@ impl Engine {
         };
         let mut out = vec![seed_ipc::PeerInfo {
             node_id: "This device".into(),
+            name: Some(self.device_name()),
             role,
             online: true,
             last_seen: now_secs(),
             have_seqno: state.last_seqno,
+            percent: if matches!(state.key.role, Role::Master) {
+                100
+            } else {
+                state.health
+            },
         }];
         out.extend(state.roster.lock().map(|r| r.infos()).unwrap_or_default());
         Ok(out)
+    }
+
+    /// Build this tick's presence broadcasts — one per share with a live presence
+    /// channel. Call under the engine lock (cheap: clones the gossip sender +
+    /// pre-encodes); send the results off-lock via [`PresenceBroadcast::send`].
+    pub fn presence_broadcasts(&self) -> Vec<crate::presence::PresenceBroadcast> {
+        let name = self.device_name();
+        let ts = now_secs();
+        let mut out = Vec::new();
+        for s in self.shares.values() {
+            let Some(h) = s.presence.as_ref() else {
+                continue;
+            };
+            let (role, percent) = match s.key.role {
+                Role::Master => (seed_ipc::Role::Master, 100),
+                Role::Viewer => (seed_ipc::Role::Viewer, s.health),
+            };
+            let p = crate::presence::Presence {
+                v: crate::presence::PRESENCE_V,
+                name: name.clone(),
+                role,
+                seqno: s.last_seqno,
+                percent,
+                ts,
+            };
+            out.push(crate::presence::PresenceBroadcast::new(
+                h.sender.clone(),
+                &p,
+            ));
+        }
+        out
     }
 
     /// Reveal the keys for a share. Returns the master key only when this node
@@ -1067,17 +1206,33 @@ impl Engine {
         // Self-consistency: signed root must match the signed file list.
         manifest::verify_root(&manifest, &manifest.files).map_err(|e| anyhow!("root: {e}"))?;
 
-        // 3. Ensure every listed file's content is present before mutating disk.
+        // 3. Ensure every listed file's content is present before mutating disk,
+        //    and compute this viewer's sync health (present / total bytes) — set on
+        //    the share so an in-progress or behind viewer reports a partial %, not
+        //    just 0/100. (A viewer that hasn't downloaded the newest manifest's
+        //    files reads <100 of *that* manifest, so this also captures "behind".)
         let mut desired: HashSet<String> = HashSet::new();
+        let mut total_bytes: u64 = 0;
+        let mut present_bytes: u64 = 0;
+        let mut all_present = true;
         for fe in &manifest.files {
             desired.insert(fe.path.clone());
+            total_bytes += fe.size;
             if fe.size == 0 {
-                continue; // empty files carry no blob; materialized directly below
+                continue; // empty files carry no blob; always counted present
             }
             let arr: [u8; 32] = fe.hash.as_slice().try_into().context("bad hash len")?;
-            if !self.node.blobs.blobs().has(Hash::from(arr)).await? {
-                return Ok(false); // a file's content is still downloading; retry later
+            if self.node.blobs.blobs().has(Hash::from(arr)).await? {
+                present_bytes += fe.size;
+            } else {
+                all_present = false;
             }
+        }
+        state.health = (present_bytes.min(total_bytes) * 100)
+            .checked_div(total_bytes)
+            .unwrap_or(100) as u8;
+        if !all_present {
+            return Ok(false); // some content still downloading; retry later
         }
 
         // 4. Materialize each listed file whose local content differs.
