@@ -34,7 +34,7 @@ Write-Host "[3/3] wix build" -ForegroundColor Cyan
 $dist = Join-Path $root "dist\SeedSync"
 $out = Join-Path $root "target\wix\SeedSync-$Version.msi"
 New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
-& wix build "$root\wix\seedsync.wxs" -d DistDir="$dist" -o $out
+& wix build -arch x64 "$root\wix\seedsync.wxs" -d DistDir="$dist" -o $out
 if ($LASTEXITCODE -ne 0) { throw "wix build failed" }
 
 Write-Host ("Done -> {0}  ({1:N1} MB)" -f $out, ((Get-Item $out).Length / 1MB)) -ForegroundColor Green

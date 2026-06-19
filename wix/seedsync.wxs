@@ -7,8 +7,9 @@
   LocalSystem "SeedSyncDaemon" service, and drops Start-menu + desktop shortcuts
   to the GUI.
 
-  Build (see scripts\build-msi.ps1):
-    wix build wix\seedsync.wxs -d DistDir=dist\SeedSync -o target\wix\SeedSync-<ver>.msi
+  Build (see scripts\build-msi.ps1) — -arch x64 so it installs to Program Files
+  (without it WiX builds a 32-bit MSI that lands in Program Files (x86)):
+    wix build -arch x64 wix\seedsync.wxs -d DistDir=dist\SeedSync -o target\wix\SeedSync-<ver>.msi
 
   The runtime is harvested wholesale with <Files> (no hand-maintained file list).
   seed-daemon.exe is its own component so the service can be installed/started/
