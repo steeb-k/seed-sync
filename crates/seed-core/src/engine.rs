@@ -133,6 +133,37 @@ async fn store_seed_bounded(share_id: &str, seed: [u8; 32]) -> anyhow::Result<()
     }
 }
 
+/// Try to delete a blob's orphaned owned `data/<hash>.data` file after a reference
+/// export. Returns `true` when it's gone (reclaimed now, or already moved/absent)
+/// and `false` when it's still locked and should be retried on a later pass.
+///
+/// `ExportMode::TryReference` moves the owned blob into the mirror with a `rename`;
+/// across volumes that fails with `EXDEV` and iroh falls back to a copy, leaving the
+/// downloaded copy behind (no GC runs to reclaim it — see iroh-blobs `fs.rs`
+/// `export_path_impl`). The store entry is then `External` (it serves from the mirror
+/// file and keeps the outboard), so the owned `.data` is pure waste — deleting it
+/// keeps a viewer at 1× regardless of whether its mirror is on the data dir's volume.
+///
+/// On Windows the file can't be deleted while iroh still holds its handle (Linux
+/// allows unlinking an open file, so this usually succeeds at once there). iroh's
+/// EntityManager releases the idle handle a few seconds after the export, so the
+/// caller queues the hash and retries each reconcile until this returns `true`. The
+/// outboard `.obao4` is never touched. Only ever called for hashes we just exported
+/// (entry guaranteed `External`), so a legitimately-owned blob is never destroyed.
+fn try_reclaim_owned_data(blobs_dir: &Path, hash: Hash) -> bool {
+    let data_file = blobs_dir
+        .join("data")
+        .join(format!("{}.data", hash.to_hex()));
+    match std::fs::remove_file(&data_file) {
+        Ok(()) => {
+            tracing::debug!("reclaimed orphaned owned blob copy {}", data_file.display());
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => false, // iroh still holds the handle; retry next reconcile
+    }
+}
+
 /// Provider endpoint ids to re-fetch content from during self-heal: the master
 /// (its id is carried in the share key) first, then any peers seen in the roster.
 fn peer_providers(key: &ShareKey, roster: &Arc<StdMutex<PeerRoster>>) -> Vec<EndpointId> {
@@ -416,6 +447,10 @@ pub struct Engine {
     /// being published off-lock, keyed by share id. Shared with each in-flight
     /// [`PublishJob`] so [`Engine::list_summaries`] can report a moving percent.
     progress: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
+    /// Hashes whose orphaned owned blob copy (left by a cross-volume reference
+    /// export) still needs deleting. Retried each reconcile until iroh releases
+    /// the file handle — see [`try_reclaim_owned_data`].
+    reclaim_pending: std::collections::HashSet<Hash>,
 }
 
 impl Engine {
@@ -431,6 +466,7 @@ impl Engine {
             shares: HashMap::new(),
             db,
             progress: Arc::new(StdMutex::new(HashMap::new())),
+            reclaim_pending: std::collections::HashSet::new(),
         };
         engine.reload_shares().await?;
         Ok(engine)
@@ -835,6 +871,14 @@ impl Engine {
     /// Returns the ids that changed. Viewers' content download/export streams
     /// via the blob store, but this still holds the engine lock for now.
     pub async fn apply_all_viewers(&mut self) -> Vec<String> {
+        // Retry deleting any orphaned cross-volume blob copies whose handle iroh
+        // has since released (drop the ones that are gone, keep the still-locked).
+        if !self.reclaim_pending.is_empty() {
+            let blobs_dir = self.node.blobs_dir.clone();
+            self.reclaim_pending
+                .retain(|&h| !try_reclaim_owned_data(&blobs_dir, h));
+        }
+
         let ids: Vec<String> = self
             .shares
             .iter()
@@ -1034,7 +1078,13 @@ impl Engine {
                 }
             }
 
-            if !file_matches(&target, &fe.hash) {
+            if file_matches(&target, &fe.hash) {
+                // The export referenced the mirror file (entry is now External).
+                // Across volumes it left the downloaded copy behind; queue it for
+                // reclaim so the viewer ends up 1× on any drive layout (iroh holds
+                // the file handle briefly, so the deletion is retried below).
+                self.reclaim_pending.insert(hash);
+            } else {
                 // Either the export couldn't restore it, or an existing file was
                 // edited/corrupted. Do NOT re-export here: when the store already
                 // references this same path, exporting would copy the corrupt

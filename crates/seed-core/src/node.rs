@@ -17,6 +17,10 @@ use iroh_gossip::net::Gossip;
 pub struct IrohNode {
     pub endpoint: Endpoint,
     pub blobs: FsStore,
+    /// The blob store's root dir (`<data_dir>/blobs`). Used to reclaim a blob's
+    /// owned `data/<hash>.data` file after a cross-volume reference export leaves
+    /// it orphaned (see `engine::reclaim_owned_data`).
+    pub blobs_dir: PathBuf,
     pub gossip: Gossip,
     pub docs: Docs,
     router: Router,
@@ -60,6 +64,7 @@ impl IrohNode {
         Ok(Self {
             endpoint,
             blobs,
+            blobs_dir,
             gossip,
             docs,
             router,

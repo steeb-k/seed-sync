@@ -20,11 +20,25 @@ Legend: ✅ pass · ❌ fail/bug · ⏳ not yet tested
 | Cross-OS path (`/`↔`\`) + unicode names | ✅ | ⏳ |
 | Self-heal (corrupt mirror → auto-restore) | ✅ ~6s | ⏳ |
 | Viewer 1× dedup, **same volume** | ✅ (local) | ⏳ |
-| Viewer 1× dedup, **cross volume** | ❌ see #1 | ⏳ |
+| Viewer 1× dedup, **cross volume** | ✅ fixed (#1) | ⏳ |
 | Deletion / update propagation | ⏳ | ⏳ |
 
 ## Open issues
-### #1 — Cross-volume viewer dedup leaves a 2× copy on Windows  *(open; upstream iroh bug)*
+### #1 — Cross-volume viewer dedup leaves a 2× copy on Windows  *(FIXED — Option A)*
+**Resolution (2026-06-18):** vendored + one-line-patched `iroh-blobs` (`vendor/iroh-blobs`,
+`[patch.crates-io]` in `Cargo.toml`) so its `TryReference` export also treats Windows
+`ERROR_NOT_SAME_DEVICE` (17) as a cross-volume move and falls back to copy + `External`.
+The leftover owned copy (Windows holds the handle briefly) is then deleted by a reclaim
+retry queue in `engine.rs`/`node.rs` (`reclaim_pending`, retried each reconcile until iroh
+releases the handle, ~3 s). Verified: cross-volume viewer blob store **100.91 MB → 0.91 MB**
+(1×), same-volume still 0.91 MB, all seed-core tests green. **Linux:** the patch is inert
+there (Linux gets EXDEV=18, already handled), so behavior is unchanged — but `vendor/iroh-blobs`
+must be present after a pull for the build to resolve the `[patch]`.
+
+Original analysis below for reference.
+
+---
+
 When a viewer's **mirror folder is on a different volume than its data dir**, the
 content is stored twice (auto-downloaded blob in the store **and** the mirror file).
 Same-volume is fine (1×).
