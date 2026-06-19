@@ -396,13 +396,18 @@ fn build_ui(
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("Seed Sync")
+        .title("S.E.E.D.")
         .default_width(580)
         .default_height(380)
         .build();
 
     // --- header bar ---
     let header = adw::HeaderBar::new();
+    // Title + subtitle: "S.E.E.D." over "Secure Environment Exchange Daemon".
+    header.set_title_widget(Some(&adw::WindowTitle::new(
+        "S.E.E.D.",
+        "Secure Environment Exchange Daemon",
+    )));
 
     // "+" menu: create / add.
     let add_btn = gtk::MenuButton::builder()

@@ -24,7 +24,7 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
     #[cfg(windows)]
     set_preferred_app_mode(adw::StyleManager::default().is_dark());
 
-    let open = MenuItem::new("Open Seed Sync", true, None);
+    let open = MenuItem::new("Open S.E.E.D.", true, None);
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
     let _ = menu.append(&open);
@@ -34,7 +34,7 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
 
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("Seed Sync");
+        .with_tooltip("S.E.E.D.");
     match load_tray_icon() {
         Some(icon) => builder = builder.with_icon(icon),
         None => tracing::warn!("tray icon failed to decode; using system default"),
@@ -178,7 +178,7 @@ mod linux {
             "io.github.steeb_k.SeedSync".into()
         }
         fn title(&self) -> String {
-            "Seed Sync".into()
+            "S.E.E.D.".into()
         }
         fn category(&self) -> ksni::Category {
             ksni::Category::ApplicationStatus
@@ -191,7 +191,7 @@ mod linux {
         }
         fn tool_tip(&self) -> ksni::ToolTip {
             ksni::ToolTip {
-                title: "Seed Sync".into(),
+                title: "S.E.E.D.".into(),
                 description: String::new(),
                 icon_name: String::new(),
                 icon_pixmap: Vec::new(),
@@ -205,7 +205,7 @@ mod linux {
             use ksni::menu::StandardItem;
             vec![
                 StandardItem {
-                    label: "Open Seed Sync".into(),
+                    label: "Open S.E.E.D.".into(),
                     activate: Box::new(|t: &mut Self| {
                         let _ = t.tx.try_send(TrayCmd::Open);
                     }),
