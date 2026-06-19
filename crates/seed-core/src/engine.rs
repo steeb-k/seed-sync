@@ -361,6 +361,21 @@ impl PublishJob {
                 Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) => size,
                 _ => f.size,
             };
+            // iroh-docs rejects a (non-empty hash, len 0) entry. A file being
+            // actively written can report a stale 0 size (the Windows directory
+            // entry / `path.metadata()` lags the data iroh actually hashes),
+            // producing exactly that pair. Rather than fail the whole publish on
+            // one in-flight file — which retries every tick and wedges the share —
+            // skip it this cycle; it publishes once it settles. (A genuinely empty
+            // file has the EMPTY hash + len 0 and passes.)
+            if (hash == Hash::EMPTY) != (size == 0) {
+                tracing::warn!(
+                    "skip publishing {}: content/size mismatch (size {}, file still being written?)",
+                    f.rel,
+                    size
+                );
+                continue;
+            }
             self.doc
                 .set_hash(self.author, f.rel.as_bytes().to_vec(), hash, size)
                 .await
