@@ -1,15 +1,15 @@
 //! Embed the Windows application icon into the seed-gui exe so it shows in
 //! Explorer, the taskbar, and the window. The icon lives at the repo root
-//! (icon/appIcon.ico), i.e. two levels up from this crate.
+//! (icon/appIconHiVis.ico), i.e. two levels up from this crate.
 //!
 //! No-op on non-Windows hosts (the Linux/macOS builds don't carry it).
 
 fn main() {
-    println!("cargo:rerun-if-changed=../../icon/appIcon.ico");
+    println!("cargo:rerun-if-changed=../../icon/appIconHiVis.ico");
     #[cfg(windows)]
     {
         let mut res = winresource::WindowsResource::new();
-        res.set_icon("../../icon/appIcon.ico");
+        res.set_icon("../../icon/appIconHiVis.ico");
         if let Err(e) = res.compile() {
             // Don't fail the build if the resource compiler is unavailable; just
             // ship without the embedded icon and make it visible.

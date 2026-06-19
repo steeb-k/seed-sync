@@ -9,7 +9,7 @@ description = "Seed Sync GTK4/Libadwaita GUI + system tray (IPC client to seed-d
 name = "seed-gui"
 path = "src/main.rs"
 
-# Embeds the Windows app icon (icon/appIcon.ico) into the exe — see build.rs.
+# Embeds the Windows app icon (icon/appIconHiVis.ico) into the exe — see build.rs.
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
