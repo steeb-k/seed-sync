@@ -150,6 +150,63 @@ async fn master_viewer_mirror_lifecycle() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A genuinely empty (0-byte) file must sync — including a unicode-named one.
+/// iroh-docs can't carry a len-0 content entry, so empty files ride the signed
+/// manifest and the viewer creates them directly. Regression: a 0-byte `café.txt`
+/// used to fail `set_hash` ("Attempted to insert an empty entry") and wedge the
+/// whole publish on a loop.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn empty_files_sync() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let mut master = Engine::new(a_data.path()).await?;
+    let mut viewer = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        master.wait_online().await;
+        viewer.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    // A 0-byte unicode-named file next to a normal one. The empty file must not
+    // wedge the publish, and must still mirror.
+    std::fs::write(a_folder.path().join("café.txt"), b"")?;
+    std::fs::write(a_folder.path().join("readme.txt"), b"hello")?;
+
+    let created = master.create_share(a_folder.path(), vec![]).await?;
+    let master_addr = master.endpoint_addr();
+    let share_id = viewer
+        .add_share(&created.viewer_key, b_folder.path(), vec![master_addr])
+        .await?;
+
+    let want = snapshot(a_folder.path());
+    sync_until(&mut viewer, &share_id, b_folder.path(), &want).await?;
+    let cafe = b_folder.path().join("café.txt");
+    assert!(cafe.is_file(), "empty unicode file should exist on viewer");
+    assert_eq!(std::fs::metadata(&cafe)?.len(), 0, "should be 0 bytes");
+    println!("empty unicode file synced OK");
+
+    // A file truncated to empty later must also propagate to 0 bytes.
+    std::fs::write(a_folder.path().join("readme.txt"), b"")?;
+    master.publish(&share_id).await?;
+    let want = snapshot(a_folder.path());
+    sync_until(&mut viewer, &share_id, b_folder.path(), &want).await?;
+    assert_eq!(
+        std::fs::metadata(b_folder.path().join("readme.txt"))?.len(),
+        0,
+        "truncated-to-empty should propagate"
+    );
+
+    master.shutdown().await?;
+    viewer.shutdown().await?;
+    println!("empty-file sync OK");
+    Ok(())
+}
+
 /// A viewer must store synced content ~1x: the blob store keeps only the outboard
 /// and references the mirror file, instead of holding a second copy of the bytes.
 #[tokio::test]

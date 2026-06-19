@@ -361,19 +361,19 @@ impl PublishJob {
                 Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) => size,
                 _ => f.size,
             };
-            // iroh-docs rejects a (non-empty hash, len 0) entry. A file being
-            // actively written can report a stale 0 size (the Windows directory
-            // entry / `path.metadata()` lags the data iroh actually hashes),
-            // producing exactly that pair. Rather than fail the whole publish on
-            // one in-flight file — which retries every tick and wedges the share —
-            // skip it this cycle; it publishes once it settles. (A genuinely empty
-            // file has the EMPTY hash + len 0 and passes.)
-            if (hash == Hash::EMPTY) != (size == 0) {
-                tracing::warn!(
-                    "skip publishing {}: content/size mismatch (size {}, file still being written?)",
-                    f.rel,
-                    size
-                );
+            // iroh-docs can't carry an empty file: it only accepts a len-0 entry
+            // paired with its all-zeros empty *sentinel* hash, but a real 0-byte
+            // file hashes to BLAKE3("") — so set_hash is rejected ("Attempted to
+            // insert an empty entry"), which used to fail (and endlessly retry) the
+            // whole publish. Empty files instead ride the signed manifest only; the
+            // viewer creates them directly (see `apply`). No doc entry, no blob.
+            if size == 0 {
+                files.push(manifest::FileEntry {
+                    path: f.rel.clone(),
+                    hash: hash.as_bytes().to_vec(),
+                    size: 0,
+                    deleted: false,
+                });
                 continue;
             }
             self.doc
@@ -1071,6 +1071,9 @@ impl Engine {
         let mut desired: HashSet<String> = HashSet::new();
         for fe in &manifest.files {
             desired.insert(fe.path.clone());
+            if fe.size == 0 {
+                continue; // empty files carry no blob; materialized directly below
+            }
             let arr: [u8; 32] = fe.hash.as_slice().try_into().context("bad hash len")?;
             if !self.node.blobs.blobs().has(Hash::from(arr)).await? {
                 return Ok(false); // a file's content is still downloading; retry later
@@ -1088,6 +1091,20 @@ impl Engine {
         let endpoint = self.node.endpoint.clone();
         for fe in &manifest.files {
             let target = state.folder.join(rel_to_native(&fe.path));
+            // Empty files ride the manifest only (iroh-docs can't carry them);
+            // create them directly rather than through the blob store.
+            if fe.size == 0 {
+                let present = std::fs::metadata(&target)
+                    .map(|m| m.is_file() && m.len() == 0)
+                    .unwrap_or(false);
+                if !present {
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::File::create(&target)?;
+                }
+                continue;
+            }
             if file_matches(&target, &fe.hash) {
                 continue;
             }
