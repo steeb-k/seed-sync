@@ -1159,21 +1159,9 @@ fn submit_create(net: &Net, folder: PathBuf, ignore: Vec<String>) {
 
 /// Add flow: enter a key (+ optional bootstrap), pick a folder, add the share.
 fn show_add_dialog(window: &adw::ApplicationWindow, net: &Net, device_name: &Rc<RefCell<String>>) {
-    let dialog = gtk::Window::builder()
-        .title("Add existing share")
-        .transient_for(window)
-        .modal(true)
-        .default_width(460)
-        .build();
+    let dialog = adw::MessageDialog::new(Some(window), Some("Add existing share"), None);
 
-    let vbox = gtk::Box::builder()
-        .orientation(gtk::Orientation::Vertical)
-        .spacing(8)
-        .margin_start(16)
-        .margin_end(16)
-        .margin_top(16)
-        .margin_bottom(16)
-        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
 
     let key_entry = gtk::Entry::builder()
         .placeholder_text("Paste master or viewer key (seedm… / seedv…)")
@@ -1187,52 +1175,84 @@ fn show_add_dialog(window: &adw::ApplicationWindow, net: &Net, device_name: &Rc<
         .css_classes(["dim-label"])
         .build();
     let folder_btn = gtk::Button::with_label("Choose folder…");
-    let chosen: std::rc::Rc<std::cell::RefCell<Option<PathBuf>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let chosen: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+    let (name_box, name_entry) = name_field(device_name);
+
+    // The "Add" response stays disabled until there's a key and a chosen folder —
+    // a MessageDialog response always closes, so we gate it rather than no-op on
+    // submit.
+    let update_valid: Rc<dyn Fn()> = {
+        let dialog = dialog.clone();
+        let key_entry = key_entry.clone();
+        let chosen = chosen.clone();
+        Rc::new(move || {
+            let ok = !key_entry.text().trim().is_empty() && chosen.borrow().is_some();
+            dialog.set_response_enabled("add", ok);
+        })
+    };
+
     {
         let chosen = chosen.clone();
         let folder_lbl = folder_lbl.clone();
         let dialog = dialog.clone();
+        let update_valid = update_valid.clone();
         folder_btn.connect_clicked(move |_| {
             let fd = gtk::FileDialog::builder()
                 .title("Choose local folder")
                 .build();
             let chosen = chosen.clone();
             let folder_lbl = folder_lbl.clone();
+            let update_valid = update_valid.clone();
             fd.select_folder(Some(&dialog), gio::Cancellable::NONE, move |res| {
                 if let Ok(f) = res {
                     if let Some(p) = f.path() {
                         folder_lbl.set_text(&p.to_string_lossy());
                         *chosen.borrow_mut() = Some(p);
+                        update_valid();
                     }
                 }
             });
         });
     }
+    {
+        let update_valid = update_valid.clone();
+        key_entry.connect_changed(move |_| update_valid());
+    }
 
-    let (name_box, name_entry) = name_field(device_name);
+    content.append(
+        &gtk::Label::builder()
+            .label("Key")
+            .halign(gtk::Align::Start)
+            .build(),
+    );
+    content.append(&key_entry);
+    content.append(&boot_entry);
+    let folder_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    folder_row.append(&folder_btn);
+    folder_row.append(&folder_lbl);
+    content.append(&folder_row);
+    content.append(&name_box);
 
-    let add = gtk::Button::builder()
-        .label("Add share")
-        .css_classes(["suggested-action"])
-        .build();
+    dialog.set_extra_child(Some(&content));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("add", "Add");
+    dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("add"));
+    dialog.set_close_response("cancel");
+    dialog.set_response_enabled("add", false);
+
     {
         let net = net.clone();
-        let key_entry = key_entry.clone();
-        let boot_entry = boot_entry.clone();
-        let chosen = chosen.clone();
-        let dialog = dialog.clone();
         let device_name = device_name.clone();
-        let name_entry = name_entry.clone();
-        add.connect_clicked(move |_| {
+        dialog.connect_response(None, move |_, resp| {
+            if resp != "add" {
+                return;
+            }
             apply_device_name(&net, &device_name, &name_entry);
             let key = key_entry.text().to_string();
             let Some(folder) = chosen.borrow().clone() else {
                 return;
             };
-            if key.is_empty() {
-                return;
-            }
             let bootstrap = {
                 let b = boot_entry.text().to_string();
                 if b.trim().is_empty() {
@@ -1253,26 +1273,9 @@ fn show_add_dialog(window: &adw::ApplicationWindow, net: &Net, device_name: &Rc<
                     _ => Some(UiMsg::Toast("add failed".into())),
                 },
             );
-            dialog.close();
         });
     }
 
-    vbox.append(
-        &gtk::Label::builder()
-            .label("Key")
-            .halign(gtk::Align::Start)
-            .build(),
-    );
-    vbox.append(&key_entry);
-    vbox.append(&boot_entry);
-    let folder_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-    folder_row.append(&folder_btn);
-    folder_row.append(&folder_lbl);
-    vbox.append(&folder_row);
-    vbox.append(&name_box);
-    vbox.append(&add);
-
-    dialog.set_child(Some(&vbox));
     dialog.present();
 }
 
