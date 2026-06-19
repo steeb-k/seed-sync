@@ -67,4 +67,4 @@ if (Test-Path "$gbin\gtk-update-icon-cache.exe") {
 }
 
 Write-Host "Done. Portable tree at $dist"
-Write-Host "Next: zip it, or build an MSI with cargo-wix (see docs/windows-packaging.md)."
+Write-Host "Next: zip it, or build the MSI (scripts\bundle is run by scripts\build-msi.ps1)."
