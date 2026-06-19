@@ -231,7 +231,7 @@ mod linux {
         use gtk::gdk_pixbuf::{InterpType, Pixbuf};
         const PNG: &[u8] = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../icon/appIcon.png"
+            "/../../icon/appIconHiVis.png"
         ));
         let Ok(src) = Pixbuf::from_read(std::io::Cursor::new(PNG)) else {
             return Vec::new();
