@@ -216,10 +216,112 @@ fn main() -> glib::ExitCode {
     // window shown.
     let hidden = std::env::args().any(|a| a == "--hidden");
 
+    // Single-instance: a second launch should reveal the running window, not spin
+    // up a second process (and a second tray icon). `show_rx` carries those
+    // "reveal" requests to the live window.
+    let (show_tx, show_rx) = async_channel::unbounded::<()>();
+    #[cfg(windows)]
+    if single_instance::already_running(&show_tx) {
+        // Another instance owns the lock; we signaled it to show and now exit.
+        return glib::ExitCode::SUCCESS;
+    }
+    // Keep a sender alive for the whole process so the reveal-channel stays open
+    // (on Windows the watcher thread also holds one; on Linux it's otherwise
+    // unused — GApplication's own D-Bus uniqueness handles a second launch).
+    let _show_tx = show_tx;
+
     let app = adw::Application::builder().application_id(APP_ID).build();
-    app.connect_activate(move |app| build_ui(app, handle.clone(), socket.clone(), hidden));
+    app.connect_activate(move |app| {
+        // Re-activation (Linux GApplication uniqueness, or our reveal-signal)
+        // presents the existing window instead of building a second one.
+        if let Some(win) = app.windows().first() {
+            win.present();
+            return;
+        }
+        build_ui(app, handle.clone(), socket.clone(), hidden, show_rx.clone());
+    });
     // We parse our own args (above); don't hand them to GApplication.
     app.run_with_args::<&str>(&[])
+}
+
+/// Windows single-instance guard. GApplication's uniqueness is D-Bus-based and a
+/// no-op on Windows, so each launch is its own primary (and spawns its own tray).
+/// We enforce one instance with a named mutex, and let a second launch poke the
+/// first (via a named event) to reveal its window before exiting.
+#[cfg(windows)]
+mod single_instance {
+    use std::ffi::c_void;
+
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    const EVENT_MODIFY_STATE: u32 = 0x0002;
+    const INFINITE: u32 = 0xFFFF_FFFF;
+    const WAIT_OBJECT_0: u32 = 0;
+
+    // Session-local (per user session) so different logon sessions are independent.
+    const MUTEX_NAME: &str = "Local\\com.seedsync.SeedSync.instance";
+    const EVENT_NAME: &str = "Local\\com.seedsync.SeedSync.show";
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateMutexW(attrs: *const c_void, owner: i32, name: *const u16) -> *mut c_void;
+        fn CreateEventW(
+            attrs: *const c_void,
+            manual_reset: i32,
+            initial: i32,
+            name: *const u16,
+        ) -> *mut c_void;
+        fn OpenEventW(access: u32, inherit: i32, name: *const u16) -> *mut c_void;
+        fn SetEvent(handle: *mut c_void) -> i32;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn WaitForSingleObject(handle: *mut c_void, ms: u32) -> u32;
+        fn GetLastError() -> u32;
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// Returns `true` if another instance already holds the lock — after signaling
+    /// it to reveal its window. Otherwise claims the lock as the primary instance,
+    /// spawns a thread that forwards reveal-signals onto `show_tx`, and returns
+    /// `false`. The mutex/event handles are intentionally never closed: they live
+    /// for the process.
+    pub fn already_running(show_tx: &async_channel::Sender<()>) -> bool {
+        let mutex_name = wide(MUTEX_NAME);
+        let event_name = wide(EVENT_NAME);
+        unsafe {
+            let mutex = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
+            if !mutex.is_null() && GetLastError() == ERROR_ALREADY_EXISTS {
+                // Secondary: poke the primary to show itself, then bow out.
+                let ev = OpenEventW(EVENT_MODIFY_STATE, 0, event_name.as_ptr());
+                if !ev.is_null() {
+                    SetEvent(ev);
+                    CloseHandle(ev);
+                }
+                CloseHandle(mutex);
+                return true;
+            }
+
+            // Primary: hold the mutex (never closed) and watch for reveal-signals.
+            let event = CreateEventW(std::ptr::null(), 0, 0, event_name.as_ptr());
+            if !event.is_null() {
+                let event_addr = event as usize; // raw HANDLE isn't Send; move as usize
+                let show_tx = show_tx.clone();
+                std::thread::spawn(move || {
+                    let event = event_addr as *mut c_void;
+                    loop {
+                        if WaitForSingleObject(event, INFINITE) != WAIT_OBJECT_0 {
+                            break;
+                        }
+                        if show_tx.send_blocking(()).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            false
+        }
+    }
 }
 
 /// Install the app stylesheet: a base "frameless" look on every platform, plus a
@@ -241,7 +343,13 @@ fn load_css() {
     );
 }
 
-fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf, hidden: bool) {
+fn build_ui(
+    app: &adw::Application,
+    handle: Handle,
+    socket: PathBuf,
+    hidden: bool,
+    show_rx: async_channel::Receiver<()>,
+) {
     load_css();
     let (tx, rx) = async_channel::unbounded::<UiMsg>();
     let net = Net { handle, socket, tx };
@@ -469,6 +577,16 @@ fn build_ui(app: &adw::Application, handle: Handle, socket: PathBuf, hidden: boo
 
     // --- system tray (best effort; ignored if no StatusNotifier host) ---
     tray::install(app, &window);
+
+    // A second launch (single-instance) signals us here to reveal the window.
+    {
+        let window = window.clone();
+        glib::spawn_future_local(async move {
+            while show_rx.recv().await.is_ok() {
+                window.present();
+            }
+        });
+    }
 
     // Be present in the tray from login (Windows): a `--hidden` autostart entry.
     ensure_autostart();
