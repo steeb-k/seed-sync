@@ -58,12 +58,18 @@ Legend: ✅ pass · ❌ fail · ⏳ not yet · 🐧 Linux-doable · 🪟 Windows
   the name silently stays empty until GUI relaunch. Suggest refetch-on-reconnect or a retry.
 - ✅ **Item 7 (create/add "Your name" prefill):** uses the same `device_name` cache as item 8, so
   prefills once the cache is populated (confirmed working post-restart; create form shares the path).
-- ⏳ **Item 11 ("Open folder" → xdg-open):** menu present; the launch action itself not yet exercised.
+- ✅ **Item 11 ("Open folder"):** human-verified — opens the target folder in the file manager.
 - ✅ **A3 gray (offline) dot, cross-OS:** killed the Linux viewer daemon → on the **Windows** Members
   dialog the Linux member `steebP14s` flipped to **gray almost instantly** (gossip `NeighborDown`, not a
   slow heartbeat timeout). The offline member **retains its last-known name** (roster keeps the entry
   with `online=false`) — correct/intended UX (you want to see *who* is offline). Green + gray verified.
-- ⏳ Health-dot **yellow (<100%)** still not observed live (needs a viewer caught mid-sync).
+- 🆗 Health-dot **yellow (<100%)**: **called good without a live capture** — same code path as green/gray
+  (`health = present/total bytes`, already seen as "Syncing 0%" text during the ISO sync); low risk.
+- ✅ **Linux tray = intentional no-op** (NOT a bug): `tray-icon`'s Linux backend needs GTK3+libappindicator
+  (conflicts with this GTK4 app), so the Linux build logs "tray not enabled on this platform build
+  (Linux: planned via ksni)" and shows no icon. Deferred to a `ksni`/StatusNotifier impl. **Windows tray
+  is a separate item (#12/13, 🪟):** if the Seed Sync icon is missing in the *Windows* tray while other
+  apps show, that's a real Windows bug — check for a `tray unavailable: {e}` warn from `TrayIconBuilder`.
 - Tooling note: no input-injection on this Wayland/niri session (no ydotool/wtype) — the human
   drives clicks; I focus the window (`niri msg action focus-window --id N`) + screenshot.
 
