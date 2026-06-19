@@ -145,7 +145,54 @@ fn default_socket() -> PathBuf {
     }
 }
 
+/// On Windows, point GLib/GTK at the bundled runtime resources relative to this
+/// exe, so a relocated install (Program Files, the portable tree, anywhere) finds
+/// its GSettings schemas, pixbuf loaders, and icon themes. Without the schema dir
+/// the file chooser aborts with "No GSettings schemas are installed on the system".
+/// Must run before any GLib/GTK call. No-op on other platforms (system paths).
+#[cfg(windows)]
+fn setup_runtime_env() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // <prefix>\bin\seed-gui.exe -> prefix is the install root (holds share\, lib\).
+    let Some(prefix) = exe.parent().and_then(|bin| bin.parent()) else {
+        return;
+    };
+    let set_if = |var: &str, p: PathBuf| {
+        if p.exists() && std::env::var_os(var).is_none() {
+            std::env::set_var(var, &p);
+        }
+    };
+    set_if(
+        "GSETTINGS_SCHEMA_DIR",
+        prefix.join(r"share\glib-2.0\schemas"),
+    );
+    set_if(
+        "GDK_PIXBUF_MODULE_FILE",
+        prefix.join(r"lib\gdk-pixbuf-2.0\2.10.0\loaders.cache"),
+    );
+    // Prepend our share\ so the icon theme is found.
+    let share = prefix.join("share");
+    if share.exists() {
+        let val = match std::env::var_os("XDG_DATA_DIRS") {
+            Some(cur) if !cur.is_empty() => {
+                let mut s = std::ffi::OsString::from(&share);
+                s.push(";");
+                s.push(cur);
+                s
+            }
+            _ => std::ffi::OsString::from(&share),
+        };
+        std::env::set_var("XDG_DATA_DIRS", val);
+    }
+}
+
+#[cfg(not(windows))]
+fn setup_runtime_env() {}
+
 fn main() -> glib::ExitCode {
+    setup_runtime_env();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
