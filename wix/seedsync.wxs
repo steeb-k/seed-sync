@@ -36,6 +36,8 @@
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="SeedSync">
         <Directory Id="BinDir" Name="bin" />
+        <Directory Id="ShareDir" Name="share" />
+        <Directory Id="LibDir" Name="lib" />
       </Directory>
     </StandardDirectory>
 
@@ -55,10 +57,14 @@
       <File Id="gdbus.exe" Source="$(DistDir)\bin\gdbus.exe" KeyPath="yes" />
     </Component>
 
-    <!-- The GTK runtime (schemas, pixbuf loaders, icon themes) preserving its
-         share\ and lib\ subtree under the install root. -->
-    <ComponentGroup Id="RuntimeFiles" Directory="INSTALLFOLDER">
+    <!-- The GTK runtime (schemas, pixbuf loaders, icon themes). Harvested into
+         explicit share\ and lib\ dirs — a <Files> glob takes the part before the
+         wildcard as its base, so targeting INSTALLFOLDER directly would drop the
+         share\/lib\ level and GTK wouldn't find its resources. -->
+    <ComponentGroup Id="ShareFiles" Directory="ShareDir">
       <Files Include="$(DistDir)\share\**" />
+    </ComponentGroup>
+    <ComponentGroup Id="LibFiles" Directory="LibDir">
       <Files Include="$(DistDir)\lib\**" />
     </ComponentGroup>
 
@@ -107,7 +113,8 @@
       <ComponentRef Id="GuiExe" />
       <ComponentRef Id="CliExe" />
       <ComponentRef Id="GdbusExe" />
-      <ComponentGroupRef Id="RuntimeFiles" />
+      <ComponentGroupRef Id="ShareFiles" />
+      <ComponentGroupRef Id="LibFiles" />
       <ComponentRef Id="DaemonExe" />
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="DesktopShortcut" />
