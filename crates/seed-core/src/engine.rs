@@ -351,18 +351,28 @@ impl PublishJob {
                 .await
                 .with_context(|| format!("import {}", f.abs.display()))?;
             let hash = tag.hash();
+            // Use the size iroh actually imported — it hashed the bytes, so this
+            // always agrees with `hash`. The scan's metadata size can disagree:
+            // a file still being written reports a stale 0 in the directory entry
+            // while the read sees real content. iroh-docs rejects a (non-empty
+            // hash, len 0) entry, which would wedge the whole publish on that one
+            // file (republishing and failing every tick).
+            let size = match self.blobs.blobs().status(hash).await {
+                Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) => size,
+                _ => f.size,
+            };
             self.doc
-                .set_hash(self.author, f.rel.as_bytes().to_vec(), hash, f.size)
+                .set_hash(self.author, f.rel.as_bytes().to_vec(), hash, size)
                 .await
                 .with_context(|| format!("set doc entry {}", f.rel))?;
             files.push(manifest::FileEntry {
                 path: f.rel.clone(),
                 hash: hash.as_bytes().to_vec(),
-                size: f.size,
+                size,
                 deleted: false,
             });
             live_keys.insert(f.rel.as_bytes().to_vec());
-            done_bytes += f.size;
+            done_bytes += size;
             self.set_progress(done_bytes, total_bytes);
             drop(tag);
         }
