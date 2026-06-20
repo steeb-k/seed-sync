@@ -1,0 +1,84 @@
+#!/bin/sh
+# S.E.E.D. (Seed Sync) bootstrap — install, update, or remove in one command.
+#
+#   curl -fsSL https://raw.githubusercontent.com/steeb-k/seed-sync-binaries/main/install.sh | sh
+#
+# Interactive when run from a terminal; otherwise defaults to install/update.
+# Non-interactive override:
+#   ... | sh -s -- install     (or update / remove)
+#   SEED_ACTION=install ... | sh
+#
+# Served from the public seed-sync-binaries repo root (mirrors this file). After
+# the first install, manage everything with the `seed-sync` command directly.
+set -eu
+
+REPO="${SEED_BINARIES_REPO:-steeb-k/seed-sync-binaries}"
+API="https://api.github.com/repos/$REPO/releases/latest"
+
+say()  { printf '%s\n' "$*"; }
+die()  { printf '%s\n' "seed-sync: error: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+have curl || die "curl is required"
+have tar  || die "tar is required"
+
+INSTALLED=""
+if have seed-daemon; then
+  INSTALLED="$(seed-daemon --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+fi
+
+# Pick the action: CLI arg > $SEED_ACTION > interactive menu > sane default.
+ACTION="${1:-${SEED_ACTION:-}}"
+if [ -z "$ACTION" ]; then
+  if [ -r /dev/tty ]; then
+    say "S.E.E.D. (Seed Sync)"
+    if [ -n "$INSTALLED" ]; then
+      say "  Installed: v$INSTALLED"
+      say ""
+      say "  1) Update to the latest version"
+      say "  2) Remove"
+      say "  3) Cancel"
+      printf "Choose [1]: "
+      read ans < /dev/tty || ans=3
+      case "${ans:-1}" in 1|"") ACTION=update ;; 2) ACTION=remove ;; *) say "Cancelled."; exit 0 ;; esac
+    else
+      say "  Not installed."
+      say ""
+      say "  1) Install"
+      say "  2) Cancel"
+      printf "Choose [1]: "
+      read ans < /dev/tty || ans=2
+      case "${ans:-1}" in 1|"") ACTION=install ;; *) say "Cancelled."; exit 0 ;; esac
+    fi
+  else
+    ACTION=install   # piped, no terminal: install (idempotent — also upgrades)
+  fi
+fi
+
+case "$ACTION" in
+  install|update|--install|--update)     ACTION=install_or_update ;;
+  remove|uninstall|--remove|--uninstall) ACTION=remove ;;
+  cancel) say "Cancelled."; exit 0 ;;
+  *) die "unknown action '$ACTION' (use install | update | remove)" ;;
+esac
+
+# Update/remove of an existing install: delegate to the installed wrapper, which
+# already knows how to download + version-check + swap (no work to duplicate here).
+if have seed-sync; then
+  case "$ACTION" in
+    install_or_update) exec seed-sync --update ;;
+    remove)            exec seed-sync --uninstall ;;
+  esac
+fi
+[ "$ACTION" = remove ] && die "S.E.E.D. is not installed"
+
+# First-time install: fetch the latest release tarball and run its wrapper.
+URL="$(curl -fsSL "$API" | grep -oE '"browser_download_url": *"https://[^"]+linux-x86_64\.tar\.gz"' | sed -E 's/.*"(https[^"]+)".*/\1/' | head -n1)"
+[ -n "$URL" ] || die "no linux-x86_64.tar.gz asset in the latest release of $REPO"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+say "Downloading $URL"
+curl -fsSL -o "$TMP/pkg.tgz" "$URL" || die "download failed"
+tar -xzf "$TMP/pkg.tgz" -C "$TMP" || die "extract failed"
+ROOT="$(find "$TMP" -maxdepth 2 -type d -name bin -exec dirname {} ';' | head -n1)"
+[ -n "$ROOT" ] || die "downloaded archive has no bin/ directory"
+"$ROOT/seed-sync" --install

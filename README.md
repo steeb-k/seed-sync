@@ -39,16 +39,19 @@ Releases are published as a portable tarball on the public
 [`seed-sync-binaries`](https://github.com/steeb-k/seed-sync-binaries) repo. Per-user
 install (no root); requires GTK 4.10+, libadwaita 1.4+, and libdbus-1 on the system.
 
-**Install** (also upgrades in place) — fetches the latest release:
+One command installs, updates, or removes — it detects what's already there and
+prompts (install / update / remove):
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSL "$(curl -fsSL https://api.github.com/repos/steeb-k/seed-sync-binaries/releases/latest | grep -oE 'https://[^"]+linux-x86_64\.tar\.gz' | head -1)" | tar xz && seed-sync-*/seed-sync --install
+curl -fsSL https://raw.githubusercontent.com/steeb-k/seed-sync-binaries/main/install.sh | sh
 ```
 
 It drops the binaries in `~/.local/bin`, runs the daemon as a `systemd --user`
 service (auto-starts at login), and enables a daily auto-update timer. Launch
-**S.E.E.D.** from your app menu. After install, the `seed-sync` command manages
-everything:
+**S.E.E.D.** from your app menu. Non-interactive: append `-s -- install`
+(or `update` / `remove`) after `sh`.
+
+After install, the `seed-sync` command manages everything locally:
 
 ```bash
 seed-sync --update              # check + apply a newer release (the timer does this daily)

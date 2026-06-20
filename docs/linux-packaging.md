@@ -52,6 +52,19 @@ the keyring, full network (iroh), the session bus (tray), and system GTK 4.10+/l
    or a fine-grained token scoped to that one repo), and add it to the **main repo** as the
    Actions secret **`SEED_BINARIES_TOKEN`**. The default `GITHUB_TOKEN` can't write to another
    repo, which is why this is required.
+3. **Publish the bootstrap** `packaging/linux/web-install.sh` to the `seed-sync-binaries` repo
+   root as **`install.sh`** (it's served via the raw URL the one-liner uses). It's stable and
+   rarely changes — if you edit `web-install.sh`, re-copy it:
+   ```sh
+   tmp=$(mktemp -d); gh repo clone steeb-k/seed-sync-binaries "$tmp/b"
+   cp packaging/linux/web-install.sh "$tmp/b/install.sh"
+   git -C "$tmp/b" commit -am "update bootstrap" && git -C "$tmp/b" push
+   ```
+
+End users then install/update/remove with one command (detects state, prompts):
+```sh
+curl -fsSL https://raw.githubusercontent.com/steeb-k/seed-sync-binaries/main/install.sh | sh
+```
 
 ## What each file is for
 All packaging inputs live in `packaging/linux/` and are assembled into the tarball by
@@ -62,6 +75,7 @@ All packaging inputs live in `packaging/linux/` and are assembled into the tarba
 | `scripts/package-linux.sh` | Builds the release: `cargo build --release`, renders hicolor icon sizes from `icon/appIcon.png` (needs ImageMagick), stages the tree, and writes `dist/seed-sync-<ver>-linux-x86_64.tar.gz`. Run with `--skip-build` to repackage existing binaries. |
 | `.github/workflows/release.yml` | On a `v*` tag: runs the package script on **ubuntu-24.04** (GUI needs GTK 4.10+), checks the tag matches the Cargo version, and publishes the tarball to `seed-sync-binaries`. |
 | `packaging/linux/seed-sync` | **The one wrapper** — installer, updater, and uninstaller in a single script, installed to `~/.local/bin/seed-sync`. `--install [--no-auto-update] [--no-gui-autostart]` places files (from the tarball it shipped in, or downloads if run standalone), enables the daemon + update timer, adds the tray autostart entry, runs a dep check. `--update [--check]` downloads the latest, version-compares vs `seed-daemon --version`, and applies (stop daemon → swap → restart). `--uninstall [--purge]` removes everything. `--status` shows installed/latest/service state. A shared internal `apply_tree` does the atomic file placement for both install and update. |
+| `packaging/linux/web-install.sh` | **The `curl \| sh` bootstrap.** POSIX sh, no args needed. Detects whether S.E.E.D. is installed and prompts (install / update / remove) via `/dev/tty`; non-interactive via `sh -s -- install\|update\|remove` or `$SEED_ACTION`. First install downloads the latest tarball and runs its `seed-sync --install`; update/remove on an existing install just delegate to the installed `seed-sync`. **Served from the `seed-sync-binaries` repo root as `install.sh`** (raw URL), mirrored from this file — re-copy it there if you change it (see below). |
 | `packaging/linux/seed-daemon.service` | `systemd --user` unit that runs `seed-daemon run`, restarts on failure, and auto-starts at login (`WantedBy=default.target`). |
 | `packaging/linux/seed-sync-update.service` | `systemd --user` **oneshot** that runs `seed-sync --update` (invoked by the timer). |
 | `packaging/linux/seed-sync-update.timer` | `systemd --user` timer: shortly after login + daily, with a randomized delay and `Persistent=true` (catches up if the machine was off). |
