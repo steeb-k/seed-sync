@@ -25,6 +25,7 @@ Legend: ✅ pass · ❌ fail/bug · ⏳ not yet tested
 | Empty (0-byte) + unicode file syncs (`5bdfa4b`) | — | ✅ |
 | Multi-GB file (no doubling, streaming) | ✅ 100MB | ✅ 1.76GB |
 | File **move** = local relocate, no re-download | — | ✅ 1.76GB |
+| **Multi-master** two-way converge (add/del/LWW/restart) (`ebaca7c`) | ⏳ | ⏳ |
 
 ## GUI + presence feature test plan (M4 polish, 2026-06-19)
 Derived from the post-Checkpoint-#3 commits (no plan was written, so this is reverse-engineered
@@ -309,6 +310,56 @@ all verified. Remaining M4 work is non-engine: deferred MSI code-signing + WixUI
   file leaves the empty dir on the master but the viewer never materializes it. Benign; `diff -r`
   flags it. (Empty *files* now ride the signed manifest per `5bdfa4b` — separate from empty dirs.)
   Also `seed-cli publish` requires `--share <id>` (reconcile loop auto-republishes anyway).
+
+## Multi-master shares — cross-OS test plan (`ebaca7c`, 2026-06-19)
+
+**What changed (engine — daemon rebuild + restart REQUIRED on BOTH ends).** The engine
+had silently regressed to single-master, one-directional mirror: `apply()` (the only code
+that wrote files to disk) ran for **viewers only** and read a single signed manifest, so two
+master-key holders never exchanged files — and a restarted second master lost its bootstrap
+hint and vanished from the peer list. Restored the original design (*"only master key holders
+can modify the share"* — **plural**): every node now runs one **bidirectional, last-writer-wins
+reconcile** against the shared iroh-docs replica. Key points for testing:
+
+- **Trust model changed:** the bespoke signed-manifest-as-source-of-truth is **retired**. Trust
+  is now iroh-docs' native per-entry **namespace signature** (namespace key = the master secret,
+  pinned in `share_id`), so only master-key holders can write; viewers hold a read capability and
+  physically can't. Equivalent authenticity, no anti-rollback seqno (out of scope: a malicious
+  *master* already has write access).
+- **New per-path `sync_index` SQLite table** disambiguates local-add vs remote-delete. Created
+  automatically (`CREATE TABLE IF NOT EXISTS`) — existing data dirs migrate transparently; **no
+  re-download**, existing shares just converge on first reconcile.
+- **Empty files** moved off the manifest to a `\x00e/<path>` control keyspace (iroh-docs filters
+  0-byte entries as tombstones). The ignore list moved to a replicated `\x00ignore` entry so
+  viewers honor what a master ignored.
+- **Back-compat:** single-master → viewer is unchanged (all prior status-board rows should still
+  pass); a lone master just has no peer to merge with.
+
+**Deploy for the test (both machines):**
+- Rebuild the daemon from `main` (≥ `ebaca7c`) and **restart** it — this is an engine change, so a
+  GUI-only redeploy is NOT enough. (Linux: `seed-sync --update` or rebuild + restart the `systemd
+  --user` unit. Windows: replace `seed-daemon.exe`, restart `SeedSyncDaemon` — see the WIN note.)
+- **Both sides add the share with the MASTER key** (`seedm1…`), not the viewer key. That's the
+  multi-master setup; the GUI Add field accepts it.
+
+**[LINUX] please test (🔀 needs both):**
+1. ⏳ **Bidirectional add:** drop a file in the folder on the Linux side and a different file on the
+   Windows side → both files appear, byte-identical, on both ends.
+2. ⏳ **Delete propagation either way:** delete a file on Linux → it disappears on Windows, and
+   vice-versa.
+3. ⏳ **Edit propagation either way:** edit a file on one side → the change reaches the other.
+4. ⏳ **Last-writer-wins:** edit the *same* file on both sides; the later write (wall-clock mtime)
+   wins on both ends. (Caveat: a truly concurrent same-file edit silently drops one copy — LWW,
+   documented; conflict-copies are future work. Clock skew between machines affects the winner.)
+5. ⏳ **Restart reconnect:** restart the Linux daemon → it must re-appear in the Windows peer list
+   and re-converge after a fresh change (this was the headline bug — a restarted second master used
+   to vanish forever).
+6. ⏳ **Viewer still read-only:** add a *third* participant (or reuse one) with the **viewer** key →
+   its local edits are still reverted; it mirrors the masters' merged state.
+
+Headless coverage exists: `seed-core/tests/loopback.rs::two_masters_converge_bidirectionally`
+(bidir add, delete, LWW conflict, restart-reconnect) + all prior loopback tests green; clippy clean.
+Windows release `seed-daemon.exe` (still v1.0.1) built and ready to drop in.
 
 ## Distribution & auto-update — release channel (2026-06-19)
 
