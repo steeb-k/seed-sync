@@ -33,11 +33,22 @@ use iroh_docs::{
 };
 
 /// How long since a peer was last heard from before we consider it offline.
-const PEER_ONLINE_TTL_SECS: i64 = 60;
+/// How long since the last sign of life (presence heartbeat, doc sync activity,
+/// or a neighbor-up) before we consider a peer offline. Presence is broadcast
+/// about every 3s, so this tolerates several missed beats while still flipping a
+/// peer offline within a few seconds of it actually leaving.
+const PEER_ONLINE_TTL_SECS: i64 = 20;
 
-/// Tracks the peers seen for one share, fed by the doc's live events. `total`
-/// is every distinct peer seen since the daemon started; `online` is those that
-/// are currently connected (a neighbor) or heard-from within the TTL.
+/// Tracks the peers seen for one share, fed by the doc's live events + presence
+/// gossip. `total` is every distinct peer seen since the daemon started; `online`
+/// is those heard-from within [`PEER_ONLINE_TTL_SECS`].
+///
+/// Online is deliberately **heartbeat-based, not a sticky "is a neighbor" flag**:
+/// when a peer's daemon is force-stopped, iroh-gossip does not always deliver a
+/// clean `NeighborDown`, so trusting a connected flag left peers wedged "online"
+/// forever. Instead, every sign of life refreshes `last_seen` and the entry ages
+/// out on its own; a `NeighborDown`, when it *does* arrive, force-ages the entry
+/// so it flips offline at once.
 #[derive(Default)]
 pub(crate) struct PeerRoster {
     peers: HashMap<String, PeerEntry>,
@@ -45,7 +56,6 @@ pub(crate) struct PeerRoster {
 
 #[derive(Default)]
 struct PeerEntry {
-    neighbor: bool,
     last_seen: i64,
     /// Filled from presence broadcasts (gossip). Absent until a peer announces.
     name: Option<String>,
@@ -55,11 +65,17 @@ struct PeerEntry {
 }
 
 impl PeerRoster {
+    /// Record activity for a peer. `neighbor` distinguishes gossip membership
+    /// transitions: `Some(true)` = NeighborUp, `Some(false)` = NeighborDown,
+    /// `None` = other evidence of life (remote insert / sync finished / presence).
     pub(crate) fn note(&mut self, id: &str, neighbor: Option<bool>) {
         let e = self.peers.entry(id.to_string()).or_default();
-        e.last_seen = now_secs();
-        if let Some(n) = neighbor {
-            e.neighbor = n;
+        if neighbor == Some(false) {
+            // NeighborDown is positive evidence the peer left: force it offline
+            // now rather than refreshing its liveness.
+            e.last_seen = now_secs() - PEER_ONLINE_TTL_SECS - 1;
+        } else {
+            e.last_seen = now_secs();
         }
     }
 
@@ -75,7 +91,7 @@ impl PeerRoster {
     }
 
     fn is_online(&self, e: &PeerEntry, now: i64) -> bool {
-        e.neighbor || (now - e.last_seen) < PEER_ONLINE_TTL_SECS
+        (now - e.last_seen) < PEER_ONLINE_TTL_SECS
     }
 
     /// The full peer-id strings currently known, for re-fetching content from

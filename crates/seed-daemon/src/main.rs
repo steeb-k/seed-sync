@@ -220,6 +220,10 @@ pub(crate) async fn serve(
 async fn reconcile_loop(daemon: Daemon) {
     let mut tick = tokio::time::interval(Duration::from_millis(750));
     let mut tick_n: u64 = 0;
+    // Last per-share membership/status fingerprint. A peer aging online/offline
+    // produces no reconcile change, so without this the GUI would never re-query
+    // and would show a stale "N of M" / dot until the next content change.
+    let mut last_membership: u64 = 0;
     loop {
         tick.tick().await;
         tick_n = tick_n.wrapping_add(1);
@@ -270,8 +274,29 @@ async fn reconcile_loop(daemon: Daemon) {
             }
         }
 
-        if !changed.is_empty() {
+        // Fingerprint the visible per-share state (membership counts + status)
+        // so peer online/offline transitions refresh the GUI even on an otherwise
+        // idle tick.
+        let membership = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for s in daemon.engine.lock().await.list_summaries() {
+                s.share_id.hash(&mut h);
+                s.online.hash(&mut h);
+                s.total.hash(&mut h);
+                (s.status as u8).hash(&mut h);
+                s.percent.hash(&mut h);
+                s.paused.hash(&mut h);
+            }
+            h.finish()
+        };
+        let membership_changed = membership != last_membership;
+        last_membership = membership;
+
+        if !changed.is_empty() || membership_changed {
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
+        }
+        if !changed.is_empty() {
             let ts = now_unix();
             for share_id in &changed {
                 let _ = daemon.events.send(IpcEvent::LastUpdated {
