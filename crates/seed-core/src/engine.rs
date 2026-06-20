@@ -724,7 +724,10 @@ impl ReconcileJob {
                     }
                     if !self.is_master {
                         // Viewer: replica wins, always.
-                        if self.materialize(&path, &re.hash, re.size, &mut reclaim).await? {
+                        if self
+                            .materialize(&path, &re.hash, re.size, &mut reclaim)
+                            .await?
+                        {
                             index_sets.push((path, re.hash.clone()));
                             changed = true;
                         }
@@ -734,7 +737,10 @@ impl ReconcileJob {
                     match b {
                         Some(bh) if bh == &le.hash => {
                             // Local untouched, remote changed → take remote.
-                            if self.materialize(&path, &re.hash, re.size, &mut reclaim).await? {
+                            if self
+                                .materialize(&path, &re.hash, re.size, &mut reclaim)
+                                .await?
+                            {
                                 index_sets.push((path, re.hash.clone()));
                                 changed = true;
                             }
@@ -749,8 +755,7 @@ impl ReconcileJob {
                         }
                         _ => {
                             // Both changed (or unknown base) → last-writer-wins.
-                            let local_ts =
-                                le.abs.as_ref().map(|a| mtime_micros(a)).unwrap_or(0);
+                            let local_ts = le.abs.as_ref().map(|a| mtime_micros(a)).unwrap_or(0);
                             if local_ts >= re.ts {
                                 if let Some(abs) = le.abs.as_ref() {
                                     let h = self.import_one(&path, abs).await?;
