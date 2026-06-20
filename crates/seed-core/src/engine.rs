@@ -854,6 +854,11 @@ pub struct Engine {
     /// members. Cached from `settings["device_name"]` (default: hostname) so
     /// per-tick broadcasts and `peers()` don't hit the DB. One global name.
     device_name: StdMutex<String>,
+    /// Global "pause all activity" switch. When set, the reconcile loop builds no
+    /// jobs for any share (regardless of each share's own `paused` flag) and every
+    /// summary reports `Paused`. Persisted in `settings["paused_all"]` so it
+    /// survives a daemon restart and new shares added while paused stay paused.
+    paused_all: StdMutex<bool>,
 }
 
 impl Engine {
@@ -867,6 +872,7 @@ impl Engine {
             .get_setting("device_name")?
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(default_device_name);
+        let paused_all = db.get_setting("paused_all")?.as_deref() == Some("1");
         let mut engine = Self {
             node,
             author,
@@ -875,6 +881,7 @@ impl Engine {
             progress: Arc::new(StdMutex::new(HashMap::new())),
             reclaim_pending: std::collections::HashSet::new(),
             device_name: StdMutex::new(device_name),
+            paused_all: StdMutex::new(paused_all),
         };
         engine.reload_shares().await?;
         Ok(engine)
@@ -902,6 +909,36 @@ impl Engine {
             *n = resolved.clone();
         }
         Ok(resolved)
+    }
+
+    /// Whether the global "pause all activity" switch is set.
+    pub fn paused_all(&self) -> bool {
+        self.paused_all.lock().map(|p| *p).unwrap_or(false)
+    }
+
+    /// Set + persist the global "pause all activity" switch. While set, no share
+    /// reconciles. Resuming clears the switch; the caller may additionally clear
+    /// the per-share `paused` flags (see [`Engine::set_paused`]) so a full resume
+    /// gets everything running again.
+    pub fn set_paused_all(&self, paused: bool) -> anyhow::Result<()> {
+        self.db
+            .set_setting("paused_all", if paused { "1" } else { "0" })?;
+        if let Ok(mut p) = self.paused_all.lock() {
+            *p = paused;
+        }
+        Ok(())
+    }
+
+    /// Resume everything: clear the global switch and every per-share pause flag.
+    pub fn resume_all(&mut self) -> anyhow::Result<()> {
+        self.set_paused_all(false)?;
+        let ids: Vec<String> = self.shares.keys().cloned().collect();
+        for id in ids {
+            if self.shares.get(&id).map(|s| s.paused).unwrap_or(false) {
+                self.set_paused(&id, false)?;
+            }
+        }
+        Ok(())
     }
 
     /// Re-open every persisted share's replica and resume sync. Folder content
@@ -1096,6 +1133,9 @@ impl Engine {
 
     pub fn list_summaries(&self) -> Vec<seed_ipc::ShareSummary> {
         let progress = self.progress.lock().map(|m| m.clone()).unwrap_or_default();
+        // While globally paused, every share reads as paused so the GUI shows its
+        // "Syncing Paused" page and the per-row controls agree.
+        let paused_all = self.paused_all();
         self.shares
             .iter()
             .map(|(id, s)| {
@@ -1112,7 +1152,7 @@ impl Engine {
                 // report a moving percent. Otherwise derive health from whether
                 // this node holds all of the merged view's content: a master is
                 // the source (always 100); a viewer reports its present/total %.
-                let (status, percent, indexed_bytes, index_total) = if s.paused {
+                let (status, percent, indexed_bytes, index_total) = if s.paused || paused_all {
                     (seed_ipc::ShareStatus::Paused, 0, 0, 0)
                 } else if let Some(&(done, tot)) = progress.get(id) {
                     let pct = (done.min(tot) * 100).checked_div(tot).unwrap_or(0) as u8;
@@ -1135,7 +1175,7 @@ impl Engine {
                     percent,
                     online,
                     total,
-                    paused: s.paused,
+                    paused: s.paused || paused_all,
                     indexed_bytes,
                     index_total,
                     last_updated: s.last_updated,
@@ -1295,6 +1335,10 @@ impl Engine {
     /// or already-running share. A first-tick debounce gates whether local edits
     /// are treated as authoritative this round (so a file mid-copy isn't imported).
     pub fn make_reconcile_job(&mut self, share_id: &str) -> anyhow::Result<Option<ReconcileJob>> {
+        // Global pause suspends all sync activity regardless of per-share state.
+        if self.paused_all() {
+            return Ok(None);
+        }
         let blobs = self.node.blobs.clone();
         let endpoint = self.node.endpoint.clone();
         let author = self.author;

@@ -500,6 +500,16 @@ async fn handle_request(daemon: &Daemon, req: IpcRequest) -> anyhow::Result<IpcR
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
             IpcResponse::Ok
         }
+        IpcRequest::PauseAll => {
+            daemon.engine.lock().await.set_paused_all(true)?;
+            let _ = daemon.events.send(IpcEvent::ShareListChanged);
+            IpcResponse::Ok
+        }
+        IpcRequest::ResumeAll => {
+            daemon.engine.lock().await.resume_all()?;
+            let _ = daemon.events.send(IpcEvent::ShareListChanged);
+            IpcResponse::Ok
+        }
         IpcRequest::RemoveShare {
             share_id,
             delete_files,

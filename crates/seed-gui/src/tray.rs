@@ -10,12 +10,49 @@
 //! than quitting (see `main`), so the icon persists in the background. Double-
 //! clicking it (or the "Open" menu item) re-shows the window; "Quit" exits.
 
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::Arc;
+
+/// Everything the tray backends need from the GTK side. Bundled so the
+/// platform-specific `install`s share one signature.
+pub struct TrayWiring {
+    /// A pause/resume menu click, delivered back to the GTK loop (where `net`
+    /// lives to issue the IPC).
+    pub pause_tx: async_channel::Sender<()>,
+    /// Current global pause state, written by the GTK side; drives the menu label.
+    pub paused: Arc<AtomicBool>,
+    /// Fires when the tray should re-render — a pause flip or fresh throughput.
+    /// Used by the ksni backend (the `tray-icon` backend polls instead).
+    pub refresh_rx: async_channel::Receiver<()>,
+    /// Latest throughput in bytes/sec as `(down, up)`, shown in the tooltip.
+    pub speeds: Arc<(AtomicU64, AtomicU64)>,
+}
+
+/// The live down/up rate line for the tray tooltip, mirroring the window's bottom
+/// status bar (e.g. "↓ 1.2 Mbps   ↑ 0.3 Mbps").
+fn rate_line(speeds: &(AtomicU64, AtomicU64)) -> String {
+    use std::sync::atomic::Ordering;
+    let down = speeds.0.load(Ordering::Relaxed);
+    let up = speeds.1.load(Ordering::Relaxed);
+    format!("↓ {}   ↑ {}", crate::fmt_speed(down), crate::fmt_speed(up))
+}
+
 #[cfg(any(windows, target_os = "macos"))]
-pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
+pub fn install(app: &adw::Application, window: &adw::ApplicationWindow, wiring: TrayWiring) {
     use adw::prelude::*;
     use gtk::glib;
+    use std::sync::atomic::Ordering;
     use tray_icon::menu::{Menu, MenuEvent, MenuItem};
     use tray_icon::{TrayIconBuilder, TrayIconEvent};
+
+    // The poll loop re-reads `paused`/`speeds` each tick, so the ksni re-render
+    // signal isn't needed on this backend.
+    let TrayWiring {
+        pause_tx,
+        paused,
+        refresh_rx: _refresh_rx,
+        speeds,
+    } = wiring;
 
     // Opt the process into dark mode so native popups (the tray's context menu,
     // a TrackPopupMenu) honor the app's color scheme. muda only dark-themes menu
@@ -25,11 +62,23 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
     set_preferred_app_mode(adw::StyleManager::default().is_dark());
 
     let open = MenuItem::new("Open S.E.E.D.", true, None);
+    // Label reflects the current state; refreshed in the poll loop below.
+    let pause = MenuItem::new(
+        if paused.load(Ordering::Relaxed) {
+            "Resume syncing"
+        } else {
+            "Pause syncing"
+        },
+        true,
+        None,
+    );
     let quit = MenuItem::new("Quit", true, None);
     let menu = Menu::new();
     let _ = menu.append(&open);
+    let _ = menu.append(&pause);
     let _ = menu.append(&quit);
     let open_id = open.id().clone();
+    let pause_id = pause.id().clone();
     let quit_id = quit.id().clone();
 
     let mut builder = TrayIconBuilder::new()
@@ -47,16 +96,37 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
         }
     };
 
-    // Keep the icon alive for the process lifetime.
-    Box::leak(Box::new(icon));
     tracing::info!("system tray installed");
 
     // tray-icon delivers clicks and menu picks on global channels; poll them on
     // the GTK main loop (where we can touch the window/app). 250 ms is plenty for
-    // a tray and keeps the idle cost negligible.
+    // a tray and keeps the idle cost negligible. The `icon` is moved into this
+    // closure (rather than leaked) so it stays alive *and* its tooltip can be
+    // updated with the live throughput.
     let app = app.clone();
     let window = window.clone();
+    let mut last_paused = paused.load(Ordering::Relaxed);
+    let mut last_speeds = (u64::MAX, u64::MAX);
     glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+        // Keep the menu label in step with the (externally driven) pause state.
+        let now_paused = paused.load(Ordering::Relaxed);
+        if now_paused != last_paused {
+            pause.set_text(if now_paused {
+                "Resume syncing"
+            } else {
+                "Pause syncing"
+            });
+            last_paused = now_paused;
+        }
+        // Refresh the tooltip when the throughput changes.
+        let now_speeds = (
+            speeds.0.load(Ordering::Relaxed),
+            speeds.1.load(Ordering::Relaxed),
+        );
+        if now_speeds != last_speeds {
+            let _ = icon.set_tooltip(Some(format!("S.E.E.D.\n{}", rate_line(&speeds))));
+            last_speeds = now_speeds;
+        }
         let mut open_window = false;
         let mut quit_app = false;
         while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
@@ -67,6 +137,8 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             if ev.id == open_id {
                 open_window = true;
+            } else if ev.id == pause_id {
+                let _ = pause_tx.try_send(());
             } else if ev.id == quit_id {
                 quit_app = true;
             }
@@ -171,6 +243,13 @@ mod linux {
     struct SeedTray {
         icons: Vec<ksni::Icon>,
         tx: async_channel::Sender<TrayCmd>,
+        /// Current global pause state, written by the GTK side; drives the
+        /// Pause/Resume menu label.
+        paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// A pause/resume menu click, bridged straight to the GTK loop.
+        pause_tx: async_channel::Sender<()>,
+        /// Live throughput `(down, up)` in bytes/sec, shown in the tooltip.
+        speeds: std::sync::Arc<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
     }
 
     impl ksni::Tray for SeedTray {
@@ -192,7 +271,7 @@ mod linux {
         fn tool_tip(&self) -> ksni::ToolTip {
             ksni::ToolTip {
                 title: "S.E.E.D.".into(),
-                description: String::new(),
+                description: super::rate_line(&self.speeds),
                 icon_name: String::new(),
                 icon_pixmap: Vec::new(),
             }
@@ -203,11 +282,25 @@ mod linux {
         }
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
             use ksni::menu::StandardItem;
+            use std::sync::atomic::Ordering;
+            let pause_label = if self.paused.load(Ordering::Relaxed) {
+                "Resume syncing"
+            } else {
+                "Pause syncing"
+            };
             vec![
                 StandardItem {
                     label: "Open S.E.E.D.".into(),
                     activate: Box::new(|t: &mut Self| {
                         let _ = t.tx.try_send(TrayCmd::Open);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+                StandardItem {
+                    label: pause_label.into(),
+                    activate: Box::new(|t: &mut Self| {
+                        let _ = t.pause_tx.try_send(());
                     }),
                     ..Default::default()
                 }
@@ -267,7 +360,17 @@ mod linux {
             .collect()
     }
 
-    pub fn install(app: &adw::Application, window: &adw::ApplicationWindow) {
+    pub fn install(
+        app: &adw::Application,
+        window: &adw::ApplicationWindow,
+        wiring: super::TrayWiring,
+    ) {
+        let super::TrayWiring {
+            pause_tx,
+            paused,
+            refresh_rx,
+            speeds,
+        } = wiring;
         let icons = load_icons();
         if icons.is_empty() {
             tracing::warn!("tray icon failed to decode; tray disabled");
@@ -293,7 +396,13 @@ mod linux {
 
         // ksni's tokio service runs on its own thread; block_on keeps the runtime
         // (and the returned handle) alive for the process lifetime.
-        let tray = SeedTray { icons, tx };
+        let tray = SeedTray {
+            icons,
+            tx,
+            paused,
+            pause_tx,
+            speeds,
+        };
         let spawn = std::thread::Builder::new()
             .name("seed-tray".into())
             .spawn(move || {
@@ -310,8 +419,13 @@ mod linux {
                 };
                 rt.block_on(async move {
                     match tray.spawn().await {
-                        Ok(_handle) => {
+                        Ok(handle) => {
                             tracing::info!("system tray installed (ksni/StatusNotifier)");
+                            // Re-render (menu label + tooltip) whenever the GTK side
+                            // signals a change — a pause flip or fresh throughput.
+                            while refresh_rx.recv().await.is_ok() {
+                                let _ = handle.update(|_| {}).await;
+                            }
                             std::future::pending::<()>().await;
                         }
                         Err(e) => tracing::warn!("tray unavailable: {e}"),
@@ -329,6 +443,6 @@ pub use linux::install;
 
 // Other unixes (e.g. *BSD): no tray backend wired.
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
-pub fn install(_app: &adw::Application, _window: &adw::ApplicationWindow) {
+pub fn install(_app: &adw::Application, _window: &adw::ApplicationWindow, _wiring: TrayWiring) {
     tracing::info!("tray not enabled on this platform build");
 }

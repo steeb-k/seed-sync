@@ -80,6 +80,11 @@ pub enum IpcRequest {
     Resume {
         share_id: ShareId,
     },
+    /// Set the global "pause all activity" switch: suspends sync for every share.
+    PauseAll,
+    /// Clear the global pause switch *and* every per-share pause flag, so a full
+    /// resume gets everything syncing again.
+    ResumeAll,
     RemoveShare {
         share_id: ShareId,
         delete_files: bool,

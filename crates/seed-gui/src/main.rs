@@ -19,6 +19,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use adw::prelude::*;
@@ -51,6 +53,9 @@ enum UiMsg {
     },
     LastUpdated(i64),
     Refresh,
+    /// The daemon could not be reached on the last request — the GUI shows the
+    /// "Daemon Not Started" page instead of spamming error toasts.
+    DaemonDown,
     Toast(String),
 }
 
@@ -83,7 +88,9 @@ impl Net {
         self.send(IpcRequest::ListShares, |res| match res {
             Ok(IpcResponse::Shares(s)) => Some(UiMsg::Shares(s)),
             Ok(IpcResponse::Err(e)) => Some(UiMsg::Toast(format!("list failed: {e}"))),
-            Err(e) => Some(UiMsg::Toast(format!("daemon unreachable: {e}"))),
+            // A connection failure means the daemon isn't running/reachable; the
+            // UI surfaces a dedicated status page rather than a toast per refresh.
+            Err(_) => Some(UiMsg::DaemonDown),
             _ => None,
         });
     }
@@ -394,6 +401,31 @@ fn build_ui(
     // sync; used to prefill the create/add "Your name" field and the gear dialog.
     let device_name: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
 
+    // State shared with the tray (which lives partly on other threads). The
+    // message pump writes it from the daemon's summaries/throughput; the tray
+    // reads it to label its menu item and fill its tooltip. `tray_refresh` nudges
+    // the Linux tray to re-render when something changes; `tray_pause` carries a
+    // tray click back to the GTK loop, where `net` is available to issue the IPC.
+    let paused_state = Arc::new(AtomicBool::new(false));
+    let tray_speeds = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+    let (tray_refresh_tx, tray_refresh_rx) = async_channel::unbounded::<()>();
+    let (tray_pause_tx, tray_pause_rx) = async_channel::unbounded::<()>();
+
+    // Toggle the global pause switch from its current known state, then refresh.
+    let toggle_pause_all = {
+        let net = net.clone();
+        let paused_state = paused_state.clone();
+        Rc::new(move || {
+            let req = if paused_state.load(Ordering::Relaxed) {
+                IpcRequest::ResumeAll
+            } else {
+                IpcRequest::PauseAll
+            };
+            net.send(req, |_| None);
+            net.refresh();
+        })
+    };
+
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("S.E.E.D.")
@@ -431,9 +463,14 @@ fn build_ui(
         .build();
     let gear_popover = gtk::Popover::new();
     let gear_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    // Pause/Resume all activity; its label tracks the global pause state, kept in
+    // sync by the message pump below.
+    let pause_all_btn = flat_button("Pause all syncing");
     let setname_btn = flat_button("Set device name…");
     let nodeaddr_btn = flat_button("Show this device's address…");
     let quit_btn = flat_button("Quit");
+    gear_box.append(&pause_all_btn);
+    gear_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     gear_box.append(&setname_btn);
     gear_box.append(&nodeaddr_btn);
     gear_box.append(&quit_btn);
@@ -490,11 +527,60 @@ fn build_ui(
     status_bar.append(&up_lbl);
     status_bar.append(&updated_lbl);
 
+    // --- "Syncing Paused" status page (shown when every share is paused) ---
+    let paused_page = adw::StatusPage::builder()
+        .icon_name("media-playback-pause-symbolic")
+        .title("Syncing Paused")
+        .css_classes(["empty-state"])
+        .build();
+    let resume_btn = gtk::Button::builder()
+        .label("Resume")
+        .halign(gtk::Align::Center)
+        .css_classes(["pill", "suggested-action"])
+        .build();
+    paused_page.set_child(Some(&resume_btn));
+    {
+        let toggle = toggle_pause_all.clone();
+        resume_btn.connect_clicked(move |_| toggle());
+    }
+
+    // --- "Daemon Not Started" status page (shown when the daemon is unreachable) ---
+    // A plain error glyph, deliberately left in the default symbolic color (not
+    // the destructive/red accent) so it reads as "needs attention", not "crashed".
+    let daemon_page = adw::StatusPage::builder()
+        .icon_name("dialog-error-symbolic")
+        .title("Daemon Not Started")
+        .css_classes(["empty-state"])
+        .build();
+    let start_daemon_btn = gtk::Button::builder()
+        .label("Start Daemon")
+        .halign(gtk::Align::Center)
+        .css_classes(["pill", "suggested-action"])
+        .build();
+    daemon_page.set_child(Some(&start_daemon_btn));
+    {
+        let net = net.clone();
+        start_daemon_btn.connect_clicked(move |_| {
+            start_daemon();
+            // Give the service a moment to come up, then re-query.
+            let net = net.clone();
+            glib::timeout_add_local_once(Duration::from_millis(1500), move || net.refresh());
+        });
+    }
+
+    // --- view stack: the share list, or one of the two status pages ---
+    let view_stack = gtk::Stack::new();
+    view_stack.set_vexpand(true);
+    view_stack.add_named(&scroller, Some("list"));
+    view_stack.add_named(&paused_page, Some("paused"));
+    view_stack.add_named(&daemon_page, Some("daemon"));
+    view_stack.set_visible_child_name("list");
+
     // --- assemble ---
     let toast_overlay = adw::ToastOverlay::new();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
     content.append(&header);
-    content.append(&scroller);
+    content.append(&view_stack);
     content.append(&status_bar);
     toast_overlay.set_child(Some(&content));
     window.set_content(Some(&toast_overlay));
@@ -542,8 +628,26 @@ fn build_ui(
         });
     }
     {
+        let toggle = toggle_pause_all.clone();
+        let pop = gear_popover.clone();
+        pause_all_btn.connect_clicked(move |_| {
+            pop.popdown();
+            toggle();
+        });
+    }
+    {
         let app = app.clone();
         quit_btn.connect_clicked(move |_| app.quit());
+    }
+    // A tray "pause/resume" click is bridged onto the GTK loop here, where `net`
+    // is available to issue the request.
+    {
+        let toggle = toggle_pause_all.clone();
+        glib::spawn_future_local(async move {
+            while tray_pause_rx.recv().await.is_ok() {
+                toggle();
+            }
+        });
     }
 
     // --- UI message pump (runs on the GTK main context) ---
@@ -555,17 +659,58 @@ fn build_ui(
         let up_lbl = up_lbl.clone();
         let updated_lbl = updated_lbl.clone();
         let device_name = device_name.clone();
+        let view_stack = view_stack.clone();
+        let pause_all_btn = pause_all_btn.clone();
+        let paused_state = paused_state.clone();
+        let tray_speeds = tray_speeds.clone();
         let rows: Rc<RefCell<HashMap<String, RowWidgets>>> = Rc::new(RefCell::new(HashMap::new()));
         glib::spawn_future_local(async move {
+            // Which status page (if any) the main area should show. Recomputed on
+            // every Shares/DaemonDown so the stack tracks daemon + pause state.
+            // `daemon_up` is set by both arms before it's read; `all_paused`
+            // persists across ticks so a DaemonDown keeps the last-known value.
+            let mut daemon_up;
+            let mut all_paused = false;
+            // Last throughput pushed to the tray, so an idle stream of identical
+            // samples doesn't re-render the tray every second.
+            let mut last_tray_speeds = (u64::MAX, u64::MAX);
+            let select_view = |stack: &gtk::Stack, daemon_up: bool, all_paused: bool| {
+                stack.set_visible_child_name(if !daemon_up {
+                    "daemon"
+                } else if all_paused {
+                    "paused"
+                } else {
+                    "list"
+                });
+            };
             while let Ok(msg) = rx.recv().await {
                 match msg {
                     UiMsg::Shares(shares) => {
+                        daemon_up = true;
                         if let Some(ts) = shares.iter().map(|s| s.last_updated).max() {
                             if ts > 0 {
                                 updated_lbl.set_text(&format!("Last updated: {}", fmt_time(ts)));
                             }
                         }
                         update_list(&listbox, &shares, &net, &window, &rows);
+                        // "All paused" drives both the status page and the tray/gear
+                        // labels. Notify the tray only when it actually flips.
+                        all_paused = !shares.is_empty() && shares.iter().all(|s| s.paused);
+                        if paused_state.swap(all_paused, Ordering::Relaxed) != all_paused {
+                            let _ = tray_refresh_tx.send(()).await;
+                        }
+                        if let Some(lbl) = pause_all_btn.child().and_downcast::<gtk::Label>() {
+                            lbl.set_text(if all_paused {
+                                "Resume all syncing"
+                            } else {
+                                "Pause all syncing"
+                            });
+                        }
+                        select_view(&view_stack, daemon_up, all_paused);
+                    }
+                    UiMsg::DaemonDown => {
+                        daemon_up = false;
+                        select_view(&view_stack, daemon_up, all_paused);
                     }
                     UiMsg::Created => {
                         // Don't pop the keys dialog automatically — a large folder
@@ -589,6 +734,14 @@ fn build_ui(
                     UiMsg::Throughput { down, up } => {
                         down_lbl.set_text(&format!("↓ {}", fmt_speed(down)));
                         up_lbl.set_text(&format!("↑ {}", fmt_speed(up)));
+                        // Mirror into the tray tooltip and nudge it to re-render,
+                        // but only when the rate actually changed.
+                        if last_tray_speeds != (down, up) {
+                            tray_speeds.0.store(down, Ordering::Relaxed);
+                            tray_speeds.1.store(up, Ordering::Relaxed);
+                            last_tray_speeds = (down, up);
+                            let _ = tray_refresh_tx.send(()).await;
+                        }
                     }
                     UiMsg::LastUpdated(ts) => {
                         updated_lbl.set_text(&format!("Last updated: {}", fmt_time(ts)));
@@ -624,7 +777,16 @@ fn build_ui(
     });
 
     // --- system tray (best effort; ignored if no StatusNotifier host) ---
-    tray::install(app, &window);
+    tray::install(
+        app,
+        &window,
+        tray::TrayWiring {
+            pause_tx: tray_pause_tx,
+            paused: paused_state.clone(),
+            refresh_rx: tray_refresh_rx,
+            speeds: tray_speeds.clone(),
+        },
+    );
 
     // A second launch (single-instance) signals us here to reveal the window.
     {
@@ -675,6 +837,79 @@ fn ensure_autostart() {
 
 #[cfg(not(windows))]
 fn ensure_autostart() {}
+
+/// Attempt to start the background daemon (the "Start Daemon" button). On Windows
+/// the daemon is a LocalSystem service the unprivileged GUI can't start, so we
+/// relaunch `seed-daemon start` elevated via UAC. On Linux it's a systemd *user*
+/// service. Best effort: failures are logged and the GUI re-queries shortly after,
+/// falling back to the "Daemon Not Started" page if it's still down.
+fn start_daemon() {
+    #[cfg(windows)]
+    {
+        // <prefix>\bin\seed-gui.exe -> sibling seed-daemon.exe.
+        if let Some(daemon) = sibling_exe("seed-daemon.exe") {
+            shell_execute_runas(&daemon, "start");
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Err(e) = std::process::Command::new("systemctl")
+            .args(["--user", "start", "seed-daemon.service"])
+            .spawn()
+        {
+            tracing::warn!("start daemon failed: {e}");
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(daemon) = sibling_exe("seed-daemon") {
+            let _ = std::process::Command::new(daemon).arg("run").spawn();
+        }
+    }
+}
+
+/// Path to a binary sitting next to this executable (the bundled daemon lives in
+/// the same `bin/` dir as the GUI).
+#[cfg(any(windows, target_os = "macos"))]
+fn sibling_exe(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    Some(exe.parent()?.join(name))
+}
+
+/// Relaunch `exe args` elevated through the Windows shell ("runas" verb → UAC).
+/// Hidden window so the short-lived `seed-daemon start` console doesn't flash.
+#[cfg(windows)]
+fn shell_execute_runas(exe: &std::path::Path, args: &str) {
+    use std::os::raw::c_void;
+    #[link(name = "shell32")]
+    extern "system" {
+        fn ShellExecuteW(
+            hwnd: *mut c_void,
+            operation: *const u16,
+            file: *const u16,
+            parameters: *const u16,
+            directory: *const u16,
+            show_cmd: i32,
+        ) -> *mut c_void;
+    }
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    const SW_HIDE: i32 = 0;
+    let verb = wide("runas");
+    let file = wide(&exe.to_string_lossy());
+    let params = wide(args);
+    unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            std::ptr::null(),
+            SW_HIDE,
+        );
+    }
+}
 
 /// Per-row widgets we mutate in place on refresh. Keeping the rows alive (rather
 /// than tearing down and rebuilding the whole list every update) is what lets an
@@ -1423,7 +1658,7 @@ fn key_field(label: &str, value: &str) -> gtk::Box {
 }
 
 /// Format a byte/sec rate as a human bit-rate (Mbps/Kbps).
-fn fmt_speed(bytes_per_sec: u64) -> String {
+pub(crate) fn fmt_speed(bytes_per_sec: u64) -> String {
     let bits = bytes_per_sec as f64 * 8.0;
     if bits >= 1_000_000.0 {
         format!("{:.1} Mbps", bits / 1_000_000.0)
