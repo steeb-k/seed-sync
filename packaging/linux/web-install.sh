@@ -23,6 +23,49 @@ have() { command -v "$1" >/dev/null 2>&1; }
 have curl || die "curl is required"
 have tar  || die "tar is required"
 
+# Branding banner: the SEED wordmark with a vertical neon-green→neon-purple
+# gradient, the full name centered beneath. Truecolor only on a real terminal
+# (and unless NO_COLOR is set); otherwise printed plain so a piped/captured run
+# isn't littered with escape codes.
+print_banner() {
+  art=' @@@@@@        @@@@@@@@       @@@@@@@@       @@@@@@@
+@@@@@@@        @@@@@@@@       @@@@@@@@       @@@@@@@@
+!@@            @@!            @@!            @@!  @@@
+!@!            !@!            !@!            !@!  @!@
+!!@@!!         @!!!:!         @!!!:!         @!@  !@!
+ !!@!!!        !!!!!:         !!!!!:         !@!  !!!
+     !:!       !!:            !!:            !!:  !!!
+    !:!   :!:  :!:       :!:  :!:       :!:  :!:  !:!
+:::: ::   :::   :: ::::  :::   :: ::::  :::   :::: ::
+:: : :    :::  : :: ::   :::  : :: ::   :::  :: :  :   '
+  sub='Secure Environment Exchange Daemon'
+
+  # Center the subtitle under the widest art line.
+  width=$(printf '%s\n' "$art" | awk '{ n=length($0); if (n>m) m=n } END { print m+0 }')
+  pad=$(( (width - ${#sub}) / 2 ))
+  [ "$pad" -lt 0 ] && pad=0
+  indent=$(printf "%${pad}s" '')
+
+  if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+    total=$(printf '%s\n' "$art" | wc -l)
+    [ "$total" -lt 2 ] && total=2
+    # Gradient endpoints: neon green (57,255,20) → neon purple (188,19,254).
+    i=0
+    printf '%s\n' "$art" | while IFS= read -r line; do
+      r=$(( 57  + 131 * i / (total - 1) ))
+      g=$(( 255 - 236 * i / (total - 1) ))
+      b=$(( 20  + 234 * i / (total - 1) ))
+      printf '\033[1;38;2;%d;%d;%dm%s\033[0m\n' "$r" "$g" "$b" "$line"
+      i=$(( i + 1 ))
+    done
+    printf '\033[1;38;2;188;19;254m%s%s\033[0m\n\n' "$indent" "$sub"
+  else
+    printf '%s\n' "$art"
+    printf '%s%s\n\n' "$indent" "$sub"
+  fi
+}
+print_banner
+
 INSTALLED=""
 if have seed-daemon; then
   INSTALLED="$(seed-daemon --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
