@@ -152,9 +152,33 @@ report only, `-RegisterTask` / `-UnregisterTask` = used by the MSI. Logs to
 `%PROGRAMDATA%\SeedSync\update.log`.
 
 To cut a release: bump `[workspace.package].version` in `Cargo.toml`, commit, then
-`git tag vX.Y.Z && git push origin vX.Y.Z` (Linux `release.yml` builds + publishes
-the tarball and guards tag == Cargo version), and run the two scripts above on the
-Windows box.
+`git tag vX.Y.Z && git push origin vX.Y.Z`. The `release.yml` **`windows` job** now
+builds + signs + publishes the MSI autonomously alongside Linux + macOS (no manual
+`build-msi.ps1` / `publish-msi.ps1` run needed) once the one-time Azure setup below
+is in place — those two scripts remain for local builds and as a fallback.
+
+### 3.3 Autonomous CI signing (Azure Trusted Signing via OIDC)
+The `windows` job in `release.yml` builds GTK with **gvsbuild** (cached at `C:\gtk`),
+installs WiX 5, then signs via the **same `sign-artifacts.ps1` + committed
+`artifact-signing-metadata.json`** — the cert never touches CI. The runner
+authenticates to Azure as a **service principal over OIDC** (`azure/login@v2`); the
+`Azure.CodeSigning.Dlib` (installed from the `Microsoft.Trusted.Signing.Client` NuGet)
+signs remotely against the account/profile named in the metadata.
+
+**One-time maintainer setup** (without it, `azure/login` fails — but the Linux/macOS
+assets still publish, since the jobs are independent):
+1. Register an **Azure AD app** (service principal).
+2. Grant it the **"Trusted Signing Certificate Profile Signer"** role on the Trusted
+   Signing account (or scoped to the certificate profile).
+3. Add an **OIDC federated credential** on the app for this repo — subject e.g.
+   `repo:steeb-k/seed-sync-gtk:ref:refs/tags/v*`.
+4. Add repo secrets: **`AZURE_CLIENT_ID`**, **`AZURE_TENANT_ID`**, **`AZURE_SUBSCRIPTION_ID`**
+   (`SEED_BINARIES_TOKEN` already exists for publishing).
+
+Status: **wired but unvalidated on a runner** — the gvsbuild build and the dlib
+install want a first-tag shakeout. If the dlib/auth path misbehaves, the alternative
+is the purpose-built `azure/artifact-signing-action@v2` (would mean splitting
+`build-msi.ps1` so the action signs the exes before `wix build` and the MSI after).
 
 ## 4. Checkpoint #3 (end-to-end)
 

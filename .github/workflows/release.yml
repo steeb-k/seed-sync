@@ -103,3 +103,92 @@ jobs:
           files: dist/*.tar.gz
           # Attaches alongside the Linux/Windows assets on the same release.
           fail_on_unmatched_files: true
+
+  windows:
+    name: Windows MSI -> seed-sync-binaries
+    # Builds the signed MSI end to end and publishes it to the same release as
+    # Linux/macOS. GTK comes from gvsbuild (Option A: built once, then cached).
+    # Signing uses Azure Trusted Signing via OIDC — the cert never touches CI; the
+    # runner authenticates as a service principal and the dlib signs remotely.
+    #
+    # REQUIRED SETUP before this job can sign (one-time, by the maintainer):
+    #   1. artifact-signing-metadata.json at the repo root (committed) — DONE.
+    #   2. An Azure AD app (service principal) with the "Trusted Signing Certificate
+    #      Profile Signer" role on the Trusted Signing account, and an OIDC federated
+    #      credential for this repo (subject e.g. repo:steeb-k/seed-sync-gtk:ref:refs/tags/v*).
+    #   3. Repo secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID.
+    # Until those exist, azure/login fails and the job errors — but it's independent,
+    # so the Linux + macOS assets still publish. (UNVALIDATED on a runner — the
+    # gvsbuild + dlib-install steps want a first-tag shakeout on Windows.)
+    runs-on: windows-latest
+    permissions:
+      id-token: write     # azure/login OIDC
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Sanity-check the tag matches Cargo.toml
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          $tag = "$env:GITHUB_REF_NAME".TrimStart('v')
+          if ($ver -ne $tag) { Write-Error "tag $env:GITHUB_REF_NAME does not match Cargo.toml version $ver"; exit 1 }
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable-msvc
+      - uses: Swatinem/rust-cache@v2
+
+      # --- GTK via gvsbuild, cached (Option A). First run ~30-60 min; later runs
+      # restore C:\gtk from cache. Bump the key suffix to force a rebuild. ---
+      - name: Cache GTK (C:\gtk)
+        id: gtk
+        uses: actions/cache@v4
+        with:
+          path: C:\gtk
+          key: gtk-gvsbuild-gtk4-libadwaita-v1
+      - name: Build GTK with gvsbuild
+        if: steps.gtk.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          py -m pip install --user pipx
+          py -m pipx ensurepath
+          pipx install gvsbuild
+          gvsbuild build gtk4 libadwaita
+
+      - name: Install WiX 5
+        shell: pwsh
+        run: dotnet tool install --global wix --version "5.*"
+
+      # --- Azure auth for Trusted Signing (OIDC; no stored cert/secret) ---
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Install Trusted Signing client (Azure.CodeSigning.Dlib)
+        shell: pwsh
+        run: |
+          # sign-artifacts.ps1 signs via `signtool /dlib Azure.CodeSigning.Dlib.dll`.
+          # The dlib ships in the Microsoft.Trusted.Signing.Client NuGet; install it
+          # and point ARTIFACT_SIGNING_DLIB at the dll so the script finds it.
+          $dir = "$env:RUNNER_TEMP\tsclient"
+          nuget install Microsoft.Trusted.Signing.Client -OutputDirectory $dir -ExcludeVersion
+          $dll = Get-ChildItem $dir -Recurse -Filter Azure.CodeSigning.Dlib.dll | Select-Object -First 1
+          if (-not $dll) { Write-Error "Azure.CodeSigning.Dlib.dll not found in the NuGet"; exit 1 }
+          "ARTIFACT_SIGNING_DLIB=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # --- Build + bundle + sign exes + wix + sign MSI (reuses the local script;
+      # it reads artifact-signing-metadata.json and signs via the OIDC session). ---
+      - name: Build + sign the MSI
+        shell: pwsh
+        run: pwsh -File scripts\build-msi.ps1
+
+      - name: Publish MSI to seed-sync-binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: steeb-k/seed-sync-binaries
+          token: ${{ secrets.SEED_BINARIES_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: target/wix/*.msi
+          fail_on_unmatched_files: true
