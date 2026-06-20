@@ -12,7 +12,7 @@ up to date. It's the Linux counterpart to `docs/windows-packaging.md`.
 3. `.github/workflows/release.yml` builds the tarball and publishes it to the **public**
    `steeb-k/seed-sync-binaries` repo as a GitHub Release named after the tag.
 4. Installed machines pick it up automatically within a day (the `seed-sync-update.timer`),
-   or immediately with `seed-sync-update`.
+   or immediately with `seed-sync --update`.
 
 That's it. The rest of this document explains the moving parts.
 
@@ -34,7 +34,7 @@ the keyring, full network (iroh), the session bus (tray), and system GTK 4.10+/l
 ```
   main repo (private)                 seed-sync-binaries (PUBLIC)         user machine
   ───────────────────                 ──────────────────────────         ────────────
-  git tag vX.Y.Z  ──►  release.yml ──►  Release "vX.Y.Z"          ◄─────  seed-sync-update
+  git tag vX.Y.Z  ──►  release.yml ──►  Release "vX.Y.Z"          ◄─── seed-sync --update
    (Cargo version)     builds tarball   ├─ ...linux-x86_64.tar.gz  poll   (timer, daily)
                        publishes via    └─ ...windows...  (added    +     compares to
                        SEED_BINARIES_TOKEN   by the Windows side)  fetch  `seed-daemon --version`
@@ -60,12 +60,10 @@ All packaging inputs live in `packaging/linux/` and are assembled into the tarba
 | File | Purpose |
 |---|---|
 | `scripts/package-linux.sh` | Builds the release: `cargo build --release`, renders hicolor icon sizes from `icon/appIcon.png` (needs ImageMagick), stages the tree, and writes `dist/seed-sync-<ver>-linux-x86_64.tar.gz`. Run with `--skip-build` to repackage existing binaries. |
-| `.github/workflows/release.yml` | On a `v*` tag: runs the package script on **ubuntu-22.04** (older glibc → broader compatibility), checks the tag matches the Cargo version, and publishes the tarball to `seed-sync-binaries`. |
-| `packaging/linux/install.sh` | First-time **per-user** install. Places files (via `seed-sync-update --apply-from`), enables the daemon + update timer (`systemd --user`), adds the GUI tray autostart entry, runs a runtime-dependency check. Flags: `--no-auto-update`, `--no-gui-autostart`. |
-| `packaging/linux/seed-sync-update` | The **install-or-update engine**, installed to `~/.local/bin`. Default run: checks `seed-sync-binaries` for a newer release and applies it (stop daemon → swap binaries → refresh assets → restart). `--check` reports only; `--apply-from <dir>` applies an already-extracted tree (how `install.sh` reuses the placement logic). |
-| `packaging/linux/uninstall.sh` | Removes binaries, units, launcher, icons. Keeps user data by default; `--purge` also removes `~/.local/share/SeedSync`. |
+| `.github/workflows/release.yml` | On a `v*` tag: runs the package script on **ubuntu-24.04** (GUI needs GTK 4.10+), checks the tag matches the Cargo version, and publishes the tarball to `seed-sync-binaries`. |
+| `packaging/linux/seed-sync` | **The one wrapper** — installer, updater, and uninstaller in a single script, installed to `~/.local/bin/seed-sync`. `--install [--no-auto-update] [--no-gui-autostart]` places files (from the tarball it shipped in, or downloads if run standalone), enables the daemon + update timer, adds the tray autostart entry, runs a dep check. `--update [--check]` downloads the latest, version-compares vs `seed-daemon --version`, and applies (stop daemon → swap → restart). `--uninstall [--purge]` removes everything. `--status` shows installed/latest/service state. A shared internal `apply_tree` does the atomic file placement for both install and update. |
 | `packaging/linux/seed-daemon.service` | `systemd --user` unit that runs `seed-daemon run`, restarts on failure, and auto-starts at login (`WantedBy=default.target`). |
-| `packaging/linux/seed-sync-update.service` | `systemd --user` **oneshot** that runs `seed-sync-update` (invoked by the timer). |
+| `packaging/linux/seed-sync-update.service` | `systemd --user` **oneshot** that runs `seed-sync --update` (invoked by the timer). |
 | `packaging/linux/seed-sync-update.timer` | `systemd --user` timer: shortly after login + daily, with a randomized delay and `Persistent=true` (catches up if the machine was off). |
 | `packaging/linux/io.github.steeb_k.SeedSync.desktop` | App-menu launcher. `Exec=__BIN__/seed-gui` — the `__BIN__` placeholder is rewritten to the real `~/.local/bin` at install time. The filename + `Icon=` match the GTK app id so the window/tray/icon associate. |
 | `packaging/linux/io.github.steeb_k.SeedSync.metainfo.xml` | AppStream metadata (name/summary/categories) for software centers. |
@@ -75,8 +73,8 @@ All packaging inputs live in `packaging/linux/` and are assembled into the tarba
 ```
 seed-sync-<ver>-linux-x86_64/
 ├── bin/{seed-daemon,seed-gui,seed-cli}
-├── seed-sync-update            # also copied into ~/.local/bin on install
-├── install.sh  uninstall.sh  INSTALL.txt
+├── seed-sync                   # the wrapper; also copied into ~/.local/bin on install
+├── INSTALL.txt
 ├── lib/systemd/user/{seed-daemon.service,seed-sync-update.service,seed-sync-update.timer}
 └── share/
     ├── applications/io.github.steeb_k.SeedSync.desktop
@@ -86,7 +84,7 @@ seed-sync-<ver>-linux-x86_64/
 
 ### Where things land on the user's machine (per-user, no root)
 ```
-~/.local/bin/                     seed-daemon, seed-gui, seed-cli, seed-sync-update
+~/.local/bin/                     seed-daemon, seed-gui, seed-cli, seed-sync
 ~/.config/systemd/user/           seed-daemon.service, seed-sync-update.{service,timer}
 ~/.config/autostart/              io.github.steeb_k.SeedSync.desktop (tray, --hidden)
 ~/.local/share/applications/      io.github.steeb_k.SeedSync.desktop (launcher)
@@ -100,18 +98,18 @@ The data dir + socket are chosen by the `directories` crate; on Linux `ProjectDi
 on it by default, so no socket args are needed. `SEED_SOCKET` overrides it if ever necessary.
 
 ## How an upgrade actually happens
-1. `seed-sync-update.timer` fires → runs `seed-sync-update`.
+1. `seed-sync-update.timer` fires → runs `seed-sync --update`.
 2. It GETs `https://api.github.com/repos/steeb-k/seed-sync-binaries/releases/latest`
    (public), reads the tag, and compares to `seed-daemon --version`.
-3. If newer: download the tarball to a temp dir, extract, then `apply_from`:
+3. If newer: download the tarball to a temp dir, extract, then `apply_tree`:
    `systemctl --user stop seed-daemon` → atomically replace each binary (temp + `mv`, safe
    even while the GUI/daemon hold the old inode) → refresh `.desktop`/icons/units **only if
    changed** → `daemon-reload` if a unit changed → `systemctl --user start seed-daemon`.
 4. A running GUI reconnects on its own (2 s retry loop); its binary updates on next launch.
 5. Any failure aborts before the swap, leaving the current install intact.
 
-Self-replacement of `seed-sync-update` is safe: the running shell keeps its open fd to the
-old inode while the new file is `mv`'d into place for the next run.
+Self-replacement of `seed-sync` is safe: `apply_tree` writes the new file to a temp name and
+`mv`'s it into place, so the running shell keeps its open fd to the old inode for that run.
 
 ## Caveats / gotchas for maintainers
 - **ABI portability.** The tarball is dynamically linked against the build host's glibc + GTK.

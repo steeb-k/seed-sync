@@ -42,17 +42,19 @@ install (no root); requires GTK 4.10+, libadwaita 1.4+, and libdbus-1 on the sys
 **Install** (also upgrades in place) — fetches the latest release:
 
 ```bash
-cd "$(mktemp -d)" && curl -fsSL "$(curl -fsSL https://api.github.com/repos/steeb-k/seed-sync-binaries/releases/latest | grep -oE 'https://[^"]+linux-x86_64\.tar\.gz' | head -1)" | tar xz && seed-sync-*/install.sh
+cd "$(mktemp -d)" && curl -fsSL "$(curl -fsSL https://api.github.com/repos/steeb-k/seed-sync-binaries/releases/latest | grep -oE 'https://[^"]+linux-x86_64\.tar\.gz' | head -1)" | tar xz && seed-sync-*/seed-sync --install
 ```
 
 It drops the binaries in `~/.local/bin`, runs the daemon as a `systemd --user`
 service (auto-starts at login), and enables a daily auto-update timer. Launch
-**S.E.E.D.** from your app menu.
+**S.E.E.D.** from your app menu. After install, the `seed-sync` command manages
+everything:
 
-**Update:** `seed-sync-update` (the timer does this automatically). **Uninstall:**
-re-fetch the tarball and run `seed-sync-*/uninstall.sh` (add `--purge` to also
-remove synced data). Full command list: see the
-[`seed-sync-binaries`](https://github.com/steeb-k/seed-sync-binaries#install--update--uninstall-linux) README.
+```bash
+seed-sync --update              # check + apply a newer release (the timer does this daily)
+seed-sync --status              # installed/latest version + service state
+seed-sync --uninstall [--purge] # remove (--purge also deletes synced data)
+```
 
 Maintainers: see **`docs/linux-packaging.md`** for how releases, the tarball, and
 auto-update work, and **`docs/windows-packaging.md`** for the MSI side.

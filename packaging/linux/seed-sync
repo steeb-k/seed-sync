@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# S.E.E.D. (Seed Sync) — install / update / uninstall wrapper (per-user, no root).
+#
+#   seed-sync --install [--no-auto-update] [--no-gui-autostart]
+#   seed-sync --update  [--check]
+#   seed-sync --uninstall [--purge]
+#   seed-sync --status
+#   seed-sync --help
+#
+# Run --install from an unpacked release tarball to bootstrap; afterwards the
+# command is on your PATH and --update / --uninstall / --status work anywhere.
+# The systemd --user timer runs `seed-sync --update` daily.
+set -euo pipefail
+
+REPO="${SEED_BINARIES_REPO:-steeb-k/seed-sync-binaries}"
+ASSET_RE='https://[^"]+linux-x86_64\.tar\.gz'
+
+BIN_DIR="$HOME/.local/bin"
+APP_ID="io.github.steeb_k.SeedSync"
+UNIT_DIR="$HOME/.config/systemd/user"
+APPS_DIR="$HOME/.local/share/applications"
+AUTOSTART_DIR="$HOME/.config/autostart"
+ICONS_DIR="$HOME/.local/share/icons/hicolor"
+METAINFO_DIR="$HOME/.local/share/metainfo"
+DATA_DIR="$HOME/.local/share/seedsync"
+
+WORKDIR=""
+trap 'rm -rf "${WORKDIR:-}"' EXIT
+
+log()  { printf '%s\n' "seed-sync: $*"; }
+die()  { printf '%s\n' "seed-sync: error: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+uctl() { systemctl --user "$@" 2>/dev/null; }
+
+version_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$2" ]; }
+installed_version() { have seed-daemon && seed-daemon --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1; }
+
+# Latest release tag's version (no download). Empty if unreachable.
+latest_version() {
+  have curl || die "curl is required"
+  curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+    | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/'
+}
+
+# Download + extract the latest release; echo the extracted tree root.
+fetch_latest_tree() {
+  have curl || die "curl is required"
+  local json url root
+  json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest")" || die "cannot reach $REPO releases API"
+  url="$(printf '%s' "$json" | grep -oE "\"browser_download_url\": *\"$ASSET_RE\"" | sed -E 's/.*"(https[^"]+)".*/\1/' | head -n1)"
+  [ -n "$url" ] || die "latest release has no linux-x86_64.tar.gz asset"
+  WORKDIR="$(mktemp -d)"
+  curl -fsSL -o "$WORKDIR/pkg.tgz" "$url" || die "download failed"
+  tar -xzf "$WORKDIR/pkg.tgz" -C "$WORKDIR" || die "extract failed"
+  root="$(find "$WORKDIR" -maxdepth 2 -type d -name bin -exec dirname {} \; | head -n1)"
+  [ -n "$root" ] || die "archive missing a bin/ directory"
+  printf '%s\n' "$root"
+}
+
+# Place files from a release tree ($1) into the user's home. Atomic per file, so
+# replacing the running daemon (or this very script) is safe. Refreshes desktop/
+# icon/unit assets only when they differ. Shared by --install and --update.
+apply_tree() {
+  local src="$1"
+  [ -x "$src/bin/seed-daemon" ] || die "release tree '$src' is incomplete"
+
+  local was=0
+  if uctl is-active --quiet seed-daemon; then was=1; log "stopping seed-daemon"; uctl stop seed-daemon; fi
+
+  mkdir -p "$BIN_DIR"
+  local f name
+  for f in "$src"/bin/*; do
+    name="$(basename "$f")"
+    install -m 0755 "$f" "$BIN_DIR/$name.t$$"; mv -f "$BIN_DIR/$name.t$$" "$BIN_DIR/$name"
+  done
+  # The wrapper itself ships at the tree root; install it too.
+  if [ -f "$src/seed-sync" ]; then
+    install -m 0755 "$src/seed-sync" "$BIN_DIR/seed-sync.t$$"; mv -f "$BIN_DIR/seed-sync.t$$" "$BIN_DIR/seed-sync"
+  fi
+
+  if [ -f "$src/share/applications/$APP_ID.desktop" ]; then
+    mkdir -p "$APPS_DIR"
+    sed "s|__BIN__|$BIN_DIR|g" "$src/share/applications/$APP_ID.desktop" > "$APPS_DIR/$APP_ID.desktop.t$$"
+    mv -f "$APPS_DIR/$APP_ID.desktop.t$$" "$APPS_DIR/$APP_ID.desktop"
+  fi
+  [ -d "$src/share/icons/hicolor" ] && { mkdir -p "$ICONS_DIR"; cp -r "$src"/share/icons/hicolor/* "$ICONS_DIR/"; }
+  [ -f "$src/share/metainfo/$APP_ID.metainfo.xml" ] && { mkdir -p "$METAINFO_DIR"; cp -f "$src/share/metainfo/$APP_ID.metainfo.xml" "$METAINFO_DIR/"; }
+
+  local changed=0 u b
+  if [ -d "$src/lib/systemd/user" ]; then
+    mkdir -p "$UNIT_DIR"
+    for u in "$src"/lib/systemd/user/*; do
+      b="$(basename "$u")"
+      cmp -s "$u" "$UNIT_DIR/$b" || { cp -f "$u" "$UNIT_DIR/$b"; changed=1; }
+    done
+  fi
+  [ "$changed" = 1 ] && uctl daemon-reload || true
+
+  have gtk-update-icon-cache && gtk-update-icon-cache -qtf "$ICONS_DIR" 2>/dev/null || true
+  have update-desktop-database && update-desktop-database -q "$APPS_DIR" 2>/dev/null || true
+
+  [ "$was" = 1 ] && { log "starting seed-daemon"; uctl start seed-daemon; } || true
+}
+
+cmd_install() {
+  local auto=1 gui=1 a
+  for a in "$@"; do case "$a" in
+    --no-auto-update) auto=0 ;;
+    --no-gui-autostart) gui=0 ;;
+    *) die "unknown flag for --install: $a" ;;
+  esac; done
+
+  # Prefer the tarball tree we were run from; otherwise download the latest.
+  local here tree
+  here="$(cd "$(dirname "$0")" && pwd)"
+  if [ -x "$here/bin/seed-daemon" ]; then tree="$here"; else log "no local release tree; fetching latest"; tree="$(fetch_latest_tree)"; fi
+
+  if have ldd; then
+    local miss; miss="$(ldd "$tree/bin/seed-gui" 2>/dev/null | awk '/not found/{print $1}' | sort -u || true)"
+    [ -n "$miss" ] && { echo "seed-sync: WARNING — missing shared libraries:" >&2; printf '  %s\n' $miss >&2; echo "  Install GTK 4.10+, libadwaita 1.4+, and libdbus-1, then re-run." >&2; }
+  fi
+
+  log "installing"
+  apply_tree "$tree"
+
+  if uctl daemon-reload; then
+    uctl enable --now seed-daemon.service && log "daemon enabled (auto-starts at login)" \
+      || log "WARNING: could not enable the daemon; start it manually with: seed-daemon run"
+    [ "$auto" = 1 ] && { uctl enable --now seed-sync-update.timer && log "daily auto-update enabled" || true; }
+  else
+    log "WARNING: systemd --user unavailable; the daemon was not started automatically."
+  fi
+
+  if [ "$gui" = 1 ] && [ -f "$APPS_DIR/$APP_ID.desktop" ]; then
+    mkdir -p "$AUTOSTART_DIR"
+    sed "s|^Exec=.*|Exec=$BIN_DIR/seed-gui --hidden|" "$APPS_DIR/$APP_ID.desktop" > "$AUTOSTART_DIR/$APP_ID.desktop"
+    echo "X-GNOME-Autostart-enabled=true" >> "$AUTOSTART_DIR/$APP_ID.desktop"
+    log "tray GUI will start at login"
+  fi
+
+  case ":$PATH:" in *":$BIN_DIR:"*) ;; *) log "NOTE: $BIN_DIR is not on your PATH — add it to run seed-sync/seed-cli directly." ;; esac
+  log "done. Launch \"S.E.E.D.\" from your app menu, or run: seed-gui"
+}
+
+cmd_update() {
+  local check=0 a
+  for a in "$@"; do case "$a" in --check) check=1 ;; *) die "unknown flag for --update: $a" ;; esac; done
+
+  local inst latest
+  inst="$(installed_version || true)"
+  [ -n "$inst" ] || die "not installed; run: seed-sync --install"
+  latest="$(latest_version)"
+  [ -n "$latest" ] || die "could not determine the latest release"
+  log "installed $inst, latest $latest"
+  if ! version_gt "$inst" "$latest"; then log "up to date"; return 0; fi
+  log "update available: $inst -> $latest"
+  [ "$check" = 1 ] && return 0
+  local tree; tree="$(fetch_latest_tree)"
+  apply_tree "$tree"
+  log "updated to $latest"
+}
+
+cmd_uninstall() {
+  local purge=0 a
+  for a in "$@"; do case "$a" in --purge) purge=1 ;; *) die "unknown flag for --uninstall: $a" ;; esac; done
+
+  uctl disable --now seed-sync-update.timer
+  uctl disable --now seed-daemon.service
+  uctl stop seed-sync-update.service
+  rm -f "$UNIT_DIR/seed-daemon.service" "$UNIT_DIR/seed-sync-update.service" "$UNIT_DIR/seed-sync-update.timer"
+  uctl daemon-reload
+  rm -f "$BIN_DIR/seed-daemon" "$BIN_DIR/seed-gui" "$BIN_DIR/seed-cli" "$BIN_DIR/seed-sync"
+  rm -f "$APPS_DIR/$APP_ID.desktop" "$AUTOSTART_DIR/$APP_ID.desktop" "$METAINFO_DIR/$APP_ID.metainfo.xml"
+  find "$ICONS_DIR" -type f -name "$APP_ID.png" -delete 2>/dev/null || true
+  have gtk-update-icon-cache && gtk-update-icon-cache -qtf "$ICONS_DIR" 2>/dev/null || true
+  have update-desktop-database && update-desktop-database -q "$APPS_DIR" 2>/dev/null || true
+  log "removed binaries, units, launcher, icons."
+  if [ "$purge" = 1 ]; then
+    rm -rf "$DATA_DIR"; log "purged $DATA_DIR (any master seed in the OS keyring is left intact)."
+  else
+    log "kept your data at $DATA_DIR (use --purge to remove)."
+  fi
+}
+
+cmd_status() {
+  printf '%-10s %s\n' "installed:" "$(installed_version || echo none)"
+  printf '%-10s %s\n' "latest:"    "$(latest_version 2>/dev/null || echo '?')"
+  printf '%-10s %s / %s\n' "daemon:" "$(uctl is-active seed-daemon.service || echo inactive)" "$(uctl is-enabled seed-daemon.service || echo disabled)"
+  printf '%-10s %s\n' "timer:"     "$(uctl is-enabled seed-sync-update.timer || echo disabled)"
+}
+
+usage() {
+  cat <<'EOF'
+S.E.E.D. (Seed Sync) installer/updater
+
+  seed-sync --install [--no-auto-update] [--no-gui-autostart]
+  seed-sync --update  [--check]
+  seed-sync --uninstall [--purge]
+  seed-sync --status
+EOF
+}
+
+case "${1:-}" in
+  --install)   shift; cmd_install "$@" ;;
+  --update)    shift; cmd_update "$@" ;;
+  --uninstall) shift; cmd_uninstall "$@" ;;
+  --status)    shift; cmd_status ;;
+  --check)     cmd_update --check ;;
+  -h|--help|"") usage ;;
+  *)           die "unknown command: $1 (try --help)" ;;
+esac

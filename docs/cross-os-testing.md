@@ -330,16 +330,16 @@ for the Windows instance** to build its half. Full Linux design lives in `docs/l
   `contents: write` on `seed-sync-binaries` (the default `GITHUB_TOKEN` can't write another repo).
 
 **Linux side (DONE — for reference / parity):** `packaging/linux/` + `scripts/package-linux.sh` +
-`.github/workflows/release.yml`. Per-user install (`install.sh`), daemon as `systemd --user`,
-`seed-sync-update` engine driven by a `systemd --user` **timer** (daily) that does stop-daemon →
-swap binaries → restart.
+`.github/workflows/release.yml`. A single per-user wrapper `seed-sync` with `--install` / `--update`
+/ `--uninstall` / `--status`; daemon as `systemd --user`; a `systemd --user` **timer** (daily) runs
+`seed-sync --update`, which does stop-daemon → swap binaries → restart.
 
 **[WIN] TODO — mirror this on Windows:**
 1. **Publish step:** have the Windows build attach its MSI/zip to the `seed-sync-binaries` release for
    the tag (same release the Linux job creates — `softprops/action-gh-release` upserts, so order doesn't
    matter). Reuse the `SEED_BINARIES_TOKEN` secret. (Windows GUI+MSI build automation in CI is still
    pending per earlier notes; until then the artifact can be attached manually to the release.)
-2. **Windows updater** mirroring `seed-sync-update`: query the latest release (public, no auth), compare
+2. **Windows updater** mirroring `seed-sync --update`: query the latest release (public, no auth), compare
    `seed-daemon.exe --version`, download the Windows artifact, **stop the `SeedSyncDaemon` service**, swap
    binaries (or run the MSI silently with `msiexec /i … /qn`), restart the service. Mind the in-use GTK
    runtime DLLs (the service must be stopped before replacing them).

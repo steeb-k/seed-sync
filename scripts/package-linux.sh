@@ -43,11 +43,9 @@ for b in seed-daemon seed-gui seed-cli; do
   install -m 0755 "target/release/$b" "$STAGE/bin/$b"
 done
 
-# Installer/updater scripts + docs (tarball root)
-install -m 0755 "$PKG_SRC/seed-sync-update" "$STAGE/seed-sync-update"
-install -m 0755 "$PKG_SRC/install.sh"       "$STAGE/install.sh"
-install -m 0755 "$PKG_SRC/uninstall.sh"     "$STAGE/uninstall.sh"
-install -m 0644 "$PKG_SRC/INSTALL.txt"      "$STAGE/INSTALL.txt"
+# Installer/updater wrapper + docs (tarball root)
+install -m 0755 "$PKG_SRC/seed-sync"   "$STAGE/seed-sync"
+install -m 0644 "$PKG_SRC/INSTALL.txt" "$STAGE/INSTALL.txt"
 
 # Desktop entry + AppStream metadata
 install -m 0644 "$PKG_SRC/$APP_ID.desktop"       "$STAGE/share/applications/$APP_ID.desktop"

@@ -6,4 +6,4 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/.local/bin/seed-sync-update
+ExecStart=%h/.local/bin/seed-sync --update

@@ -1,37 +1,36 @@
 S.E.E.D. (Seed Sync) — Linux install
 ====================================
 
-Per-user install, no root required.
+Per-user install, no root required. One command does it all:
 
-    ./install.sh
+    ./seed-sync --install
 
-This installs to your home directory:
-  ~/.local/bin/                 seed-daemon, seed-gui, seed-cli, seed-sync-update
+This installs to your home directory and starts the sync daemon as a
+systemd --user service (auto-starts at every login), enables a daily
+auto-update timer, and adds the "S.E.E.D." app-menu launcher.
+
+  ~/.local/bin/                 seed-daemon, seed-gui, seed-cli, seed-sync
   ~/.config/systemd/user/       seed-daemon.service, seed-sync-update.{service,timer}
   ~/.local/share/applications/  S.E.E.D. launcher
-  ~/.local/share/icons/         app icon (hicolor)
+  ~/.local/share/icons/         app icon
 
-The sync daemon is started immediately and auto-starts at every login
-(systemd --user). A daily timer checks for updates and applies them
-automatically. Launch "S.E.E.D." from your app menu for the GUI.
+After installing, `seed-sync` is on your PATH:
 
-Options:
-  ./install.sh --no-auto-update    don't enable the daily update timer
-  ./install.sh --no-gui-autostart  don't auto-launch the tray GUI at login
+    seed-sync --update            check + apply a newer release (the timer does this)
+    seed-sync --update --check    report only, don't change anything
+    seed-sync --status            show installed/latest version + service state
+    seed-sync --uninstall         remove the app (keeps your share settings)
+    seed-sync --uninstall --purge also remove ~/.local/share/seedsync data
 
-Updating manually (the timer does this for you):
-  seed-sync-update            check + apply a newer release if available
-  seed-sync-update --check    report only, don't change anything
-
-Uninstall:
-  ./uninstall.sh              remove the app (keeps your synced-share settings)
-  ./uninstall.sh --purge      also remove ~/.local/share/seedsync data
+Install options:
+    ./seed-sync --install --no-auto-update    don't enable the daily update timer
+    ./seed-sync --install --no-gui-autostart  don't auto-launch the tray GUI at login
 
 Requirements (must already be present on the system):
-  GTK 4.10+, libadwaita 1.4+, libdbus-1
-  Debian/Ubuntu: libgtk-4-1 libadwaita-1-0 libdbus-1-3
-  Fedora:        gtk4 libadwaita dbus-libs
-  Arch:          gtk4 libadwaita dbus
-install.sh runs a quick check and tells you if anything is missing.
+    GTK 4.10+, libadwaita 1.4+, libdbus-1
+    Debian/Ubuntu: libgtk-4-1 libadwaita-1-0 libdbus-1-3
+    Fedora:        gtk4 libadwaita dbus-libs
+    Arch:          gtk4 libadwaita dbus
+--install runs a quick check and tells you if anything is missing.
 
 Note: ensure ~/.local/bin is on your PATH (most desktops add it automatically).
