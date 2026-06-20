@@ -171,10 +171,15 @@ macOS 14 (Sonoma) is the practical arm64 floor for hosted CI; a lower floor need
 Mac. (On Apple Silicon dyld always loads the arm64 slice, so the arm64 `minos` is what gates those
 machines — the x86_64 slice's lower floor only helps Intel Macs.)
 
-> **Broader Intel coverage (optional, more CI):** build the x86_64 slice on a `macos-13` (Ventura,
-> Intel) runner and the arm64 slice on `macos-14`, upload both as artifacts, then `lipo` + sign + publish
-> in a third job. That drops the Intel floor to macOS 13 while Apple Silicon stays at 14. Not wired up;
-> the single-runner `macos-14` build (x86_64 via Rosetta) is the default.
+**Can we go below macOS 14?** Not cheaply. GitHub's *oldest* Apple-Silicon runner is `macos-14`, and
+Homebrew's arm64 GTK bottles target recent macOS — so 14 is the practical arm64 floor for hosted CI.
+Lower needs either a **self-hosted older Apple-Silicon Mac** (where `brew` builds GTK from source against
+that OS) or **building the whole GTK stack from source with `MACOSX_DEPLOYMENT_TARGET` pinned** (a macOS
+"gvsbuild" — a real project). The Intel angle is also closing: Apple discontinued x86_64, the `macos-13`
+runner image is being retired, and GitHub drops Intel runners after `macos-15` (Fall 2027) — so there's
+no longer a cheap sub-14 Intel runner either. In practice macOS 14 (Sonoma) is the oldest macOS still in
+Apple's support window, and every Apple-Silicon Mac runs 14+, so a 14 floor already covers the entire
+currently-supported install base.
 
 **Caveat for the current release:** the `v1.1.0` macOS asset was published *manually* from a macOS-26
 dev box, so its arm64 slice needs macOS 26. Re-cut via the `macos-14` CI job to drop it to macOS 14.
