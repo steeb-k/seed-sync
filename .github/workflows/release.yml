@@ -53,3 +53,38 @@ jobs:
           files: dist/*.tar.gz
           # Don't clobber a Windows asset already attached to this release.
           fail_on_unmatched_files: true
+
+  macos:
+    name: macOS tarball -> seed-sync-binaries
+    # macos-14 is the Apple Silicon (arm64) runner. Phase 1 ships an arm64-only
+    # asset (seed-sync-<ver>-macos-arm64.tar.gz); the universal2 lipo step (which
+    # needs an x86_64 Homebrew prefix under Rosetta) is future work — see
+    # docs/macos-packaging.md. Xcode CLT (install_name_tool/codesign/otool) is
+    # preinstalled on the runner; the bundler ad-hoc signs the relocated dylibs.
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK4 + libadwaita
+        run: brew install gtk4 libadwaita pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Sanity-check the tag matches Cargo.toml
+        run: |
+          CARGO_VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          if [ "$CARGO_VER" != "$TAG_VER" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VER"
+            exit 1
+          fi
+      - name: Build the release tarball (bundle + relocate + ad-hoc sign)
+        run: scripts/package-macos.sh
+      - name: Publish to seed-sync-binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: steeb-k/seed-sync-binaries
+          token: ${{ secrets.SEED_BINARIES_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: dist/*.tar.gz
+          # Attaches alongside the Linux/Windows assets on the same release.
+          fail_on_unmatched_files: true

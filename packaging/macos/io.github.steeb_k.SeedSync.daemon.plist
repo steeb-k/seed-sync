@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- S.E.E.D. sync daemon LaunchAgent (per-user). __APP__ (the installed
+     SEED Sync.app) and __LOG__ (~/Library/Logs/SeedSync) are rewritten by
+     `seed-sync --install`. Analog of the Linux seed-daemon.service:
+     RunAtLoad + KeepAlive == auto-start at login and restart on exit. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.steeb_k.SeedSync.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__APP__/Contents/MacOS/seed-daemon</string>
+    <string>run</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__LOG__/seed-daemon.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG__/seed-daemon.log</string>
+</dict>
+</plist>

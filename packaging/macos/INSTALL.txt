@@ -1,0 +1,46 @@
+S.E.E.D. (Seed Sync) — macOS install
+====================================
+
+Per-user install, no root required. One command does it all:
+
+    ./seed-sync --install
+
+This is a self-contained build: "SEED Sync.app" bundles GTK4 + libadwaita and
+their dependencies, so nothing from Homebrew is required. The app is ad-hoc
+signed; installing via the curl|sh bootstrap (or unpacking with tar) avoids the
+Gatekeeper quarantine, so it runs without an "unidentified developer" prompt and
+without notarization.
+
+What --install does:
+  - copies "SEED Sync.app" to ~/Applications (shows in Launchpad / Spotlight /
+    Finder, with a proper Dock + Applications icon)
+  - symlinks seed-daemon, seed-gui, seed-cli into ~/.local/bin (PATH), and
+    installs the seed-sync command there too
+  - loads three launchd LaunchAgents (per-user, ~/Library/LaunchAgents):
+        .daemon  — runs the sync daemon, restarts on exit, starts at login
+        .update  — checks for a newer release at login and daily
+        .gui     — starts the tray GUI (hidden) at login
+  - your data lives in ~/Library/Application Support/io.github.steeb_k.SeedSync
+    (the master seed is stored in the macOS Keychain); logs in ~/Library/Logs/SeedSync
+
+After installing, `seed-sync` is on your PATH:
+
+    seed-sync --update            check + apply a newer release (the agent does this)
+    seed-sync --update --check    report only, don't change anything
+    seed-sync --status            show installed/latest version + agent state
+    seed-sync --uninstall         remove the app (keeps your share settings)
+    seed-sync --uninstall --purge also remove ~/Library/Application Support data
+
+Install options:
+    ./seed-sync --install --no-auto-update    don't enable the daily update agent
+    ./seed-sync --install --no-gui-autostart  don't auto-launch the tray GUI at login
+
+Requirements: macOS 12+ on Apple Silicon (arm64). No Homebrew or other runtime
+needed — everything is bundled. Ensure ~/.local/bin is on your PATH (add
+`export PATH="$HOME/.local/bin:$PATH"` to your shell profile if it isn't).
+
+Note: launchd LaunchAgents need an active GUI (Aqua) login session. On a
+headless / SSH-only Mac the files are still placed, but the agents won't load
+until you log in at the desktop. If you downloaded this tarball in a browser
+(instead of curl|sh) and macOS quarantines it, clear it with:
+    xattr -dr com.apple.quarantine "<unpacked-folder>"

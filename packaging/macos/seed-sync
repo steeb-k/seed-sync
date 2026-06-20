@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# S.E.E.D. (Seed Sync) — install / update / uninstall wrapper (per-user, no root).
+# macOS analog of packaging/linux/seed-sync (launchd instead of systemd).
+#
+#   seed-sync --install [--no-auto-update] [--no-gui-autostart]
+#   seed-sync --update  [--check]
+#   seed-sync --uninstall [--purge]
+#   seed-sync --status
+#   seed-sync --help
+#
+# Run --install from an unpacked release tarball to bootstrap; afterwards the
+# command is on your PATH and --update / --uninstall / --status work anywhere.
+# A launchd agent runs `seed-sync --update` daily.
+#
+# Install shape: "SEED Sync.app" (self-contained — bundled GTK) goes to
+# ~/Applications (no root, shows in Launchpad/Spotlight/Finder, real Dock icon).
+# The CLI binaries are symlinked from ~/.local/bin into the app's Contents/MacOS
+# (so @executable_path/../lib resolves to the bundled GTK); seed-sync itself is a
+# real copy in ~/.local/bin so a self-update that swaps the app can't yank it.
+set -euo pipefail
+
+REPO="${SEED_BINARIES_REPO:-steeb-k/seed-sync-binaries}"
+case "$(uname -m)" in arm64) HOST=arm64 ;; *) HOST=x86_64 ;; esac
+# Accept the host-arch slice or a universal2 build.
+ASSET_RE="https://[^\"]+macos-(universal|$HOST)\\.tar\\.gz"
+
+APP_ID="io.github.steeb_k.SeedSync"
+APP_NAME="SEED Sync.app"
+APP_DST="$HOME/Applications/$APP_NAME"
+MACOS="$APP_DST/Contents/MacOS"
+BIN_DIR="$HOME/.local/bin"             # PATH: real seed-sync + symlinks into the app
+AGENTS="$HOME/Library/LaunchAgents"
+LOG_DIR="$HOME/Library/Logs/SeedSync"
+DATA_DIR="$HOME/Library/Application Support/$APP_ID"
+UID_NUM="$(id -u)"
+DOMAIN="gui/$UID_NUM"
+
+# Find our binaries even under launchd's minimal PATH.
+export PATH="$BIN_DIR:$MACOS:$PATH"
+
+WORKDIR=""
+trap 'rm -rf "${WORKDIR:-}"' EXIT
+
+log()  { printf '%s\n' "seed-sync: $*"; }
+die()  { printf '%s\n' "seed-sync: error: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+version_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$2" ]; }
+installed_version() { have seed-daemon && seed-daemon --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1; }
+
+# --- launchd helpers (modern bootstrap/bootout API, 10.11+) -------------------
+agent_loaded() { launchctl print "$DOMAIN/$APP_ID.$1" >/dev/null 2>&1; }
+agent_unload() { launchctl bootout "$DOMAIN/$APP_ID.$1" >/dev/null 2>&1 || true; }
+agent_load() {
+  local name="$1" plist="$AGENTS/$APP_ID.$1.plist"
+  [ -f "$plist" ] || { log "WARNING: missing agent $plist"; return 1; }
+  launchctl bootout "$DOMAIN/$APP_ID.$name" >/dev/null 2>&1 || true
+  launchctl enable "$DOMAIN/$APP_ID.$name" >/dev/null 2>&1 || true
+  if ! launchctl bootstrap "$DOMAIN" "$plist" >/dev/null 2>&1; then
+    log "WARNING: could not load $name agent (no GUI/Aqua session?)"
+    return 1
+  fi
+}
+
+# Latest release tag's version (no download). Empty if unreachable.
+latest_version() {
+  have curl || die "curl is required"
+  curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+    | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/'
+}
+
+# Download + extract the latest release; echo the extracted tree root (the dir
+# that holds "SEED Sync.app").
+fetch_latest_tree() {
+  have curl || die "curl is required"
+  local json url root
+  json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest")" || die "cannot reach $REPO releases API"
+  url="$(printf '%s' "$json" | grep -oE "\"browser_download_url\": *\"$ASSET_RE\"" | sed -E 's/.*"(https[^"]+)".*/\1/' | head -n1)"
+  [ -n "$url" ] || die "latest release has no macos-$HOST (or -universal) tarball"
+  WORKDIR="$(mktemp -d)"
+  curl -fsSL -o "$WORKDIR/pkg.tgz" "$url" || die "download failed"
+  tar -xzf "$WORKDIR/pkg.tgz" -C "$WORKDIR" || die "extract failed"
+  root="$(find "$WORKDIR" -maxdepth 2 -type d -name "$APP_NAME" -exec dirname {} \; | head -n1)"
+  [ -n "$root" ] || die "archive missing $APP_NAME"
+  printf '%s\n' "$root"
+}
+
+# Place files from a release tree ($1): copy the .app to ~/Applications, refresh
+# PATH symlinks + the real seed-sync, write the launch agents. Stops the daemon +
+# GUI first; the caller re-loads. WAS_DAEMON/WAS_GUI record what to restart.
+WAS_DAEMON=0; WAS_GUI=0
+apply_tree() {
+  local src="$1"
+  [ -d "$src/$APP_NAME" ] || die "release tree '$src' has no $APP_NAME"
+
+  agent_loaded daemon && WAS_DAEMON=1
+  agent_loaded gui && WAS_GUI=1
+  [ "$WAS_DAEMON" = 1 ] && { log "stopping daemon"; agent_unload daemon; }
+  [ "$WAS_GUI" = 1 ] && agent_unload gui
+  pkill -x seed-gui >/dev/null 2>&1 || true
+
+  mkdir -p "$HOME/Applications" "$LOG_DIR" "$BIN_DIR" "$AGENTS"
+
+  # Replace the app (binaries not in use now). Stage as .new, then swap.
+  rm -rf "$APP_DST.new"
+  cp -R "$src/$APP_NAME" "$APP_DST.new"
+  rm -rf "$APP_DST"
+  mv "$APP_DST.new" "$APP_DST"
+
+  local b
+  for b in seed-gui seed-daemon seed-cli; do
+    ln -sfn "$MACOS/$b" "$BIN_DIR/$b"
+  done
+  # seed-sync is a real file (atomic swap), not a symlink into the app.
+  install -m 0755 "$src/seed-sync" "$BIN_DIR/seed-sync.t$$"
+  mv -f "$BIN_DIR/seed-sync.t$$" "$BIN_DIR/seed-sync"
+
+  local p
+  for p in daemon update gui; do
+    [ -f "$src/LaunchAgents/$APP_ID.$p.plist" ] || continue
+    sed -e "s|__APP__|$APP_DST|g" -e "s|__BIN__|$BIN_DIR|g" -e "s|__LOG__|$LOG_DIR|g" \
+      "$src/LaunchAgents/$APP_ID.$p.plist" > "$AGENTS/$APP_ID.$p.plist.t$$"
+    mv -f "$AGENTS/$APP_ID.$p.plist.t$$" "$AGENTS/$APP_ID.$p.plist"
+  done
+}
+
+cmd_install() {
+  local auto=1 gui=1 a
+  for a in "$@"; do case "$a" in
+    --no-auto-update) auto=0 ;;
+    --no-gui-autostart) gui=0 ;;
+    *) die "unknown flag for --install: $a" ;;
+  esac; done
+
+  # Prefer the tarball tree we were run from; otherwise download the latest.
+  local here tree
+  here="$(cd "$(dirname "$0")" && pwd)"
+  if [ -d "$here/$APP_NAME" ]; then tree="$here"; else log "no local release tree; fetching latest"; tree="$(fetch_latest_tree)"; fi
+
+  log "installing $APP_NAME to ~/Applications"
+  apply_tree "$tree"
+
+  agent_load daemon && log "daemon agent loaded (auto-starts at login)" \
+    || log "start it manually with: seed-daemon run"
+  [ "$auto" = 1 ] && { agent_load update && log "daily auto-update enabled"; }
+  [ "$gui" = 1 ]  && { agent_load gui && log "tray GUI will start at login"; }
+
+  case ":$PATH:" in *":$BIN_DIR:"*) ;; *) log "NOTE: $BIN_DIR is not on your PATH — add it to run seed-sync/seed-cli directly." ;; esac
+  log "done. Find \"SEED Sync\" in ~/Applications / Launchpad, or run: seed-gui"
+}
+
+cmd_update() {
+  local check=0 a
+  for a in "$@"; do case "$a" in --check) check=1 ;; *) die "unknown flag for --update: $a" ;; esac; done
+
+  local inst latest
+  inst="$(installed_version || true)"
+  [ -n "$inst" ] || die "not installed; run: seed-sync --install"
+  latest="$(latest_version)"
+  [ -n "$latest" ] || die "could not determine the latest release"
+  log "installed $inst, latest $latest"
+  if ! version_gt "$inst" "$latest"; then log "up to date"; return 0; fi
+  log "update available: $inst -> $latest"
+  [ "$check" = 1 ] && return 0
+
+  local tree; tree="$(fetch_latest_tree)"
+  apply_tree "$tree"
+  agent_load daemon
+  [ "$WAS_GUI" = 1 ] && agent_load gui
+  log "updated to $latest"
+}
+
+cmd_uninstall() {
+  local purge=0 a
+  for a in "$@"; do case "$a" in --purge) purge=1 ;; *) die "unknown flag for --uninstall: $a" ;; esac; done
+
+  agent_unload gui
+  agent_unload update
+  agent_unload daemon
+  pkill -x seed-gui >/dev/null 2>&1 || true
+  rm -f "$AGENTS/$APP_ID.daemon.plist" "$AGENTS/$APP_ID.update.plist" "$AGENTS/$APP_ID.gui.plist"
+  local b
+  for b in seed-daemon seed-gui seed-cli seed-sync; do rm -f "$BIN_DIR/$b"; done
+  rm -rf "$APP_DST" "$LOG_DIR"
+  log "removed the app, launch agents, and symlinks."
+  if [ "$purge" = 1 ]; then
+    rm -rf "$DATA_DIR"; log "purged $DATA_DIR (any master seed in the Keychain is left intact)."
+  else
+    log "kept your data at $DATA_DIR (use --purge to remove)."
+  fi
+}
+
+cmd_status() {
+  local da up
+  da="$(agent_loaded daemon && echo loaded || echo stopped)"
+  up="$(agent_loaded update && echo enabled || echo disabled)"
+  printf '%-13s %s\n' "installed:" "$(installed_version || echo none)"
+  printf '%-13s %s\n' "latest:"    "$(latest_version 2>/dev/null || echo '?')"
+  printf '%-13s %s\n' "daemon:"    "$da"
+  printf '%-13s %s\n' "auto-update:" "$up"
+  printf '%-13s %s\n' "app:"       "$([ -d "$APP_DST" ] && echo "$APP_DST" || echo "not installed")"
+}
+
+usage() {
+  cat <<'EOF'
+S.E.E.D. (Seed Sync) installer/updater — macOS
+
+  seed-sync --install [--no-auto-update] [--no-gui-autostart]
+  seed-sync --update  [--check]
+  seed-sync --uninstall [--purge]
+  seed-sync --status
+EOF
+}
+
+case "${1:-}" in
+  --install)   shift; cmd_install "$@" ;;
+  --update)    shift; cmd_update "$@" ;;
+  --uninstall) shift; cmd_uninstall "$@" ;;
+  --status)    shift; cmd_status ;;
+  --check)     cmd_update --check ;;
+  -h|--help|"") usage ;;
+  *)           die "unknown command: $1 (try --help)" ;;
+esac

@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- S.E.E.D. auto-update LaunchAgent. Analog of the Linux seed-sync-update.timer:
+     RunAtLoad checks shortly after login; StartCalendarInterval re-checks daily.
+     `seed-sync --update` no-ops fast when already current. Points at the real-file
+     wrapper in __BIN__ (~/.local/bin), NOT the copy inside the .app, so a self-
+     update that replaces the .app doesn't yank this running process. __BIN__ and
+     __LOG__ are rewritten on install. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>io.github.steeb_k.SeedSync.update</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__BIN__/seed-sync</string>
+    <string>--update</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>13</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__LOG__/seed-update.log</string>
+  <key>StandardErrorPath</key>
+  <string>__LOG__/seed-update.log</string>
+</dict>
+</plist>
