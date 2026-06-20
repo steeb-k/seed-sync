@@ -111,15 +111,17 @@ jobs:
     # Signing uses Azure Trusted Signing via OIDC — the cert never touches CI; the
     # runner authenticates as a service principal and the dlib signs remotely.
     #
-    # REQUIRED SETUP before this job can sign (one-time, by the maintainer):
-    #   1. artifact-signing-metadata.json at the repo root (committed) — DONE.
-    #   2. An Azure AD app (service principal) with the "Trusted Signing Certificate
-    #      Profile Signer" role on the Trusted Signing account, and an OIDC federated
-    #      credential for this repo (subject e.g. repo:steeb-k/seed-sync-gtk:ref:refs/tags/v*).
+    # REQUIRED SETUP before this job can sign (one-time, by the maintainer) — DONE:
+    #   1. artifact-signing-metadata.json at the repo root (committed).
+    #   2. Azure AD app "github-seed-sync-gtk-signing" (service principal) holding the
+    #      "Artifact Signing Certificate Profile Signer" role (formerly "Trusted
+    #      Signing ...") scoped to the <your-certificate-profile> cert profile on account <your-trusted-signing-account>,
+    #      plus a flexible OIDC federated credential matching
+    #      repo:steeb-k/seed-sync-gtk:ref:refs/tags/v* (any version tag).
     #   3. Repo secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID.
-    # Until those exist, azure/login fails and the job errors — but it's independent,
-    # so the Linux + macOS assets still publish. (UNVALIDATED on a runner — the
-    # gvsbuild + dlib-install steps want a first-tag shakeout on Windows.)
+    # The job is independent, so even if Azure auth ever breaks the Linux + macOS
+    # assets still publish. (UNVALIDATED on a runner — the gvsbuild + dlib-install
+    # steps want a first-tag shakeout on Windows.)
     runs-on: windows-latest
     permissions:
       id-token: write     # azure/login OIDC
