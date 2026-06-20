@@ -174,14 +174,16 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-      - name: Install Trusted Signing client (Azure.CodeSigning.Dlib)
+      - name: Install Artifact Signing client (Azure.CodeSigning.Dlib)
         shell: pwsh
         run: |
           # sign-artifacts.ps1 signs via `signtool /dlib Azure.CodeSigning.Dlib.dll`.
-          # The dlib ships in the Microsoft.Trusted.Signing.Client NuGet; install it
-          # and point ARTIFACT_SIGNING_DLIB at the dll so the script finds it.
+          # The dlib ships in the Microsoft.ArtifactSigning.Client NuGet (formerly
+          # Microsoft.Trusted.Signing.Client, renamed with the Trusted->Artifact
+          # rebrand; the dll name is unchanged). Pinned for reproducibility. Point
+          # ARTIFACT_SIGNING_DLIB at the dll so the script finds it.
           $dir = "$env:RUNNER_TEMP\tsclient"
-          nuget install Microsoft.Trusted.Signing.Client -OutputDirectory $dir -ExcludeVersion
+          nuget install Microsoft.ArtifactSigning.Client -Version 1.0.128 -OutputDirectory $dir -ExcludeVersion
           $dll = Get-ChildItem $dir -Recurse -Filter Azure.CodeSigning.Dlib.dll | Select-Object -First 1
           if (-not $dll) { Write-Error "Azure.CodeSigning.Dlib.dll not found in the NuGet"; exit 1 }
           "ARTIFACT_SIGNING_DLIB=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append
