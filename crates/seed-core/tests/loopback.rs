@@ -151,10 +151,10 @@ async fn master_viewer_mirror_lifecycle() -> anyhow::Result<()> {
 }
 
 /// A genuinely empty (0-byte) file must sync — including a unicode-named one.
-/// iroh-docs can't carry a len-0 content entry, so empty files ride the signed
-/// manifest and the viewer creates them directly. Regression: a 0-byte `café.txt`
-/// used to fail `set_hash` ("Attempted to insert an empty entry") and wedge the
-/// whole publish on a loop.
+/// iroh-docs filters 0-byte entries out of queries as deletion markers, so empty
+/// files ride a dedicated `\x00e/<path>` control key (non-empty marker value) and
+/// peers create them directly. Regression: a 0-byte `café.txt` must not be
+/// confused with a tombstone, and must mirror to peers.
 #[tokio::test]
 #[ignore = "opens real iroh endpoints; run with --ignored"]
 async fn empty_files_sync() -> anyhow::Result<()> {
@@ -380,5 +380,168 @@ async fn referenced_viewer_serves_peers() -> anyhow::Result<()> {
 
     viewer1.shutdown().await?;
     viewer2.shutdown().await?;
+    Ok(())
+}
+
+/// Drive two engines' reconcile loops until *both* folders equal `want`, or time
+/// out. Models the daemon ticking each node.
+async fn converge_two(
+    a: &mut Engine,
+    a_id: &str,
+    a_folder: &Path,
+    b: &mut Engine,
+    b_id: &str,
+    b_folder: &Path,
+    want: &BTreeMap<String, Vec<u8>>,
+) -> anyhow::Result<()> {
+    let res = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let _ = a.reconcile(a_id).await;
+            let _ = b.reconcile(b_id).await;
+            if &snapshot(a_folder) == want && &snapshot(b_folder) == want {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    match res {
+        Ok(inner) => inner,
+        Err(_) => Err(anyhow::anyhow!(
+            "timed out; a={:?} b={:?} want={:?}",
+            snapshot(a_folder).keys().collect::<Vec<_>>(),
+            snapshot(b_folder).keys().collect::<Vec<_>>(),
+            want.keys().collect::<Vec<_>>()
+        )),
+    }
+}
+
+/// Two **masters** of the same share (the second added with the *master* key) must
+/// converge bidirectionally: a file added on either side reaches the other, a
+/// delete propagates, a concurrent same-path edit resolves last-writer-wins, and a
+/// restarted node reconnects and re-converges. This is the multi-master feature the
+/// original design called for (`project-plan-human.md`: "only master key holders
+/// can modify the share" — plural).
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn two_masters_converge_bidirectionally() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let mut a = Engine::new(a_data.path()).await?;
+    let mut b = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        a.wait_online().await;
+        b.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    // A creates the share with one file.
+    std::fs::write(a_folder.path().join("a.txt"), b"from A")?;
+    let created = a.create_share(a_folder.path(), vec![]).await?;
+    let a_addr = a.endpoint_addr();
+
+    // B joins with the **master** key (becomes a co-master), bootstrapped to A, and
+    // independently drops in its own file *before* the first sync.
+    let share_id = b
+        .add_share(&created.master_key, b_folder.path(), vec![a_addr])
+        .await?;
+    assert_eq!(share_id, created.share_id);
+    std::fs::write(b_folder.path().join("b.txt"), b"from B")?;
+
+    // 1. Both files must reach both sides (true bidirectional add).
+    let mut want = BTreeMap::new();
+    want.insert("a.txt".to_string(), b"from A".to_vec());
+    want.insert("b.txt".to_string(), b"from B".to_vec());
+    converge_two(
+        &mut a,
+        &share_id,
+        a_folder.path(),
+        &mut b,
+        &share_id,
+        b_folder.path(),
+        &want,
+    )
+    .await?;
+    println!("bidirectional add OK");
+
+    // 2. A delete on A propagates to B.
+    std::fs::remove_file(a_folder.path().join("a.txt"))?;
+    let mut want = BTreeMap::new();
+    want.insert("b.txt".to_string(), b"from B".to_vec());
+    converge_two(
+        &mut a,
+        &share_id,
+        a_folder.path(),
+        &mut b,
+        &share_id,
+        b_folder.path(),
+        &want,
+    )
+    .await?;
+    assert!(!b_folder.path().join("a.txt").exists());
+    println!("bidirectional delete OK");
+
+    // 3. Concurrent same-path edit → last-writer-wins. First get c.txt onto both,
+    //    then edit it on B *after* a delay so B's mtime is strictly newer.
+    std::fs::write(a_folder.path().join("c.txt"), b"c from A")?;
+    let mut want = BTreeMap::new();
+    want.insert("b.txt".to_string(), b"from B".to_vec());
+    want.insert("c.txt".to_string(), b"c from A".to_vec());
+    converge_two(
+        &mut a,
+        &share_id,
+        a_folder.path(),
+        &mut b,
+        &share_id,
+        b_folder.path(),
+        &want,
+    )
+    .await?;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    std::fs::write(b_folder.path().join("c.txt"), b"c from B (newer)")?;
+    let mut want = BTreeMap::new();
+    want.insert("b.txt".to_string(), b"from B".to_vec());
+    want.insert("c.txt".to_string(), b"c from B (newer)".to_vec());
+    converge_two(
+        &mut a,
+        &share_id,
+        a_folder.path(),
+        &mut b,
+        &share_id,
+        b_folder.path(),
+        &want,
+    )
+    .await?;
+    println!("last-writer-wins OK");
+
+    // 4. Restart B (drop + reopen its data dir). It must reconnect to A — using the
+    //    creator endpoint id preserved in its stored key — and re-converge after a
+    //    fresh change on A.
+    b.shutdown().await?;
+    let mut b = Engine::new(b_data.path()).await?;
+    b.wait_online().await;
+    std::fs::write(a_folder.path().join("d.txt"), b"after restart")?;
+    let mut want = BTreeMap::new();
+    want.insert("b.txt".to_string(), b"from B".to_vec());
+    want.insert("c.txt".to_string(), b"c from B (newer)".to_vec());
+    want.insert("d.txt".to_string(), b"after restart".to_vec());
+    converge_two(
+        &mut a,
+        &share_id,
+        a_folder.path(),
+        &mut b,
+        &share_id,
+        b_folder.path(),
+        &want,
+    )
+    .await?;
+    println!("restart reconnect OK");
+
+    a.shutdown().await?;
+    b.shutdown().await?;
     Ok(())
 }

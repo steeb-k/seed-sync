@@ -2,11 +2,13 @@
 
 A Resilio Sync–style **P2P mirrored folder sync** app in Rust + GTK4/Libadwaita.
 
-A *master* key holder can modify a shared folder; *viewer* key holders are
-read-only — any local edits they make are discarded so every peer's copy stays
-byte-identical. Built on the [iroh](https://iroh.computer) 1.0 stack (QUIC,
-content-addressed blobs, multi-writer docs, gossip), with an end-to-end
-signed-manifest trust model layered on top.
+Any *master* key holder can modify a shared folder — multiple masters across
+devices stay in sync, changes flowing both ways (last-writer-wins). *Viewer* key
+holders are read-only: any local edits they make are discarded so every peer's
+copy stays byte-identical. Built on the [iroh](https://iroh.computer) 1.0 stack
+(QUIC, content-addressed blobs, multi-writer docs, gossip); the share's
+multi-writer doc replica is the trust root — every entry is signed by the master
+namespace key, so only master-key holders can write.
 
 > Status: early development. See `project-plan-human.md` for the product brief
 > and the implementation plan for the build sequence.
@@ -64,13 +66,19 @@ auto-update work, and **`docs/windows-packaging.md`** for the MSI side.
 
 ## Permission model
 
-- **Master key** (`seedm1…`) carries an Ed25519 signing seed → write access.
+- **Master key** (`seedm1…`) carries an Ed25519 signing seed → write access. It
+  doubles as the iroh-docs namespace secret, so anyone holding it can write to the
+  share's replica. **Multi-master** is supported: add the master key on any number
+  of devices and they all read/write the same share.
 - **Viewer key** (`seedv1…`) carries only the public verifying key → read-only.
-- `share_id = BLAKE3(master_pub)`. The master signs a versioned manifest
-  (merkle root + monotonic seqno + expiry + ignore list); viewers verify against
-  the pinned master key and reject/overwrite anything not validly signed.
-- Multi-master (per-device identities, revocation, attribution) is planned future
-  work; the manifest format reserves fields for it.
+  A viewer holds a read capability and physically cannot write doc entries, so its
+  local edits are reverted to keep every copy byte-identical.
+- `share_id = BLAKE3(master_pub)`, which is also the doc namespace id. Every entry
+  in the replica is signed by the namespace key, so a peer without the master
+  secret cannot forge file content; masters' entries merge **last-writer-wins**.
+- Conflict caveat: two masters editing the *same* file before they sync resolve
+  last-writer-wins, so one of the two concurrent edits is dropped. Conflict-copy
+  preservation (à la Syncthing) is planned future work.
 
 ## License
 

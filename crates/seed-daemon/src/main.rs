@@ -210,12 +210,13 @@ pub(crate) async fn serve(
     Ok(())
 }
 
-/// Periodically apply updates to viewer shares and republish changed masters.
+/// Periodically reconcile every share against the merged replica.
 ///
-/// Master publishes run *off* the engine lock: we plan them under a brief lock,
-/// stream the content while unlocked (so a big folder can't freeze the GUI's
-/// share list), then re-lock briefly to record the result. Viewer applies still
-/// hold the lock.
+/// Each share's reconcile runs *off* the engine lock: we build a job under a
+/// brief lock, do the heavy work (hash the folder, stream blobs in/out) while
+/// unlocked so a big folder can't freeze the GUI, then re-lock briefly to commit
+/// the result. This drives multi-master convergence — every node (master or
+/// viewer) imports its local changes and materializes remote ones.
 async fn reconcile_loop(daemon: Daemon) {
     let mut tick = tokio::time::interval(Duration::from_millis(750));
     let mut tick_n: u64 = 0;
@@ -224,24 +225,40 @@ async fn reconcile_loop(daemon: Daemon) {
         tick_n = tick_n.wrapping_add(1);
         let mut changed = Vec::new();
 
-        // Masters: plan (brief lock) -> publish (no lock) -> commit (brief lock).
-        let jobs = { daemon.engine.lock().await.plan_publishes() };
-        for job in jobs {
-            let result = job.run().await;
-            let ok = result.is_ok();
-            let id = job.share_id().to_string();
-            if let Err(e) = &result {
-                tracing::warn!("publish {id} failed: {e:#}");
-            }
-            daemon.engine.lock().await.finish_publish(&id, result.ok());
-            if ok {
-                changed.push(id);
+        let ids = { daemon.engine.lock().await.share_ids() };
+        for id in ids {
+            // Build the job (brief lock) -> run (no lock) -> commit (brief lock).
+            let job = {
+                daemon
+                    .engine
+                    .lock()
+                    .await
+                    .make_reconcile_job(&id)
+                    .ok()
+                    .flatten()
+            };
+            let Some(job) = job else { continue };
+            match job.run().await {
+                Ok(outcome) => {
+                    let did = outcome.changed();
+                    daemon
+                        .engine
+                        .lock()
+                        .await
+                        .finish_reconcile(&id, Some(outcome));
+                    if did {
+                        changed.push(id);
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("reconcile {id} failed: {e:#}");
+                    daemon.engine.lock().await.finish_reconcile(&id, None);
+                }
             }
         }
 
-        // Viewers apply under the lock.
-        let applied = { daemon.engine.lock().await.apply_all_viewers().await };
-        changed.extend(applied);
+        // Retry any deferred cross-volume blob reclaims.
+        daemon.engine.lock().await.retry_reclaims();
 
         // Presence: announce this device's name + health to each share's pool.
         // Every ~4th tick (~3s), plus immediately whenever a share changed (its
@@ -390,24 +407,24 @@ async fn handle_request(daemon: &Daemon, req: IpcRequest) -> anyhow::Result<IpcR
             generate_ignore: _,
             ignore,
         } => {
-            // Open the share under a brief lock, then stream the initial publish
-            // *without* the lock so a large folder doesn't block other requests
-            // (ListShares, status, etc.). The share is visible in the list while
-            // it publishes.
+            // Open + persist the share under a brief lock, then run the initial
+            // import *without* the lock so a large folder doesn't block other
+            // requests (ListShares, status, etc.). The share is visible in the
+            // list while it imports; if the import errors it's just retried by the
+            // reconcile loop, so creation itself still succeeds.
             let (created, job) = {
                 let mut engine = daemon.engine.lock().await;
                 engine.create_open(&PathBuf::from(folder), ignore).await?
             };
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
-            let result = job.run().await;
+            let outcome = job.run().await;
+            if let Err(e) = &outcome {
+                tracing::warn!("initial import for {} failed: {e:#}", created.share_id);
+            }
             {
                 let mut engine = daemon.engine.lock().await;
-                match &result {
-                    Ok(seqno) => engine.create_finish(&created.share_id, *seqno).await?,
-                    Err(_) => engine.finish_publish(&created.share_id, None),
-                }
+                engine.finish_reconcile(&created.share_id, outcome.ok());
             }
-            result?;
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
             IpcResponse::ShareCreated {
                 share_id: created.share_id,

@@ -21,7 +21,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use bao_tree::io::BaoContentItem;
-use ed25519_dalek::SigningKey;
 use futures_lite::StreamExt;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
@@ -113,16 +112,19 @@ impl PeerRoster {
 }
 
 use crate::identity::{Role, ShareKey};
-use crate::manifest::{self, Manifest, SignedManifest};
 use crate::node::IrohNode;
 use crate::scan::{self, IgnoreSet};
 
-/// Reserved doc key holding the signed manifest. The `\x00` prefix namespaces
-/// control keys away from user file paths.
-const MANIFEST_KEY: &[u8] = b"\x00manifest";
-/// How long a published manifest stays valid; the master re-signs on each
-/// publish, so this only bounds how stale an unattended share may get.
-const MANIFEST_TTL_SECS: i64 = 60 * 60 * 24 * 30;
+/// All reserved doc keys share the `\x00` control prefix so they never collide
+/// with user file paths (relative POSIX strings, never starting with NUL).
+const CONTROL_PREFIX: u8 = 0;
+/// Replicated, master-written ignore list (CBOR `Vec<String>`), LWW-merged across
+/// masters. Viewers read it so they honor what a master chose not to sync.
+const IGNORE_KEY: &[u8] = b"\x00ignore";
+/// Prefix for empty-file markers: `\x00e/<relpath>` with a non-empty marker value.
+/// iroh-docs filters 0-byte entries out of queries as deletion markers, so a real
+/// empty file can't ride a normal entry — it gets its own (non-empty) control key.
+const EMPTY_PREFIX: &[u8] = b"\x00e/";
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -296,27 +298,145 @@ pub struct CreatedShare {
     pub viewer_key: String,
 }
 
-/// A self-contained unit of publish work holding *cloned* iroh handles, so the
-/// heavy part (scanning the folder + streaming every file into the blob store)
-/// can run with **no engine lock held** — keeping the daemon responsive while a
-/// large folder transfers. Produced under a brief lock by [`Engine::make_job`]
-/// or [`Engine::create_open`], then run via [`PublishJob::run`]; the engine is
-/// only re-locked afterwards (via [`Engine::finish_publish`]) to record the
-/// resulting seqno.
-pub struct PublishJob {
+/// One file's state as seen in the merged replica (the `R` side of the merge).
+struct RemoteEntry {
+    /// 32-byte BLAKE3 content hash. `Hash::EMPTY` bytes for an empty file.
+    hash: Vec<u8>,
+    size: u64,
+    /// iroh-docs record timestamp (micros since epoch); LWW conflict tiebreak.
+    ts: u64,
+}
+
+/// One file's state on local disk (the `L` side of the merge).
+struct LocalEntry {
+    hash: Vec<u8>,
+    size: u64,
+    /// Absolute path, present only when discovered by a full hashing scan (so the
+    /// reconcile can import it). `None` when `L` is inferred from the base index.
+    abs: Option<PathBuf>,
+}
+
+/// Read the merged file view from the doc: latest-per-key, with deletion markers
+/// already excluded by the query (so a tombstoned file is simply absent). Normal
+/// keys carry content; `\x00e/<path>` keys mark empty files; other control keys
+/// (e.g. `\x00ignore`) are skipped.
+async fn read_remote_files(doc: &Doc) -> anyhow::Result<HashMap<String, RemoteEntry>> {
+    let mut out = HashMap::new();
+    let mut s = std::pin::pin!(doc.get_many(Query::single_latest_per_key()).await?);
+    while let Some(e) = s.next().await {
+        let e = e?;
+        let key = e.key();
+        if key.first() == Some(&CONTROL_PREFIX) {
+            if let Some(rel) = key.strip_prefix(EMPTY_PREFIX) {
+                if let Ok(path) = std::str::from_utf8(rel) {
+                    out.insert(
+                        path.to_string(),
+                        RemoteEntry {
+                            hash: Hash::EMPTY.as_bytes().to_vec(),
+                            size: 0,
+                            ts: e.timestamp(),
+                        },
+                    );
+                }
+            }
+            continue;
+        }
+        let Ok(path) = std::str::from_utf8(key) else {
+            continue;
+        };
+        out.insert(
+            path.to_string(),
+            RemoteEntry {
+                hash: e.content_hash().as_bytes().to_vec(),
+                size: e.content_len(),
+                ts: e.timestamp(),
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Read the replicated ignore list (`\x00ignore`), if a master has published one
+/// and its content has arrived. `None` means "use the locally-configured list".
+async fn read_ignore_list(doc: &Doc, blobs: &FsStore) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(entry) = doc
+        .get_one(Query::single_latest_per_key().key_exact(IGNORE_KEY))
+        .await?
+    else {
+        return Ok(None);
+    };
+    let hash = entry.content_hash();
+    if !blobs.blobs().has(hash).await? {
+        return Ok(None);
+    }
+    let bytes = blobs.blobs().get_bytes(hash).await?;
+    let list: Vec<String> =
+        ciborium::from_reader(bytes.as_ref()).context("decode replicated ignore list")?;
+    Ok(Some(list))
+}
+
+/// Local file mtime as micros since the Unix epoch (for LWW vs. a doc timestamp).
+fn mtime_micros(p: &Path) -> u64 {
+    std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+/// Convert a 32-byte hash slice into an iroh [`Hash`].
+fn to_hash(bytes: &[u8]) -> anyhow::Result<Hash> {
+    let arr: [u8; 32] = bytes.try_into().context("bad hash len")?;
+    Ok(Hash::from(arr))
+}
+
+/// What a [`ReconcileJob::run`] decided, applied back into engine state under the
+/// lock by [`Engine::finish_reconcile`]: index mutations to persist, the new
+/// folder signature, this node's recomputed health, and any blob copies to reclaim.
+pub struct ReconcileOutcome {
+    changed: bool,
+    health: u8,
+    new_quick_sig: u64,
+    index_sets: Vec<(String, Vec<u8>)>,
+    index_dels: Vec<String>,
+    reclaim: Vec<Hash>,
+}
+
+impl ReconcileOutcome {
+    /// Whether this pass mutated the local folder or the replica.
+    pub fn changed(&self) -> bool {
+        self.changed
+    }
+}
+
+/// A self-contained unit of reconcile work holding *cloned* iroh handles, so the
+/// heavy part (hashing the folder, streaming blobs in/out) runs with **no engine
+/// lock held**. Produced under a brief lock by [`Engine::make_reconcile_job`] or
+/// [`Engine::create_open`], run via [`ReconcileJob::run`], then committed by
+/// [`Engine::finish_reconcile`].
+///
+/// It performs one bidirectional, last-writer-wins reconcile between the local
+/// folder (`L`), the merged doc replica (`R`), and the per-path base index (`B` =
+/// what we last reconciled). A **master** writes local changes back into the
+/// replica and materializes remote ones; a **viewer** holds a read-only doc
+/// capability and only mirrors the replica to disk (local edits are reverted).
+pub struct ReconcileJob {
     share_id: String,
     folder: PathBuf,
-    ignore: Vec<String>,
+    is_master: bool,
+    configured_ignore: Vec<String>,
     doc: Doc,
     blobs: FsStore,
-    signing: SigningKey,
-    share_id_bytes: Vec<u8>,
     author: AuthorId,
-    last_seqno: u64,
+    endpoint: Endpoint,
+    providers: Vec<EndpointId>,
+    base: HashMap<String, Vec<u8>>,
+    last_quick_sig: u64,
     progress: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
 }
 
-impl PublishJob {
+impl ReconcileJob {
     pub fn share_id(&self) -> &str {
         &self.share_id
     }
@@ -327,130 +447,346 @@ impl PublishJob {
         }
     }
 
-    /// Scan the folder, stream each file into the blob store by path, refresh the
-    /// doc, and publish a freshly-signed manifest. Returns the new manifest
-    /// seqno. Touches only the cloned handles, so it is safe to call without the
-    /// engine lock.
-    pub async fn run(&self) -> anyhow::Result<u64> {
-        let (ignore_set, _bad) = IgnoreSet::compile(&self.ignore);
-        // List files *without* hashing — the blob import below hashes each file
-        // as it streams it in, so we read every file exactly once (vs. scanning
-        // to hash and then re-reading to import). This also lets progress start
-        // immediately instead of after a full hashing pass.
-        let listed = scan::list_files(&self.folder, &ignore_set).context("scan folder")?;
+    /// Import a local file into the blob store (by reference) and write the
+    /// matching doc entry. Empty files ride the `\x00e/<path>` control keyspace
+    /// (iroh-docs filters 0-byte entries out as deletions). Returns the stored
+    /// 32-byte hash.
+    async fn import_one(&self, path: &str, abs: &Path) -> anyhow::Result<Vec<u8>> {
+        let tag = self
+            .blobs
+            .blobs()
+            .add_path_with_opts(AddPathOptions {
+                path: abs.to_path_buf(),
+                format: BlobFormat::Raw,
+                mode: ImportMode::TryReference,
+            })
+            .temp_tag()
+            .await
+            .with_context(|| format!("import {}", abs.display()))?;
+        let hash = tag.hash();
+        let size = match self.blobs.blobs().status(hash).await {
+            Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) => size,
+            _ => 0,
+        };
+        if size == 0 {
+            // Empty file: mark it in the control keyspace and clear any stale
+            // normal entry left from when it had content.
+            let mut k = EMPTY_PREFIX.to_vec();
+            k.extend_from_slice(path.as_bytes());
+            self.doc
+                .set_bytes(self.author, k, vec![1u8])
+                .await
+                .with_context(|| format!("mark empty {path}"))?;
+            let _ = self.doc.del(self.author, path.as_bytes().to_vec()).await;
+            drop(tag);
+            return Ok(Hash::EMPTY.as_bytes().to_vec());
+        }
+        self.doc
+            .set_hash(self.author, path.as_bytes().to_vec(), hash, size)
+            .await
+            .with_context(|| format!("set doc entry {path}"))?;
+        let mut ek = EMPTY_PREFIX.to_vec();
+        ek.extend_from_slice(path.as_bytes());
+        let _ = self.doc.del(self.author, ek).await;
+        drop(tag);
+        Ok(hash.as_bytes().to_vec())
+    }
 
-        // Seed the live import progress (bytes) so the GUI can show a moving
-        // percent while large files stream in. Cleared in `finish_publish`.
-        let total_bytes: u64 = listed.iter().map(|f| f.size).sum();
-        let mut done_bytes: u64 = 0;
-        self.set_progress(0, total_bytes);
+    /// Tombstone a file (and its empty-marker) in the replica.
+    async fn tombstone(&self, path: &str) {
+        let _ = self.doc.del(self.author, path.as_bytes().to_vec()).await;
+        let mut ek = EMPTY_PREFIX.to_vec();
+        ek.extend_from_slice(path.as_bytes());
+        let _ = self.doc.del(self.author, ek).await;
+    }
 
-        // Write/refresh a doc entry per file (content -> blob), collecting the
-        // authoritative file list. Files stream into the blob store by path;
-        // never load a whole file into memory.
-        let mut files = Vec::with_capacity(listed.len());
-        let mut live_keys: HashSet<Vec<u8>> = HashSet::new();
-        for f in &listed {
-            // Import by *reference*, not copy: the blob store keeps only the
-            // outboard (hash tree) and points at the file in place, instead of
-            // duplicating the content into `…/blobs`. This is what stops a shared
-            // folder from doubling on disk. The import still hashes the file to
-            // build the outboard, so we get the content hash for the doc entry +
-            // manifest. Hold the temp tag until the doc references the hash so the
-            // freshly-imported blob can't be reclaimed in between.
-            //
-            // Tradeoff: if the master later edits/moves the file, the referenced
-            // blob goes stale — but the reconcile loop re-imports changed files
-            // (new hash + outboard) and republishes, so peers move to the new
-            // blob and a stale read just fails verification rather than corrupts.
-            let tag = self
+    /// Materialize a remote file to disk if its content has arrived. Returns
+    /// `Ok(true)` once the file on disk matches `hash_bytes` (or is created empty),
+    /// `Ok(false)` if the content is still downloading. Pushes a hash onto
+    /// `reclaim` when a cross-volume reference export left an owned copy behind.
+    async fn materialize(
+        &self,
+        path: &str,
+        hash_bytes: &[u8],
+        size: u64,
+        reclaim: &mut Vec<Hash>,
+    ) -> anyhow::Result<bool> {
+        let target = self.folder.join(rel_to_native(path));
+        if size == 0 {
+            let present = std::fs::metadata(&target)
+                .map(|m| m.is_file() && m.len() == 0)
+                .unwrap_or(false);
+            if !present {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::File::create(&target)?;
+            }
+            return Ok(true);
+        }
+        if file_matches(&target, hash_bytes) {
+            return Ok(true);
+        }
+        let hash = to_hash(hash_bytes)?;
+        if !self.blobs.blobs().has(hash).await? {
+            return Ok(false); // content still downloading
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if !target.exists() {
+            if let Err(e) = self
                 .blobs
                 .blobs()
-                .add_path_with_opts(AddPathOptions {
-                    path: f.abs.clone(),
-                    format: BlobFormat::Raw,
-                    mode: ImportMode::TryReference,
+                .export_with_opts(ExportOptions {
+                    hash,
+                    mode: ExportMode::TryReference,
+                    target: target.clone(),
                 })
-                .temp_tag()
                 .await
-                .with_context(|| format!("import {}", f.abs.display()))?;
-            let hash = tag.hash();
-            // Use the size iroh actually imported — it hashed the bytes, so this
-            // always agrees with `hash`. The scan's metadata size can disagree:
-            // a file still being written reports a stale 0 in the directory entry
-            // while the read sees real content. iroh-docs rejects a (non-empty
-            // hash, len 0) entry, which would wedge the whole publish on that one
-            // file (republishing and failing every tick).
-            let size = match self.blobs.blobs().status(hash).await {
-                Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) => size,
-                _ => f.size,
-            };
-            // iroh-docs can't carry an empty file: it only accepts a len-0 entry
-            // paired with its all-zeros empty *sentinel* hash, but a real 0-byte
-            // file hashes to BLAKE3("") — so set_hash is rejected ("Attempted to
-            // insert an empty entry"), which used to fail (and endlessly retry) the
-            // whole publish. Empty files instead ride the signed manifest only; the
-            // viewer creates them directly (see `apply`). No doc entry, no blob.
-            if size == 0 {
-                files.push(manifest::FileEntry {
-                    path: f.rel.clone(),
-                    hash: hash.as_bytes().to_vec(),
-                    size: 0,
-                    deleted: false,
-                });
-                continue;
+            {
+                tracing::debug!("reference-export {path} failed; will self-heal: {e}");
             }
-            self.doc
-                .set_hash(self.author, f.rel.as_bytes().to_vec(), hash, size)
+        }
+        if file_matches(&target, hash_bytes) {
+            reclaim.push(hash);
+            Ok(true)
+        } else {
+            // Existing file diverged (edited/corrupted): re-fetch verified bytes.
+            self_heal_file(&self.endpoint, &self.providers, hash, &target)
                 .await
-                .with_context(|| format!("set doc entry {}", f.rel))?;
-            files.push(manifest::FileEntry {
-                path: f.rel.clone(),
-                hash: hash.as_bytes().to_vec(),
-                size,
-                deleted: false,
-            });
-            live_keys.insert(f.rel.as_bytes().to_vec());
-            done_bytes += size;
-            self.set_progress(done_bytes, total_bytes);
-            drop(tag);
+                .with_context(|| format!("self-heal {path}"))?;
+            Ok(true)
+        }
+    }
+
+    /// Run one bidirectional reconcile pass. Touches only cloned handles + disk, so
+    /// it is safe to call without the engine lock.
+    pub async fn run(&self) -> anyhow::Result<ReconcileOutcome> {
+        // 1. Effective ignore set: the replicated `\x00ignore` is authoritative
+        //    (so viewers honor what a master ignored, e.g. don't delete those
+        //    files). A master (re)publishes its configured list when it drifts.
+        let live_ignore = read_ignore_list(&self.doc, &self.blobs).await?;
+        let effective_ignore = if self.is_master {
+            if live_ignore.as_deref() != Some(self.configured_ignore.as_slice()) {
+                let mut cbor = Vec::new();
+                ciborium::into_writer(&self.configured_ignore, &mut cbor)
+                    .context("encode ignore list")?;
+                self.doc
+                    .set_bytes(self.author, IGNORE_KEY.to_vec(), cbor)
+                    .await
+                    .context("publish ignore list")?;
+            }
+            self.configured_ignore.clone()
+        } else {
+            live_ignore.unwrap_or_else(|| self.configured_ignore.clone())
+        };
+        let (ignore_set, _bad) = IgnoreSet::compile(&effective_ignore);
+
+        // 2. Merged remote view.
+        let remote = read_remote_files(&self.doc).await?;
+
+        // 3. Local view. Hashing the whole folder is costly, so only do it when the
+        //    cheap (path,size,mtime) signature changed since last reconcile;
+        //    otherwise the on-disk content equals our recorded base. Both roles
+        //    scan: a master to publish local edits, a viewer to detect (and revert)
+        //    local drift.
+        let quick_sig = scan::quick_signature(&self.folder, &ignore_set);
+        let do_scan = quick_sig != self.last_quick_sig;
+        let local: HashMap<String, LocalEntry> = if do_scan {
+            let mut m = HashMap::new();
+            for sf in scan::scan(&self.folder, &ignore_set)? {
+                m.insert(
+                    sf.entry.path.clone(),
+                    LocalEntry {
+                        hash: sf.entry.hash,
+                        size: sf.entry.size,
+                        abs: Some(sf.abs_path),
+                    },
+                );
+            }
+            m
+        } else {
+            self.base
+                .iter()
+                .map(|(p, h)| {
+                    (
+                        p.clone(),
+                        LocalEntry {
+                            hash: h.clone(),
+                            size: 0,
+                            abs: None,
+                        },
+                    )
+                })
+                .collect()
+        };
+
+        // Seed import progress so the GUI shows a moving percent on a big first
+        // import (masters only; cleared in finish_reconcile).
+        if self.is_master && do_scan {
+            let total: u64 = local.values().map(|l| l.size).sum();
+            self.set_progress(0, total);
         }
 
-        // GC doc entries for files that no longer exist (cosmetic; the manifest
-        // is authoritative). Skip the manifest control key.
-        let mut existing = std::pin::pin!(self.doc.get_many(Query::all()).await?);
-        let mut stale: Vec<Vec<u8>> = Vec::new();
-        while let Some(entry) = existing.next().await {
-            let entry = entry?;
-            let k = entry.key().to_vec();
-            if k == MANIFEST_KEY {
-                continue;
+        let mut keys: HashSet<String> = HashSet::new();
+        keys.extend(remote.keys().cloned());
+        keys.extend(local.keys().cloned());
+        keys.extend(self.base.keys().cloned());
+
+        let mut index_sets: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut index_dels: Vec<String> = Vec::new();
+        let mut reclaim: Vec<Hash> = Vec::new();
+        let mut changed = false;
+        let mut imported_bytes: u64 = 0;
+
+        for path in keys {
+            let l = local.get(&path);
+            let r = remote.get(&path);
+            let b = self.base.get(&path);
+
+            match (l, r) {
+                // Gone from disk and replica: drop any base record.
+                (None, None) => {
+                    if b.is_some() {
+                        index_dels.push(path);
+                    }
+                }
+
+                // On disk, absent from the replica.
+                (Some(le), None) => {
+                    if !self.is_master {
+                        // Viewer: not in the merged view → revert (delete) it.
+                        let target = self.folder.join(rel_to_native(&path));
+                        let _ = std::fs::remove_file(&target);
+                        if b.is_some() {
+                            index_dels.push(path);
+                        }
+                        changed = true;
+                    } else if b.map(|bh| bh == &le.hash).unwrap_or(false) {
+                        // Master, unchanged since base, now gone from replica →
+                        // a remote delete: remove it locally.
+                        let target = self.folder.join(rel_to_native(&path));
+                        let _ = std::fs::remove_file(&target);
+                        index_dels.push(path);
+                        changed = true;
+                    } else if let Some(abs) = le.abs.as_ref() {
+                        // Master, brand-new local file (or locally edited after a
+                        // remote delete): publish it.
+                        let h = self.import_one(&path, abs).await?;
+                        imported_bytes += le.size;
+                        self.set_progress(imported_bytes, imported_bytes);
+                        index_sets.push((path, h));
+                        changed = true;
+                    }
+                }
+
+                // In the replica, absent from disk.
+                (None, Some(re)) => {
+                    if self.is_master && do_scan && b.map(|bh| bh == &re.hash).unwrap_or(false) {
+                        // Master, full scan saw it genuinely gone while base+replica
+                        // agreed → the user deleted it: propagate the tombstone.
+                        self.tombstone(&path).await;
+                        index_dels.push(path);
+                        changed = true;
+                    } else if self
+                        .materialize(&path, &re.hash, re.size, &mut reclaim)
+                        .await?
+                    {
+                        index_sets.push((path, re.hash.clone()));
+                        changed = true;
+                    }
+                }
+
+                // Present on both sides.
+                (Some(le), Some(re)) => {
+                    if le.hash == re.hash {
+                        if b != Some(&le.hash) {
+                            index_sets.push((path, le.hash.clone()));
+                        }
+                        continue;
+                    }
+                    if !self.is_master {
+                        // Viewer: replica wins, always.
+                        if self.materialize(&path, &re.hash, re.size, &mut reclaim).await? {
+                            index_sets.push((path, re.hash.clone()));
+                            changed = true;
+                        }
+                        continue;
+                    }
+                    // Master three-way merge.
+                    match b {
+                        Some(bh) if bh == &le.hash => {
+                            // Local untouched, remote changed → take remote.
+                            if self.materialize(&path, &re.hash, re.size, &mut reclaim).await? {
+                                index_sets.push((path, re.hash.clone()));
+                                changed = true;
+                            }
+                        }
+                        Some(bh) if bh == &re.hash => {
+                            // Remote untouched, local changed → publish local.
+                            if let Some(abs) = le.abs.as_ref() {
+                                let h = self.import_one(&path, abs).await?;
+                                index_sets.push((path, h));
+                                changed = true;
+                            }
+                        }
+                        _ => {
+                            // Both changed (or unknown base) → last-writer-wins.
+                            let local_ts =
+                                le.abs.as_ref().map(|a| mtime_micros(a)).unwrap_or(0);
+                            if local_ts >= re.ts {
+                                if let Some(abs) = le.abs.as_ref() {
+                                    let h = self.import_one(&path, abs).await?;
+                                    index_sets.push((path, h));
+                                    changed = true;
+                                }
+                            } else if self
+                                .materialize(&path, &re.hash, re.size, &mut reclaim)
+                                .await?
+                            {
+                                index_sets.push((path, re.hash.clone()));
+                                changed = true;
+                            }
+                        }
+                    }
+                }
             }
-            if !live_keys.contains(&k) {
-                stale.push(k);
-            }
-        }
-        for k in stale {
-            let _ = self.doc.del(self.author, k).await;
         }
 
-        // Build, sign, and publish the manifest.
-        let seqno = self.last_seqno + 1;
-        let manifest = Manifest::new(
-            self.share_id_bytes.clone(),
-            seqno,
-            now_secs() + MANIFEST_TTL_SECS,
-            files,
-            self.ignore.clone(),
-        );
-        let signed = manifest::sign(&manifest, &self.signing).map_err(|e| anyhow!("sign: {e}"))?;
-        let mut cbor = Vec::new();
-        ciborium::into_writer(&signed, &mut cbor).context("encode signed manifest")?;
-        self.doc
-            .set_bytes(self.author, MANIFEST_KEY.to_vec(), cbor)
-            .await
-            .context("publish manifest")?;
-        Ok(seqno)
+        // Tidy now-empty directories a viewer/master delete may have left behind.
+        prune_empty_dirs(&self.folder);
+
+        // Health: present / total bytes of the merged desired view. A master is the
+        // source, so always 100.
+        let mut total_bytes: u64 = 0;
+        let mut present_bytes: u64 = 0;
+        for re in remote.values() {
+            total_bytes += re.size;
+            if re.size == 0 || self.blobs.blobs().has(to_hash(&re.hash)?).await? {
+                present_bytes += re.size;
+            }
+        }
+        let health = if self.is_master {
+            100
+        } else {
+            (present_bytes.min(total_bytes) * 100)
+                .checked_div(total_bytes)
+                .unwrap_or(100) as u8
+        };
+
+        // Recompute the signature *after* our disk writes so the next tick sees a
+        // settled folder rather than re-scanning our own changes.
+        let new_quick_sig = scan::quick_signature(&self.folder, &ignore_set);
+
+        Ok(ReconcileOutcome {
+            changed,
+            health,
+            new_quick_sig,
+            index_sets,
+            index_dels,
+            reclaim,
+        })
     }
 }
 
@@ -460,18 +796,15 @@ struct ShareState {
     folder: PathBuf,
     doc: Doc,
     ignore: Vec<String>,
-    /// Highest manifest seqno accepted (anti-rollback watermark).
+    /// Local "generation" counter, bumped on each changed reconcile and broadcast
+    /// in presence so peers can see this node moving (no longer a trust watermark).
     last_seqno: u64,
-    /// Cheap (path,size,mtime) signature of the last published folder state,
-    /// used by the master reconcile loop to skip unchanged ticks.
+    /// Cheap (path,size,mtime) signature of the folder after the last reconcile;
+    /// lets the next pass skip a full hashing scan when nothing changed on disk.
     last_quick_sig: u64,
-    /// Signature seen on the previous reconcile tick. A republish only fires once
-    /// the folder signature is unchanged across a tick (debounce), so a file still
-    /// being written/copied isn't repeatedly — and partially — published.
-    last_seen_sig: u64,
     /// When paused, the reconcile loop skips this share.
     paused: bool,
-    /// Set while a [`PublishJob`] for this share is running off-lock, so the
+    /// Set while a [`ReconcileJob`] for this share is running off-lock, so the
     /// reconcile loop doesn't start a second concurrent publish of it.
     publishing: bool,
     /// Live peer membership, updated by the doc event task + presence gossip.
@@ -485,15 +818,6 @@ struct ShareState {
     /// Presence gossip for this share (broadcasts our name + health, receives
     /// peers'). `None` if the gossip subscribe failed. Aborted on drop.
     presence: Option<crate::presence::PresenceHandle>,
-}
-
-impl ShareState {
-    fn ignore_set(&self) -> IgnoreSet {
-        // Always ignore our own control prefix on disk (there is none on disk,
-        // but keep the hook for future per-share metadata files).
-        let (set, _bad) = IgnoreSet::compile(&self.ignore);
-        set
-    }
 }
 
 /// The engine owns the iroh node and the set of shares.
@@ -581,8 +905,14 @@ impl Engine {
             if rec.role_master && rec.seed_in_keyring {
                 match crate::secrets::load_seed(&rec.share_id) {
                     Ok(seed) => {
-                        key = ShareKey::from_master_seed(seed)
-                            .with_endpoint_id(self.node.endpoint_id_bytes())
+                        // Preserve the creating node's endpoint id carried in the
+                        // stored (seedless) key: a master added from someone else's
+                        // master key holds *their* id as its only bootstrap hint, so
+                        // stamping our own id here would strand it after a restart.
+                        // Fall back to our own id only for legacy keys that carried
+                        // none (a self-created master's key already holds its own).
+                        let eid = key.endpoint_id().unwrap_or(self.node.endpoint_id_bytes());
+                        key = ShareKey::from_master_seed(seed).with_endpoint_id(eid);
                     }
                     Err(e) => tracing::warn!(
                         "master seed for {} unavailable from keystore; running read-only: {e}",
@@ -646,15 +976,21 @@ impl Engine {
             .context("import namespace")?;
         std::fs::create_dir_all(folder)?;
 
-        // If no explicit bootstrap was given, a viewer can still reach the
-        // master by its endpoint id (carried in the key) via n0 DNS discovery —
-        // build an address with just the id and let discovery resolve it.
+        // If no explicit bootstrap was given, any node added from a share key can
+        // reach the *creating* node by its endpoint id (carried in the key) via n0
+        // DNS discovery — build an address with just the id and let discovery
+        // resolve it. This applies to a master added from a master key just as much
+        // as to a viewer (multi-master): both must dial the creator for doc sync.
+        // The creating master's own key carries its own id, so skip dialing
+        // ourselves.
         let mut bootstrap = bootstrap;
-        if bootstrap.is_empty() && matches!(key.role, Role::Viewer) {
+        if bootstrap.is_empty() {
             if let Some(eid) = key.endpoint_id() {
                 if let Ok(pk) = iroh::EndpointId::from_bytes(&eid) {
-                    tracing::info!("no bootstrap given; using endpoint-id discovery");
-                    bootstrap.push(iroh::EndpointAddr::new(pk));
+                    if pk != self.node.endpoint.id() {
+                        tracing::info!("no bootstrap given; using endpoint-id discovery");
+                        bootstrap.push(iroh::EndpointAddr::new(pk));
+                    }
                 }
             }
         }
@@ -703,7 +1039,6 @@ impl Engine {
             ignore,
             last_seqno,
             last_quick_sig: 0,
-            last_seen_sig: 0,
             paused,
             publishing: false,
             roster,
@@ -758,17 +1093,18 @@ impl Engine {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| id.clone());
                 // An active progress entry means we're importing the folder now;
-                // report a moving percent. Otherwise fall back to the binary
-                // healthy/syncing state.
+                // report a moving percent. Otherwise derive health from whether
+                // this node holds all of the merged view's content: a master is
+                // the source (always 100); a viewer reports its present/total %.
                 let (status, percent, indexed_bytes, index_total) = if s.paused {
                     (seed_ipc::ShareStatus::Paused, 0, 0, 0)
                 } else if let Some(&(done, tot)) = progress.get(id) {
                     let pct = (done.min(tot) * 100).checked_div(tot).unwrap_or(0) as u8;
                     (seed_ipc::ShareStatus::Indexing, pct, done, tot)
-                } else if s.last_seqno > 0 {
+                } else if s.health >= 100 {
                     (seed_ipc::ShareStatus::Healthy, 100, 0, 0)
                 } else {
-                    (seed_ipc::ShareStatus::Syncing, 0, 0, 0)
+                    (seed_ipc::ShareStatus::Syncing, s.health, 0, 0)
                 };
                 let (online, total) = s.roster.lock().map(|r| r.counts()).unwrap_or((0, 0));
                 // Count this device itself as a peer (always present + online), so
@@ -891,50 +1227,43 @@ impl Engine {
     }
 
     /// Create a brand-new master share for `folder`, returning the (master,
-    /// viewer) key strings. Performs the initial publish. Convenience wrapper
-    /// that runs every phase under the caller's lock — used by tests and any
-    /// single-threaded caller. The daemon instead drives [`create_open`] →
-    /// [`PublishJob::run`] → [`create_finish`] so the heavy publish runs without
-    /// the engine lock held.
+    /// viewer) key strings. Performs the initial reconcile (imports the folder
+    /// into the replica). Convenience wrapper that runs every phase under the
+    /// caller's lock — used by tests. The daemon instead drives [`create_open`] →
+    /// [`ReconcileJob::run`] → [`finish_reconcile`] so the heavy import runs
+    /// without the engine lock held.
     ///
     /// [`create_open`]: Engine::create_open
-    /// [`create_finish`]: Engine::create_finish
+    /// [`finish_reconcile`]: Engine::finish_reconcile
     pub async fn create_share(
         &mut self,
         folder: &Path,
         ignore: Vec<String>,
     ) -> anyhow::Result<CreatedShare> {
         let (created, job) = self.create_open(folder, ignore).await?;
-        match job.run().await {
-            Ok(seqno) => {
-                self.create_finish(&created.share_id, seqno).await?;
-                Ok(created)
-            }
-            Err(e) => {
-                self.finish_publish(&created.share_id, None); // clear the guard
-                Err(e)
-            }
-        }
+        let outcome = job.run().await;
+        self.finish_reconcile(&created.share_id, outcome.ok());
+        Ok(created)
     }
 
-    /// Phase 1 of create: mint the key, open the replica, register the share
-    /// (marked publishing), and return a [`PublishJob`] for the initial publish.
-    /// The returned job borrows nothing from `self`, so the caller can drop the
-    /// engine lock before running it.
+    /// Phase 1 of create: mint the key, open the replica, persist the share, and
+    /// return a [`ReconcileJob`] for the initial import. The returned job borrows
+    /// nothing from `self`, so the caller can drop the engine lock before running.
     pub async fn create_open(
         &mut self,
         folder: &Path,
         ignore: Vec<String>,
-    ) -> anyhow::Result<(CreatedShare, PublishJob)> {
+    ) -> anyhow::Result<(CreatedShare, ReconcileJob)> {
         let key = ShareKey::generate_master().with_endpoint_id(self.node.endpoint_id_bytes());
         let share_id = key.share_id_hex();
         let state = self
-            .open_share(&key, folder, vec![], ignore, 0, false)
+            .open_share(&key, folder, vec![], ignore.clone(), 0, false)
             .await?;
         self.shares.insert(share_id.clone(), state);
+        self.persist_share(&key, folder, ignore, 0, false).await?;
         let job = self
-            .make_job(&share_id)?
-            .ok_or_else(|| anyhow!("internal: fresh master share is not publishable"))?;
+            .make_reconcile_job(&share_id)?
+            .ok_or_else(|| anyhow!("internal: fresh master share is not reconcilable"))?;
         Ok((
             CreatedShare {
                 share_id,
@@ -945,109 +1274,87 @@ impl Engine {
         ))
     }
 
-    /// Phase 3 of create: persist the share (routing the seed to the keystore)
-    /// with the post-publish seqno and clear the publishing guard.
-    pub async fn create_finish(&mut self, share_id: &str, seqno: u64) -> anyhow::Result<()> {
-        let (key, folder, ignore) = {
-            let s = self
-                .shares
-                .get(share_id)
-                .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
-            (s.key.clone(), s.folder.clone(), s.ignore.clone())
-        };
-        self.persist_share(&key, &folder, ignore, seqno, false)
-            .await?;
-        self.finish_publish(share_id, Some(seqno));
-        Ok(())
-    }
-
-    /// Build a [`PublishJob`] for a master share, marking it publishing so the
-    /// reconcile loop won't start a second concurrent publish. Returns `None`
-    /// for an unknown, paused, already-publishing, or viewer (non-master) share.
-    fn make_job(&mut self, share_id: &str) -> anyhow::Result<Option<PublishJob>> {
+    /// Build a [`ReconcileJob`] for a share, marking it busy so the reconcile loop
+    /// won't start a second concurrent pass. Returns `None` for an unknown, paused,
+    /// or already-running share. A first-tick debounce gates whether local edits
+    /// are treated as authoritative this round (so a file mid-copy isn't imported).
+    pub fn make_reconcile_job(&mut self, share_id: &str) -> anyhow::Result<Option<ReconcileJob>> {
         let blobs = self.node.blobs.clone();
+        let endpoint = self.node.endpoint.clone();
         let author = self.author;
         let progress = self.progress.clone();
+        let base = self.db.get_index(share_id).unwrap_or_default();
         let Some(state) = self.shares.get_mut(share_id) else {
             return Ok(None);
         };
         if state.paused || state.publishing {
             return Ok(None);
         }
-        let Some(signing) = state.key.signing_key() else {
-            return Ok(None); // viewer: nothing to publish
-        };
+        let is_master = matches!(state.key.role, Role::Master);
+        let providers = peer_providers(&state.key, &state.roster);
         state.publishing = true;
-        Ok(Some(PublishJob {
+        Ok(Some(ReconcileJob {
             share_id: share_id.to_string(),
             folder: state.folder.clone(),
-            ignore: state.ignore.clone(),
+            is_master,
+            configured_ignore: state.ignore.clone(),
             doc: state.doc.clone(),
             blobs,
-            signing,
-            share_id_bytes: state.key.share_id().to_vec(),
             author,
-            last_seqno: state.last_seqno,
+            endpoint,
+            providers,
+            base,
+            last_quick_sig: state.last_quick_sig,
             progress,
         }))
     }
 
-    /// Record the result of a [`PublishJob`] and clear its publishing guard.
-    /// `new_seqno` is `Some` on success (advances the watermark + persists the
-    /// seqno) and `None` on failure (just clears the guard).
-    pub fn finish_publish(&mut self, share_id: &str, new_seqno: Option<u64>) {
+    /// Commit a [`ReconcileJob`] result and clear its busy guard. `outcome` is
+    /// `Some` on success (persists the index mutations, health, and signature) and
+    /// `None` on failure (just clears the guard).
+    pub fn finish_reconcile(&mut self, share_id: &str, outcome: Option<ReconcileOutcome>) {
         if let Ok(mut m) = self.progress.lock() {
             m.remove(share_id);
+        }
+        let Some(out) = outcome else {
+            if let Some(state) = self.shares.get_mut(share_id) {
+                state.publishing = false;
+            }
+            return;
+        };
+        // Persist index mutations (path -> last-reconciled hash) outside the share
+        // borrow.
+        for (path, hash) in &out.index_sets {
+            let _ = self.db.set_index_entry(share_id, path, hash);
+        }
+        for path in &out.index_dels {
+            let _ = self.db.del_index_entry(share_id, path);
+        }
+        for h in out.reclaim {
+            self.reclaim_pending.insert(h);
         }
         let Some(state) = self.shares.get_mut(share_id) else {
             return;
         };
         state.publishing = false;
-        let Some(seqno) = new_seqno else {
-            return;
-        };
-        state.last_seqno = seqno;
-        state.last_updated = now_secs();
-        let (ig, _) = IgnoreSet::compile(&state.ignore);
-        let sig = scan::quick_signature(&state.folder, &ig);
-        state.last_quick_sig = sig;
-        let _ = self.db.set_seqno(share_id, seqno);
-        // Persist the signature so a restart skips re-importing an unchanged
-        // folder (an unpersisted sig would always look "changed" => republish).
-        let _ = self.db.set_quick_sig(share_id, sig);
-    }
-
-    /// Plan the master shares that need a republish (folder changed since last
-    /// publish), marking each publishing. The returned jobs borrow nothing from
-    /// `self`, so the caller drops the engine lock before running them.
-    pub fn plan_publishes(&mut self) -> Vec<PublishJob> {
-        let mut due: Vec<String> = Vec::new();
-        for (id, s) in self.shares.iter_mut() {
-            if s.paused || s.publishing || !matches!(s.key.role, Role::Master) {
-                continue;
-            }
-            let (ig, _) = IgnoreSet::compile(&s.ignore);
-            let sig = scan::quick_signature(&s.folder, &ig);
-            // Debounce: only publish once the folder has held the same signature
-            // across a full tick. A file still being written (e.g. a large ISO
-            // copying in) changes its size/mtime every tick, so it never looks
-            // stable and we don't repeatedly re-import a partial file or push
-            // half-written content to viewers — we wait until the copy settles.
-            let stable = sig == s.last_seen_sig;
-            s.last_seen_sig = sig;
-            if sig != s.last_quick_sig && stable {
-                due.push(id.clone());
-            }
+        state.health = out.health;
+        state.last_quick_sig = out.new_quick_sig;
+        let _ = self.db.set_quick_sig(share_id, out.new_quick_sig);
+        if out.changed {
+            state.last_seqno = state.last_seqno.saturating_add(1);
+            state.last_updated = now_secs();
+            let _ = self.db.set_seqno(share_id, state.last_seqno);
         }
-        due.into_iter()
-            .filter_map(|id| self.make_job(&id).ok().flatten())
-            .collect()
     }
 
-    /// Reconcile every (non-paused) viewer share against its latest manifest.
-    /// Returns the ids that changed. Viewers' content download/export streams
-    /// via the blob store, but this still holds the engine lock for now.
-    pub async fn apply_all_viewers(&mut self) -> Vec<String> {
+    /// Reconcile every non-paused share under the engine lock (convenience for
+    /// tests and the manual Publish IPC). Returns the ids that changed. The daemon
+    /// loop instead uses [`make_reconcile_job`] + [`ReconcileJob::run`] +
+    /// [`finish_reconcile`] to keep the heavy work off the lock.
+    ///
+    /// [`make_reconcile_job`]: Engine::make_reconcile_job
+    /// [`finish_reconcile`]: Engine::finish_reconcile
+    pub async fn reconcile_all(&mut self) -> Vec<String> {
         // Retry deleting any orphaned cross-volume blob copies whose handle iroh
         // has since released (drop the ones that are gone, keep the still-locked).
         if !self.reclaim_pending.is_empty() {
@@ -1055,20 +1362,37 @@ impl Engine {
             self.reclaim_pending
                 .retain(|&h| !try_reclaim_owned_data(&blobs_dir, h));
         }
-
         let ids: Vec<String> = self
             .shares
             .iter()
-            .filter(|(_, s)| !s.paused && matches!(s.key.role, Role::Viewer))
+            .filter(|(_, s)| !s.paused)
             .map(|(id, _)| id.clone())
             .collect();
         let mut changed = Vec::new();
         for id in ids {
-            if self.apply(&id).await.unwrap_or(false) {
+            if self.reconcile(&id).await.unwrap_or(false) {
                 changed.push(id);
             }
         }
         changed
+    }
+
+    /// Reconcile a single share under the engine lock.
+    pub async fn reconcile(&mut self, share_id: &str) -> anyhow::Result<bool> {
+        let Some(job) = self.make_reconcile_job(share_id)? else {
+            return Ok(false);
+        };
+        match job.run().await {
+            Ok(o) => {
+                let changed = o.changed;
+                self.finish_reconcile(share_id, Some(o));
+                Ok(changed)
+            }
+            Err(e) => {
+                self.finish_reconcile(share_id, None);
+                Err(e)
+            }
+        }
     }
 
     /// Persist a share to the DB, storing a master seed in the OS keystore when
@@ -1126,227 +1450,40 @@ impl Engine {
         Ok(share_id)
     }
 
-    /// (Master) Scan the folder and publish a new signed manifest + content.
-    /// Convenience wrapper that runs the whole publish under the caller's lock;
-    /// used by tests and the manual `Publish` IPC. No-op for an unknown, paused,
-    /// already-publishing, or viewer share. The daemon's reconcile loop instead
-    /// uses [`plan_publishes`] + [`PublishJob::run`] + [`finish_publish`] to keep
-    /// the heavy work off the engine lock.
-    ///
-    /// [`plan_publishes`]: Engine::plan_publishes
-    /// [`finish_publish`]: Engine::finish_publish
+    /// Ids of every share the engine currently holds (for the daemon loop to
+    /// schedule per-share reconciles).
+    pub fn share_ids(&self) -> Vec<String> {
+        self.shares.keys().cloned().collect()
+    }
+
+    /// Retry deleting any orphaned cross-volume blob copies whose file handle iroh
+    /// has since released. Call once per reconcile tick (cheap when empty).
+    pub fn retry_reclaims(&mut self) {
+        if self.reclaim_pending.is_empty() {
+            return;
+        }
+        let blobs_dir = self.node.blobs_dir.clone();
+        self.reclaim_pending
+            .retain(|&h| !try_reclaim_owned_data(&blobs_dir, h));
+    }
+
+    /// Force a reconcile of one share (manual `Publish` IPC / tests). Thin wrapper
+    /// over [`reconcile`](Engine::reconcile); no-op for a paused/unknown share.
     pub async fn publish(&mut self, share_id: &str) -> anyhow::Result<()> {
-        let Some(job) = self.make_job(share_id)? else {
-            return Ok(());
-        };
-        let result = job.run().await;
-        self.finish_publish(share_id, result.as_ref().ok().copied());
-        result.map(|_| ())
+        self.reconcile(share_id).await.map(|_| ())
     }
 
-    /// (Master) Publish only if the folder changed since the last publish, using
-    /// a cheap (path,size,mtime) signature. Returns whether a publish happened.
-    pub async fn publish_if_changed(&mut self, share_id: &str) -> anyhow::Result<bool> {
-        let changed = {
-            let state = self
-                .shares
-                .get(share_id)
-                .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
-            let sig = scan::quick_signature(&state.folder, &state.ignore_set());
-            sig != state.last_quick_sig
-        };
-        if changed {
-            self.publish(share_id).await?;
-        }
-        Ok(changed)
-    }
-
-    /// (Viewer/mirror) Reconcile the local folder to the latest verified
-    /// manifest. Returns `Ok(true)` if a new manifest was applied, `Ok(false)`
-    /// if nothing new was ready yet (content still downloading, or already
-    /// up to date).
+    /// Back-compat alias used by tests: reconcile one share. In the multi-master
+    /// model every node reconciles the same way, so this is just [`reconcile`].
+    ///
+    /// [`reconcile`]: Engine::reconcile
     pub async fn apply(&mut self, share_id: &str) -> anyhow::Result<bool> {
-        let state = self
-            .shares
-            .get_mut(share_id)
-            .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
-
-        // 1. Fetch the manifest control entry.
-        let Some(manifest_entry) = state
-            .doc
-            .get_one(Query::single_latest_per_key().key_exact(MANIFEST_KEY))
-            .await?
-        else {
-            return Ok(false); // not synced yet
-        };
-        let mhash = manifest_entry.content_hash();
-        if !self.node.blobs.blobs().has(mhash).await? {
-            return Ok(false); // manifest content still downloading
-        }
-        let bytes = self.node.blobs.blobs().get_bytes(mhash).await?;
-        let signed: SignedManifest =
-            ciborium::from_reader(bytes.as_ref()).context("decode signed manifest")?;
-
-        // 2. Verify signature/validity (not seqno yet) against the pinned master.
-        let pinned = state.key.master_pub;
-        let share_id_bytes = state.key.share_id();
-        let manifest = manifest::verify_signed(&signed, &pinned, &share_id_bytes, now_secs())
-            .map_err(|e| anyhow!("manifest verification failed: {e}"))?;
-        // Anti-rollback: a strictly older manifest is an attack; reject it. An
-        // equal seqno is the manifest we already have — still reconcile disk
-        // (to revert local drift), but don't advance the watermark.
-        if manifest.seqno < state.last_seqno {
-            return Err(anyhow!(
-                "rollback: manifest seqno {} < watermark {}",
-                manifest.seqno,
-                state.last_seqno
-            ));
-        }
-        let is_new = manifest.seqno > state.last_seqno;
-        // Self-consistency: signed root must match the signed file list.
-        manifest::verify_root(&manifest, &manifest.files).map_err(|e| anyhow!("root: {e}"))?;
-
-        // 3. Ensure every listed file's content is present before mutating disk,
-        //    and compute this viewer's sync health (present / total bytes) — set on
-        //    the share so an in-progress or behind viewer reports a partial %, not
-        //    just 0/100. (A viewer that hasn't downloaded the newest manifest's
-        //    files reads <100 of *that* manifest, so this also captures "behind".)
-        let mut desired: HashSet<String> = HashSet::new();
-        let mut total_bytes: u64 = 0;
-        let mut present_bytes: u64 = 0;
-        let mut all_present = true;
-        for fe in &manifest.files {
-            desired.insert(fe.path.clone());
-            total_bytes += fe.size;
-            if fe.size == 0 {
-                continue; // empty files carry no blob; always counted present
-            }
-            let arr: [u8; 32] = fe.hash.as_slice().try_into().context("bad hash len")?;
-            if self.node.blobs.blobs().has(Hash::from(arr)).await? {
-                present_bytes += fe.size;
-            } else {
-                all_present = false;
-            }
-        }
-        state.health = (present_bytes.min(total_bytes) * 100)
-            .checked_div(total_bytes)
-            .unwrap_or(100) as u8;
-        if !all_present {
-            return Ok(false); // some content still downloading; retry later
-        }
-
-        // 4. Materialize each listed file whose local content differs.
-        //    - unchanged file: skipped (steady state).
-        //    - missing file: moved into place by *reference* (the store keeps
-        //      only the outboard and points at the mirror file — 1x on disk),
-        //      so a viewer never holds a second copy of the content.
-        //    - file that exists but diverges (edited/corrupted): its referenced
-        //      blob is now stale and can't self-repair locally, so we re-fetch
-        //      the verified bytes from a peer and rewrite it — fully automatic.
-        let endpoint = self.node.endpoint.clone();
-        for fe in &manifest.files {
-            let target = state.folder.join(rel_to_native(&fe.path));
-            // Empty files ride the manifest only (iroh-docs can't carry them);
-            // create them directly rather than through the blob store.
-            if fe.size == 0 {
-                let present = std::fs::metadata(&target)
-                    .map(|m| m.is_file() && m.len() == 0)
-                    .unwrap_or(false);
-                if !present {
-                    if let Some(parent) = target.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::File::create(&target)?;
-                }
-                continue;
-            }
-            if file_matches(&target, &fe.hash) {
-                continue;
-            }
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let arr: [u8; 32] = fe.hash.as_slice().try_into().context("bad hash len")?;
-            let hash = Hash::from(arr);
-
-            if !target.exists() {
-                // First sync (owned blob) or a deleted file: move the blob into
-                // place by reference. No GC is enabled, so no protecting tag is
-                // needed during the move.
-                if let Err(e) = self
-                    .node
-                    .blobs
-                    .blobs()
-                    .export_with_opts(ExportOptions {
-                        hash,
-                        mode: ExportMode::TryReference,
-                        target: target.clone(),
-                    })
-                    .await
-                {
-                    tracing::debug!("reference-export {} failed; will self-heal: {e}", fe.path);
-                }
-            }
-
-            if file_matches(&target, &fe.hash) {
-                // The export referenced the mirror file (entry is now External).
-                // Across volumes it left the downloaded copy behind; queue it for
-                // reclaim so the viewer ends up 1× on any drive layout (iroh holds
-                // the file handle briefly, so the deletion is retried below).
-                self.reclaim_pending.insert(hash);
-            } else {
-                // Either the export couldn't restore it, or an existing file was
-                // edited/corrupted. Do NOT re-export here: when the store already
-                // references this same path, exporting would copy the corrupt
-                // file onto itself. Re-fetch a verified copy from a peer instead.
-                let providers = peer_providers(&state.key, &state.roster);
-                self_heal_file(&endpoint, &providers, hash, &target)
-                    .await
-                    .with_context(|| format!("self-heal {}", fe.path))?;
-            }
-        }
-
-        // 5. Delete anything on disk not in the manifest (deletion propagation
-        //    + revert of viewer-created/edited files).
-        let ignore = state.ignore_set();
-        for sf in scan::scan(&state.folder, &ignore)? {
-            if !desired.contains(&sf.entry.path) {
-                let _ = std::fs::remove_file(&sf.abs_path);
-            }
-        }
-        prune_empty_dirs(&state.folder);
-
-        if is_new {
-            state.last_seqno = manifest.seqno;
-            state.last_updated = now_secs();
-            let seqno = manifest.seqno;
-            self.db.set_seqno(share_id, seqno)?;
-        }
-        Ok(is_new)
+        self.reconcile(share_id).await
     }
 
-    /// Reconcile every (non-paused) share: viewers apply, masters publish on
-    /// change. Returns the ids of shares that changed (for status events).
-    pub async fn reconcile_all(&mut self) -> Vec<String> {
-        let plan: Vec<(String, Role, bool)> = self
-            .shares
-            .iter()
-            .map(|(id, s)| (id.clone(), s.key.role, s.paused))
-            .collect();
-        let mut changed = Vec::new();
-        for (id, role, paused) in plan {
-            if paused {
-                continue;
-            }
-            let did = match role {
-                Role::Viewer => self.apply(&id).await.unwrap_or(false),
-                Role::Master => self.publish_if_changed(&id).await.unwrap_or(false),
-            };
-            if did {
-                changed.push(id);
-            }
-        }
-        changed
+    /// Back-compat alias used by tests: reconcile every non-paused share.
+    pub async fn apply_all_viewers(&mut self) -> Vec<String> {
+        self.reconcile_all().await
     }
 
     /// Pause or resume a share (persisted; the reconcile loop skips paused shares).

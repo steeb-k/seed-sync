@@ -8,6 +8,7 @@
 //! iroh `node.key` that already lives there. Moving the seed into the OS keystore
 //! (Windows DPAPI / Secret Service) is a planned hardening pass.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -60,6 +61,12 @@ impl Db {
              CREATE TABLE IF NOT EXISTS settings (
                  k TEXT PRIMARY KEY,
                  v TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS sync_index (
+                 share_id TEXT NOT NULL,
+                 path     TEXT NOT NULL,
+                 hash     BLOB NOT NULL,
+                 PRIMARY KEY (share_id, path)
              );",
         )?;
         // Migration for DBs created before `quick_sig` existed; the error when the
@@ -147,10 +154,42 @@ impl Db {
         Ok(())
     }
 
-    /// Remove a share row.
+    /// Remove a share row (and its per-path sync index).
     pub fn remove_share(&self, share_id: &str) -> anyhow::Result<()> {
-        self.lock()
-            .execute("DELETE FROM shares WHERE share_id=?1", [share_id])?;
+        let conn = self.lock();
+        conn.execute("DELETE FROM shares WHERE share_id=?1", [share_id])?;
+        conn.execute("DELETE FROM sync_index WHERE share_id=?1", [share_id])?;
+        Ok(())
+    }
+
+    /// Load the per-path sync index (base state: `path -> last-reconciled hash`)
+    /// for a share. Used by the unified reconcile to tell a new local add from a
+    /// remotely-deleted file, and a local delete from a not-yet-materialized add.
+    pub fn get_index(&self, share_id: &str) -> anyhow::Result<HashMap<String, Vec<u8>>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT path, hash FROM sync_index WHERE share_id=?1")?;
+        let rows = stmt.query_map([share_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })?;
+        Ok(rows.collect::<Result<HashMap<_, _>, _>>()?)
+    }
+
+    /// Record (insert or replace) the reconciled hash for one path.
+    pub fn set_index_entry(&self, share_id: &str, path: &str, hash: &[u8]) -> anyhow::Result<()> {
+        self.lock().execute(
+            "INSERT INTO sync_index (share_id, path, hash) VALUES (?1, ?2, ?3)
+             ON CONFLICT(share_id, path) DO UPDATE SET hash=excluded.hash",
+            rusqlite::params![share_id, path, hash],
+        )?;
+        Ok(())
+    }
+
+    /// Drop one path from a share's sync index (after a delete reconciled).
+    pub fn del_index_entry(&self, share_id: &str, path: &str) -> anyhow::Result<()> {
+        self.lock().execute(
+            "DELETE FROM sync_index WHERE share_id=?1 AND path=?2",
+            rusqlite::params![share_id, path],
+        )?;
         Ok(())
     }
 
