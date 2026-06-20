@@ -35,7 +35,10 @@ STAGE="$(cd "$STAGE" && pwd)"
 # tarball tree; "MacOS" when STAGE is a .app's Contents/ (set BUNDLE_BINDIR=MacOS).
 BINDIR="${BUNDLE_BINDIR:-bin}"
 BIN="$STAGE/$BINDIR"
-BREW="$(brew --prefix)"
+# Homebrew prefix to source dylibs from. Defaults to the active brew (arm64
+# /opt/homebrew); BUNDLE_BREW=/usr/local points it at the x86_64 brew for the
+# universal2 x86_64 pass.
+BREW="${BUNDLE_BREW:-$(brew --prefix)}"
 LIBDIR="$STAGE/lib"
 LOADER_REL="lib/gdk-pixbuf-2.0/2.10.0/loaders"
 LOADERDIR="$STAGE/$LOADER_REL"

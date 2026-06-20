@@ -563,3 +563,21 @@ package}-macos.sh`, `packaging/macos/` (wrapper + 3 plists + `Info.plist` + `web
   isn't published to `seed-sync-binaries` yet (so the live `curl|sh` install won't find it until a release
   tag with the macos job runs), and the hosted `steeb-k.github.io/seed-install.sh` needs the unified
   cross-OS bootstrap. The sync matrix (item 6) is untouched.
+
+### [MACOS] 2026-06-20 — engine + sync testing (macOS-local, thorough)
+The headless coverage and a real-binary dry-run all pass on Apple Silicon, so the **sync engine has
+parity on macOS** (the cross-OS *live* runs Mac↔Win / Mac↔Linux still need the other machines).
+- ✅ **Unit + integration tests:** `cargo test --workspace -- --include-ignored` ALL GREEN — 18 seed-core
+  unit, 2 seed-ipc, plus the real-endpoint suites: `loopback` (6: `master_viewer_mirror_lifecycle`,
+  `empty_files_sync`, `viewer_stores_by_reference_not_copy`, `viewer_auto_heals_corrupted_file`,
+  `referenced_viewer_serves_peers`, **`two_masters_converge_bidirectionally`**), `presence`, `discovery`,
+  `persistence` (incl. `master_keeps_write_capability_after_restart`), `docs_spike`, `loopback_ipc`.
+- ✅ **Stability:** the `loopback` suite ran **4× clean** (the full `--include-ignored` pass + 3 repeats,
+  ~10s each, 0 failures) — none of the n0-DNS timing flakiness the sandbox sometimes shows on Linux.
+- ✅ **Real 2-daemon dry-run (release binaries, not the test harness):** master created a 5 MB share;
+  a viewer added it with the master's `node-addr` bootstrap → **mirrored byte-identical in ~2 s**,
+  **1× dedup** (viewer blob store 1.0 MB outboard-only, not a 2nd 5 MB copy), and **self-heal** restored
+  a corrupted mirror file to the exact original SHA-256 in ~2 s. `seed-cli create/add/reveal/list/
+  node-addr` + `--data-dir`/`--socket` isolation all work.
+- ⏳ **Needs peers (human-coordinated):** the 🔀 cross-OS rows — Mac↔Windows and Mac↔Linux mirror /
+  self-heal / dedup / multi-master converge / presence — are the remaining sync-matrix work (item 6).
