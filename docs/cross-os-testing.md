@@ -579,5 +579,12 @@ parity on macOS** (the cross-OS *live* runs Mac↔Win / Mac↔Linux still need t
   **1× dedup** (viewer blob store 1.0 MB outboard-only, not a 2nd 5 MB copy), and **self-heal** restored
   a corrupted mirror file to the exact original SHA-256 in ~2 s. `seed-cli create/add/reveal/list/
   node-addr` + `--data-dir`/`--socket` isolation all work.
+- ✅ **Real multi-master dry-run (the gap missed earlier on Win/Linux):** two daemons both adding the
+  share with the **master key** (B bootstrapped to A) → **bidirectional add converges in 2 s** (a.txt
+  from A + b.txt from B land in both folders), **delete propagates** (rm on A clears B in 3 s),
+  **restart-reconnect works** (killed + restarted B re-converged and pulled a fresh A change in 4 s —
+  this was the Linux headline bug where a restarted co-master vanished), and a third **viewer-key node
+  mirrors the merged state and reverts rogue local edits** in 2 s. (LWW same-file conflict is covered by
+  the headless `two_masters_converge_bidirectionally`.)
 - ⏳ **Needs peers (human-coordinated):** the 🔀 cross-OS rows — Mac↔Windows and Mac↔Linux mirror /
   self-heal / dedup / multi-master converge / presence — are the remaining sync-matrix work (item 6).
