@@ -493,7 +493,10 @@ calls `seed-daemon run` directly, like systemd), keyring `apple-native` (Keychai
   `launchctl bootstrap/bootout`. Installs a **`SEED Sync.app`** bundle to `~/Applications` (Dock +
   Applications icon, no root), CLI symlinks in `~/.local/bin`. End-to-end install + IPC roundtrip
   (`seed-cli list`/`node-addr`) verified; update agent reached the live repo and reported "up to date".
-- ⏳ **4. Universal2** 🍎 — still arm64-only (`…macos-arm64.tar.gz`). `lipo` x86_64 slice = phase 2.
+- ✅ **4. Universal2** 🍎 — `package-macos.sh` auto-builds universal when an x86_64 Homebrew (`/usr/local`)
+  + the x86_64 Rust target are present: builds both slices, `lipo`s every Mach-O. Verified — the
+  `…macos-universal.tar.gz` has **fat (arm64+x86_64) binaries + all 57 dylibs**, both slices run (native
+  + Rosetta), and **both are self-contained under a sandbox denying both brew prefixes**.
 - 🟡 **5. CI** 🍎 — `release.yml` macos-14 job added (brew gtk4+libadwaita → `package-macos.sh` → publish
   with the same tag/version guard). **Not yet run on a runner** — validate on the first macOS release tag.
 - ⏳ **6. Sync matrix** 🔀 — once published, fold macOS into the Windows⇄Linux⇄macOS sync tests (mirror,

@@ -1,10 +1,11 @@
 # macOS packaging, distribution & auto-update — maintainer guide
 
-> **Status: BUILT (arm64), 2026-06-20.** Bring-up checklist 0–3 are done and verified on Apple
+> **Status: BUILT (universal2), 2026-06-20.** Bring-up checklist 0–4 are done and verified on Apple
 > Silicon (see `docs/cross-os-testing.md` → [MACOS]). The build → bundle → `.app` → install →
-> launchd → update flow works end-to-end, including a `sandbox-exec` "no Homebrew" proof. Still
-> open: universal2 (x86_64 `lipo`), running the CI job on a runner + publishing the macOS asset to
-> `seed-sync-binaries`, and the unified hosted bootstrap. One design change from the original plan:
+> launchd → update flow works end-to-end, including a `sandbox-exec` "no Homebrew" proof. **Universal2
+> (arm64 + x86_64) is built and verified** (needs a second x86_64 Homebrew at `/usr/local`). Still
+> open: running the CI job on a runner + publishing the macOS asset to `seed-sync-binaries`, the unified
+> hosted bootstrap, and the live cross-OS sync runs. One design change from the original plan:
 > we ship a **`SEED Sync.app` bundle _inside_ the curl|sh tarball** (installed to `~/Applications`)
 > rather than loose binaries — this keeps the quarantine dodge while giving a real Dock/Applications
 > icon. Details below; `_(planned)_` markers remain only on what's genuinely not built.
@@ -58,7 +59,7 @@ version bump per release**. Asset name convention: **`seed-sync-<ver>-macos-univ
 
 | File | Purpose |
 |---|---|
-| `scripts/package-macos.sh` ✅ | The macOS analog of `scripts/package-linux.sh`: `cargo build --release`, build the **`SEED Sync.app`** (binaries → `Contents/MacOS`), run the bundler over `Contents/`, write `Info.plist` + `Resources/AppIcon.icns` (sips + iconutil from `icon/appIcon.png`), seal the bundle, tar `dist/seed-sync-<ver>-macos-<arch>.tar.gz`. `--skip-build` to repackage. arm64 today; universal `lipo` = phase 2. |
+| `scripts/package-macos.sh` ✅ | The macOS analog of `scripts/package-linux.sh`: `cargo build --release`, build the **`SEED Sync.app`** (binaries → `Contents/MacOS`), run the bundler over `Contents/`, write `Info.plist` + `Resources/AppIcon.icns` (sips + iconutil from `icon/appIcon.png`), seal the bundle, tar `dist/seed-sync-<ver>-macos-<arch>.tar.gz`. `--skip-build` to repackage. Builds universal2 when an x86_64 brew at `/usr/local` is present, else arm64. |
 | `scripts/bundle-gtk-macos.sh` ✅ | The hard part: walk the `seed-gui` otool closure + the gdk-pixbuf/librsvg loader modules, copy every non-system dylib into `lib/`, rewrite install names to `@executable_path/../lib` (handles absolute `/opt/homebrew/*` **and** `@rpath/*` — librsvg uses `@rpath`), regenerate `loaders.cache`, compile GSettings schemas, bundle the fontconfig config, **ad-hoc re-sign** inside-out. `BUNDLE_BINDIR=MacOS` targets a `.app`'s `Contents/`. No icon theme needed (GTK4 embeds its icons). |
 | `packaging/macos/seed-sync` ✅ | The wrapper — install/update/uninstall/status, per-user, via `launchctl bootstrap/bootout`. Installs the `.app` to `~/Applications`, symlinks the CLI into `~/.local/bin`. |
 | `packaging/macos/Info.plist` ✅ | App bundle metadata (`CFBundleExecutable=seed-gui`, `CFBundleIconFile=AppIcon`, identifier, `__VERSION__` rewritten from Cargo). What makes NSBundle resolve → the Dock/Applications icon. |
@@ -124,16 +125,23 @@ resolve through a symlink — `setup_runtime_env` calls `fs::canonicalize` so th
    --verify` passes; the app launches with the Homebrew prefix removed/renamed (the real test that
    nothing leaks to the system GTK).
 
-## Universal2 (phased) _(planned)_
+## Universal2 (built)
 
-- **Phase 1:** arm64-only (`aarch64-apple-darwin`). Prove build → bundle → relocate → re-sign →
-  launch → `curl | sh` install → launchd → update, end to end. Asset temporarily `…macos-arm64.tar.gz`.
-- **Phase 2:** add the x86_64 slice. **Homebrew GTK is single-arch**, so universal GTK requires both
-  arch slices of every dylib. Options:
-  - **Two Homebrew prefixes** — arm64 (`/opt/homebrew`) + x86_64 under Rosetta (`/usr/local`), then
-    `lipo -create arm64.dylib x86_64.dylib -output universal.dylib` per dylib (and per binary).
-  - **From-source universal GTK** (gvsbuild-grade effort) — last resort.
-  - Re-sign after `lipo` (lipo invalidates signatures too). Switch asset to `…macos-universal.tar.gz`.
+`package-macos.sh` builds universal when an x86_64 Homebrew (`/usr/local`) + the x86_64 Rust target are
+present (else it falls back to arm64-only). It builds both Rust slices, bundles each arch's GTK closure
+separately, then `lipo`s every Mach-O (binaries + dylibs + pixbuf loaders) into the arm64 `.app` and
+re-signs inside-out (lipo invalidates the ad-hoc signature). Verified: fat (arm64+x86_64) binaries +
+all 57 dylibs, both slices run (native + Rosetta), both self-contained under a no-Homebrew sandbox.
+
+- **Two Homebrew prefixes** — arm64 (`/opt/homebrew`) auto, x86_64 under Rosetta at `/usr/local`
+  (bootstrap needs sudo; `arch -x86_64 brew install gtk4 libadwaita pkg-config`). Use the **same GTK
+  version** in both (here 4.22.4 / libadwaita 1.9.1) so the dylib sets match for `lipo`.
+- **x86_64 cross-build pkg-config:** set `PKG_CONFIG_LIBDIR` (replaces the default search → no arm64
+  leak) to the x86_64 brew's per-formula `opt/*/lib/pkgconfig` (keg-only) + `lib`/`share/pkgconfig` +
+  `Homebrew/Library/Homebrew/os/mac/pkgconfig/<macOS-major>` (system-lib stubs: zlib/libffi/expat/…),
+  plus `PKG_CONFIG_ALLOW_CROSS=1`. Without the per-version stubs dir, gobject/cairo/fontconfig fail to
+  resolve their system deps.
+- **CI:** an arm64 runner only ships arm64 unless it sets up the x86_64 Homebrew/Rosetta prefix too.
 
 ## CI (built — not yet run on a runner)
 
@@ -173,9 +181,8 @@ from Phase 2). **Validate on the first macOS release tag** — the runner's Xcod
 
 ## Future work (not built)
 
-- **Universal2** — `lipo` the x86_64 slice in (Phase 2 above); switch the asset to `…macos-universal`.
-- **Unified hosted bootstrap** — `steeb-k.github.io/seed-install.sh` should detect the OS and serve the
-  Linux or macOS path from one script (`packaging/web-install.sh`).
+- **Unified hosted bootstrap** — mirror `packaging/web-install.sh` (built, OS-detecting) to
+  `steeb-k.github.io/seed-install.sh`, replacing the Linux-only one.
 - Developer ID signing + **notarization** (clean install from any source, incl. a future `.dmg`) —
   needs an Apple Developer account ($99/yr). Keeps ad-hoc as the default; notarize on top.
 - A `.dmg` for drag-to-Applications (would need notarization; the `.app` already exists).
