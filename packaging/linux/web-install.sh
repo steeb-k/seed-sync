@@ -28,9 +28,12 @@ if have seed-daemon; then
 fi
 
 # Pick the action: CLI arg > $SEED_ACTION > interactive menu > sane default.
+# Probe for a real terminal in a SUBSHELL: a redirection-only `exec` that fails
+# would exit a non-interactive shell, and `{ }` braces don't contain it — only a
+# subshell does. (`[ -r /dev/tty ]` lies: it's true even with no controlling tty.)
 ACTION="${1:-${SEED_ACTION:-}}"
 if [ -z "$ACTION" ]; then
-  if [ -r /dev/tty ]; then
+  if (exec 3</dev/tty) 2>/dev/null; then
     say "S.E.E.D. (Seed Sync)"
     if [ -n "$INSTALLED" ]; then
       say "  Installed: v$INSTALLED"
