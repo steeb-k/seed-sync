@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=S.E.E.D.
+Name=SEED Sync
 GenericName=Folder Sync
 Comment=Secure Environment Exchange Daemon — P2P folder sync
 Exec=__BIN__/seed-gui
