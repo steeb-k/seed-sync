@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.steeb_k.SeedSync</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>S.E.E.D.</name>
+  <summary>Secure Environment Exchange Daemon — peer-to-peer folder sync</summary>
+  <description>
+    <p>
+      S.E.E.D. keeps folders mirrored across your machines over a direct,
+      end-to-end encrypted peer-to-peer connection (built on iroh). A master
+      signs a versioned manifest; viewers verify and mirror it exactly.
+    </p>
+    <p>
+      Runs a per-user background daemon with a GTK4/Libadwaita front-end and a
+      system-tray presence indicator.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.steeb_k.SeedSync.desktop</launchable>
+  <categories>
+    <category>Network</category>
+    <category>FileTransfer</category>
+    <category>Utility</category>
+  </categories>
+  <url type="homepage">https://github.com/steeb-k/seed-sync-gtk</url>
+  <provides>
+    <binary>seed-gui</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+</component>

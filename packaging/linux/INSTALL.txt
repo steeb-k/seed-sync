@@ -1,0 +1,37 @@
+S.E.E.D. (Seed Sync) — Linux install
+====================================
+
+Per-user install, no root required.
+
+    ./install.sh
+
+This installs to your home directory:
+  ~/.local/bin/                 seed-daemon, seed-gui, seed-cli, seed-sync-update
+  ~/.config/systemd/user/       seed-daemon.service, seed-sync-update.{service,timer}
+  ~/.local/share/applications/  S.E.E.D. launcher
+  ~/.local/share/icons/         app icon (hicolor)
+
+The sync daemon is started immediately and auto-starts at every login
+(systemd --user). A daily timer checks for updates and applies them
+automatically. Launch "S.E.E.D." from your app menu for the GUI.
+
+Options:
+  ./install.sh --no-auto-update    don't enable the daily update timer
+  ./install.sh --no-gui-autostart  don't auto-launch the tray GUI at login
+
+Updating manually (the timer does this for you):
+  seed-sync-update            check + apply a newer release if available
+  seed-sync-update --check    report only, don't change anything
+
+Uninstall:
+  ./uninstall.sh              remove the app (keeps your synced-share settings)
+  ./uninstall.sh --purge      also remove ~/.local/share/seedsync data
+
+Requirements (must already be present on the system):
+  GTK 4.10+, libadwaita 1.4+, libdbus-1
+  Debian/Ubuntu: libgtk-4-1 libadwaita-1-0 libdbus-1-3
+  Fedora:        gtk4 libadwaita dbus-libs
+  Arch:          gtk4 libadwaita dbus
+install.sh runs a quick check and tells you if anything is missing.
+
+Note: ensure ~/.local/bin is on your PATH (most desktops add it automatically).

@@ -309,3 +309,41 @@ all verified. Remaining M4 work is non-engine: deferred MSI code-signing + WixUI
   file leaves the empty dir on the master but the viewer never materializes it. Benign; `diff -r`
   flags it. (Empty *files* now ride the signed manifest per `5bdfa4b` — separate from empty dirs.)
   Also `seed-cli publish` requires `--share <id>` (reconcile loop auto-republishes anyway).
+
+## Distribution & auto-update — release channel (2026-06-19)
+
+A shared release/update channel was designed on the Linux side; this section is the **handoff
+for the Windows instance** to build its half. Full Linux design lives in `docs/linux-packaging.md`.
+
+**The model (both OSes):**
+- Built artifacts are published to a **separate PUBLIC repo `steeb-k/seed-sync-binaries`** (source
+  stays private in `seed-sync-gtk`). One **GitHub Release per version tag `vX.Y.Z`**; each release
+  carries **both** OSes' assets — the Linux `…linux-x86_64.tar.gz` (attached by the main repo's
+  `release.yml`) and the Windows artifact (MSI or versioned zip — **the Windows side attaches this to
+  the same release/tag**).
+- Public repo ⇒ updaters download with **no auth**.
+- **Version is the source of truth:** the updater compares the installed version
+  (`seed-daemon --version` / `seed-daemon.exe --version`, from clap) to the latest release tag, and
+  only updates when the tag is newer. ⇒ **bump `[workspace.package].version` in `Cargo.toml` and tag
+  `vX.Y.Z` per release** (the Linux `release.yml` fails the build if the tag ≠ Cargo version).
+- **Publishing is cross-repo**, so it needs a PAT secret **`SEED_BINARIES_TOKEN`** with
+  `contents: write` on `seed-sync-binaries` (the default `GITHUB_TOKEN` can't write another repo).
+
+**Linux side (DONE — for reference / parity):** `packaging/linux/` + `scripts/package-linux.sh` +
+`.github/workflows/release.yml`. Per-user install (`install.sh`), daemon as `systemd --user`,
+`seed-sync-update` engine driven by a `systemd --user` **timer** (daily) that does stop-daemon →
+swap binaries → restart.
+
+**[WIN] TODO — mirror this on Windows:**
+1. **Publish step:** have the Windows build attach its MSI/zip to the `seed-sync-binaries` release for
+   the tag (same release the Linux job creates — `softprops/action-gh-release` upserts, so order doesn't
+   matter). Reuse the `SEED_BINARIES_TOKEN` secret. (Windows GUI+MSI build automation in CI is still
+   pending per earlier notes; until then the artifact can be attached manually to the release.)
+2. **Windows updater** mirroring `seed-sync-update`: query the latest release (public, no auth), compare
+   `seed-daemon.exe --version`, download the Windows artifact, **stop the `SeedSyncDaemon` service**, swap
+   binaries (or run the MSI silently with `msiexec /i … /qn`), restart the service. Mind the in-use GTK
+   runtime DLLs (the service must be stopped before replacing them).
+3. **Scheduled Task** as the Windows analog of the systemd timer — periodic auto-update check (e.g. daily),
+   running the updater for the installed user/service.
+4. Decide MSI-vs-zip: the MSI already does service registration + shortcuts; a silent MSI upgrade is the
+   natural "apply" step (the WiX `MajorUpgrade`/same-version-upgrade handling is already in place).

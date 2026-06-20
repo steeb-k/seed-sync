@@ -1,0 +1,54 @@
+name: Release
+
+# Cuts a Linux release: builds the tarball and publishes it to the PUBLIC
+# artifact repo (steeb-k/seed-sync-binaries) as a GitHub Release for the tag.
+# The Windows side attaches its artifact to the SAME release (see
+# docs/cross-os-testing.md). Trigger by pushing a version tag:
+#
+#     git tag v0.1.1 && git push origin v0.1.1
+#
+# REQUIRED SECRET: SEED_BINARIES_TOKEN — a PAT (or fine-grained token) with
+# `contents: write` on steeb-k/seed-sync-binaries. The default GITHUB_TOKEN
+# cannot write to another repository.
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux tarball -> seed-sync-binaries
+    # ubuntu-22.04 deliberately: older glibc/GTK ABI => the tarball runs on a
+    # wider range of target distros.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GTK4 + Libadwaita + D-Bus + ImageMagick
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libdbus-1-dev imagemagick
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the release tarball
+        run: scripts/package-linux.sh
+      - name: Sanity-check the tag matches Cargo.toml
+        run: |
+          CARGO_VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          if [ "$CARGO_VER" != "$TAG_VER" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VER"
+            exit 1
+          fi
+      - name: Publish to seed-sync-binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: steeb-k/seed-sync-binaries
+          token: ${{ secrets.SEED_BINARIES_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          files: dist/*.tar.gz
+          # Don't clobber a Windows asset already attached to this release.
+          fail_on_unmatched_files: true

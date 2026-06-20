@@ -33,8 +33,27 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-Windows distribution (gvsbuild GTK bundle + MSI + service registration) is a
-later milestone.
+## Installing (Linux)
+
+Releases are published as a portable tarball on the public
+[`seed-sync-binaries`](https://github.com/steeb-k/seed-sync-binaries) repo.
+Download the latest `seed-sync-<ver>-linux-x86_64.tar.gz`, then:
+
+```bash
+tar xzf seed-sync-*-linux-x86_64.tar.gz && cd seed-sync-*-linux-x86_64
+./install.sh
+```
+
+This is a per-user install (no root): it drops the binaries in `~/.local/bin`,
+runs the daemon as a `systemd --user` service (auto-starts at login), and enables
+a daily auto-update timer. Launch **S.E.E.D.** from your app menu. Requires
+GTK 4.10+, libadwaita 1.4+, and libdbus-1 to be present on the system.
+
+Manual update: `seed-sync-update` (the timer does this automatically). Uninstall:
+`./uninstall.sh` (add `--purge` to also remove synced data).
+
+Maintainers: see **`docs/linux-packaging.md`** for how releases, the tarball, and
+auto-update work, and **`docs/windows-packaging.md`** for the MSI side.
 
 ## Permission model
 

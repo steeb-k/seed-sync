@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=S.E.E.D.
+GenericName=Folder Sync
+Comment=Secure Environment Exchange Daemon — P2P folder sync
+Exec=__BIN__/seed-gui
+Icon=io.github.steeb_k.SeedSync
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+Keywords=sync;p2p;folder;iroh;mirror;
+StartupNotify=true
+StartupWMClass=io.github.steeb_k.SeedSync

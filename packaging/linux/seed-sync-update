@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# S.E.E.D. install-or-update engine.
+#
+#   seed-sync-update            check the public binaries repo; apply a newer release
+#   seed-sync-update --check    report only; make no changes
+#   seed-sync-update --apply-from <dir>   apply an already-extracted release tree
+#                                         (used by install.sh; no download)
+#
+# Public repo => no auth needed. Updates are atomic-ish: download + extract to a
+# temp dir, then stop the daemon, swap binaries, refresh assets, restart. On any
+# failure the current install is left untouched.
+set -euo pipefail
+
+REPO="${SEED_BINARIES_REPO:-steeb-k/seed-sync-binaries}"
+ASSET_GLOB='*linux-x86_64.tar.gz'
+
+BIN_DIR="$HOME/.local/bin"
+APP_ID="io.github.steeb_k.SeedSync"
+UNIT_DIR="$HOME/.config/systemd/user"
+APPS_DIR="$HOME/.local/share/applications"
+ICONS_DIR="$HOME/.local/share/icons/hicolor"
+METAINFO_DIR="$HOME/.local/share/metainfo"
+
+log()  { printf '%s\n' "seed-sync-update: $*"; }
+die()  { printf '%s\n' "seed-sync-update: error: $*" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+uctl() { systemctl --user "$@"; }
+
+# Highest of two versions via `sort -V`; prints "newer" if $2 > $1.
+version_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$2" ]; }
+
+installed_version() {
+  if have seed-daemon; then
+    seed-daemon --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+  fi
+}
+
+# Apply an extracted release tree ($1 = its root, containing bin/ share/ lib/).
+# Atomic per-file (temp + mv) so replacing the running daemon / this very script
+# is safe. Refreshes desktop/icon/unit assets only when they differ.
+apply_from() {
+  local src="$1"
+  [ -x "$src/bin/seed-daemon" ] || die "release tree at '$src' looks incomplete (no bin/seed-daemon)"
+
+  local daemon_was_running=0
+  if uctl is-active --quiet seed-daemon 2>/dev/null; then
+    daemon_was_running=1
+    log "stopping seed-daemon"
+    uctl stop seed-daemon || true
+  fi
+
+  mkdir -p "$BIN_DIR"
+  local f name
+  for f in "$src"/bin/*; do
+    name="$(basename "$f")"
+    install -m 0755 "$f" "$BIN_DIR/$name.tmp.$$"
+    mv -f "$BIN_DIR/$name.tmp.$$" "$BIN_DIR/$name"
+  done
+  # The updater itself lives at the tree root (next to install.sh); install it
+  # too. Atomic mv so replacing this very script mid-run is safe.
+  if [ -f "$src/seed-sync-update" ]; then
+    install -m 0755 "$src/seed-sync-update" "$BIN_DIR/seed-sync-update.tmp.$$"
+    mv -f "$BIN_DIR/seed-sync-update.tmp.$$" "$BIN_DIR/seed-sync-update"
+  fi
+  log "binaries -> $BIN_DIR"
+
+  # Desktop entry: rewrite the __BIN__ placeholder to the real bin dir.
+  if [ -f "$src/share/applications/$APP_ID.desktop" ]; then
+    mkdir -p "$APPS_DIR"
+    sed "s|__BIN__|$BIN_DIR|g" "$src/share/applications/$APP_ID.desktop" > "$APPS_DIR/$APP_ID.desktop.tmp.$$"
+    mv -f "$APPS_DIR/$APP_ID.desktop.tmp.$$" "$APPS_DIR/$APP_ID.desktop"
+  fi
+
+  # Icons + metainfo: copy as-is (cp -r is fine; not running files).
+  if [ -d "$src/share/icons/hicolor" ]; then
+    mkdir -p "$ICONS_DIR"
+    cp -r "$src"/share/icons/hicolor/* "$ICONS_DIR/"
+  fi
+  if [ -f "$src/share/metainfo/$APP_ID.metainfo.xml" ]; then
+    mkdir -p "$METAINFO_DIR"
+    cp -f "$src/share/metainfo/$APP_ID.metainfo.xml" "$METAINFO_DIR/"
+  fi
+
+  # systemd user units: refresh; reload only if something changed.
+  local units_changed=0 u base
+  if [ -d "$src/lib/systemd/user" ]; then
+    mkdir -p "$UNIT_DIR"
+    for u in "$src"/lib/systemd/user/*; do
+      base="$(basename "$u")"
+      if ! cmp -s "$u" "$UNIT_DIR/$base"; then
+        cp -f "$u" "$UNIT_DIR/$base"
+        units_changed=1
+      fi
+    done
+  fi
+  [ "$units_changed" = 1 ] && uctl daemon-reload || true
+
+  # Best-effort desktop integration caches.
+  have gtk-update-icon-cache && gtk-update-icon-cache -qtf "$ICONS_DIR" 2>/dev/null || true
+  have update-desktop-database && update-desktop-database -q "$APPS_DIR" 2>/dev/null || true
+
+  # Restart the daemon if we stopped it (don't touch the update timer itself).
+  if [ "$daemon_was_running" = 1 ]; then
+    log "starting seed-daemon"
+    uctl start seed-daemon || true
+  fi
+}
+
+download_and_apply() {
+  local check_only="$1"
+  have curl || die "curl is required"
+
+  local inst latest_json tag latest asset
+  inst="$(installed_version || true)"
+  [ -n "$inst" ] || die "seed-daemon not found; run install.sh for a first-time install"
+
+  log "checking $REPO for a newer release (installed: $inst)"
+  latest_json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest")" \
+    || die "could not reach the releases API for $REPO"
+
+  if have jq; then
+    tag="$(printf '%s' "$latest_json" | jq -r '.tag_name')"
+    asset="$(printf '%s' "$latest_json" | jq -r '.assets[].browser_download_url' | grep -E "${ASSET_GLOB//\*/.*}" | head -n1)"
+  else
+    tag="$(printf '%s' "$latest_json" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"([^"]+)".*/\1/')"
+    asset="$(printf '%s' "$latest_json" | grep -oE '"browser_download_url": *"[^"]+"' | sed -E 's/.*"(https[^"]+)".*/\1/' | grep -E "${ASSET_GLOB//\*/.*}" | head -n1)"
+  fi
+  [ -n "$tag" ] || die "could not determine the latest release tag"
+  local latest_ver="${tag#v}"
+
+  if ! version_gt "$inst" "$latest_ver"; then
+    log "up to date (latest: $latest_ver)"
+    return 0
+  fi
+  log "update available: $inst -> $latest_ver"
+  [ "$check_only" = 1 ] && return 0
+  [ -n "$asset" ] || die "release $tag has no $ASSET_GLOB asset"
+
+  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  log "downloading $asset"
+  curl -fsSL -o "$tmp/pkg.tar.gz" "$asset" || die "download failed"
+  tar -xzf "$tmp/pkg.tar.gz" -C "$tmp" || die "extract failed"
+  local root; root="$(find "$tmp" -maxdepth 2 -type d -name 'bin' -exec dirname {} \; | head -n1)"
+  [ -n "$root" ] || die "downloaded archive has no bin/ directory"
+
+  apply_from "$root"
+  log "updated to $latest_ver"
+}
+
+main() {
+  case "${1:-}" in
+    --apply-from) [ -n "${2:-}" ] || die "--apply-from needs a directory"; apply_from "$2" ;;
+    --check)      download_and_apply 1 ;;
+    "")           download_and_apply 0 ;;
+    -h|--help)    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *)            die "unknown argument: $1" ;;
+  esac
+}
+main "$@"

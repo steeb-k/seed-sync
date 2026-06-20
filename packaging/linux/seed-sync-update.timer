@@ -1,0 +1,14 @@
+[Unit]
+Description=S.E.E.D. daily auto-update check
+
+[Timer]
+# Check shortly after login, then once a day. Persistent catches up if the
+# machine was off at the scheduled time; the randomized delay avoids a fleet
+# all hitting GitHub at the same instant.
+OnStartupSec=2min
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

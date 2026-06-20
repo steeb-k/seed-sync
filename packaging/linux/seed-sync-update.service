@@ -1,0 +1,9 @@
+[Unit]
+Description=S.E.E.D. auto-update check
+Documentation=https://github.com/steeb-k/seed-sync-gtk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/seed-sync-update
