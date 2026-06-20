@@ -43,7 +43,7 @@ One command installs, updates, or removes — it detects what's already there an
 prompts (install / update / remove):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/steeb-k/seed-sync-binaries/main/install.sh | sh
+curl -fsSL https://steeb-k.github.io/seed-install.sh | sh
 ```
 
 It drops the binaries in `~/.local/bin`, runs the daemon as a `systemd --user`

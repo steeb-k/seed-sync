@@ -1,15 +1,16 @@
 #!/bin/sh
 # S.E.E.D. (Seed Sync) bootstrap — install, update, or remove in one command.
 #
-#   curl -fsSL https://raw.githubusercontent.com/steeb-k/seed-sync-binaries/main/install.sh | sh
+#   curl -fsSL https://steeb-k.github.io/seed-install.sh | sh
 #
 # Interactive when run from a terminal; otherwise defaults to install/update.
 # Non-interactive override:
 #   ... | sh -s -- install     (or update / remove)
 #   SEED_ACTION=install ... | sh
 #
-# Served from the public seed-sync-binaries repo root (mirrors this file). After
-# the first install, manage everything with the `seed-sync` command directly.
+# Source of truth: packaging/linux/web-install.sh in seed-sync-gtk. Mirrored to
+# steeb-k.github.io/seed-install.sh (canonical) and seed-sync-binaries/install.sh
+# (raw fallback). After the first install, manage everything with `seed-sync`.
 set -eu
 
 REPO="${SEED_BINARIES_REPO:-steeb-k/seed-sync-binaries}"
