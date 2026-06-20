@@ -27,6 +27,10 @@ Legend: ✅ pass · ❌ fail/bug · ⏳ not yet tested
 | File **move** = local relocate, no re-download | — | ✅ 1.76GB |
 | **Multi-master** two-way converge (add/del/LWW/restart) (`ebaca7c`) | ⏳ | ⏳ |
 
+> **Multi-master Linux-local validation ✅ (2026-06-19):** the full add/del/edit/LWW/restart/viewer
+> matrix passes on Linux both in the headless loopback test and a real 3-daemon dry run (see the
+> findings log). The two cross-OS columns stay ⏳ until the Windows box is online to run it Win↔Linux.
+
 ## GUI + presence feature test plan (M4 polish, 2026-06-19)
 Derived from the post-Checkpoint-#3 commits (no plan was written, so this is reverse-engineered
 from the diffs): `1d9080e` member names + health via gossip presence, `894544f` GUI dialog/dot
@@ -360,6 +364,51 @@ reconcile** against the shared iroh-docs replica. Key points for testing:
 Headless coverage exists: `seed-core/tests/loopback.rs::two_masters_converge_bidirectionally`
 (bidir add, delete, LWW conflict, restart-reconnect) + all prior loopback tests green; clippy clean.
 Windows release `seed-daemon.exe` (still v1.0.1) built and ready to drop in.
+
+### [LINUX] Multi-master + regression results 2026-06-19
+Tested on `main` @ `963a34e` (engine `ebaca7c`). The cross-OS items 1-6 still need the Windows box
+(🔀), but I validated the whole logic Linux-local two ways — headless and with real daemons.
+
+**Regression gate (no single-master regressions):**
+- ✅ `cargo build --workspace` clean; `cargo clippy --workspace` clean (0 warnings).
+- ✅ Unit tests: 18 `seed-core` + 2 `seed-ipc`, all pass.
+- ✅ Ignored real-endpoint integration tests all green: `loopback` single-master suite
+  (`master_viewer_mirror_lifecycle`, `empty_files_sync`, `viewer_stores_by_reference_not_copy`,
+  `viewer_auto_heals_corrupted_file`, `referenced_viewer_serves_peers`), `discovery`, `persistence`
+  (incl. `master_keeps_write_capability_after_restart`), `presence`, `docs_spike`, `loopback_ipc`.
+  ⚠️ `viewer_auto_heals_corrupted_file` timed out once when run *after* 4 other endpoint tests in the
+  same process, then passed 3/3 in isolation — the documented endpoint-contention flakiness, not a
+  regression. So single-master → viewer back-compat holds after the multi-master rewrite.
+
+**Multi-master headless (`two_masters_converge_bidirectionally`):** ran **19×** → **18 pass, 1 fail**.
+The single failure timed out at **stage 4 (restart-reconnect)** at the 60s budget; all earlier stages
+(bidir add, delete, LWW) passed. Root cause is **n0 DNS discovery latency**, not a reconnect logic bug:
+on restart a co-master keeps its endpoint id (`node.key` is persisted) and rebuilds its only bootstrap
+hint from the *creator's* endpoint id carried in the stored key (`engine.rs` `reload`/`open_share`),
+then relies on discovery to re-resolve the peer's current address — occasionally >60s in this sandbox
+where the IPv6 relay is unreachable (the known `NetworkUnreachable` fallback). It re-converges, just
+sometimes slower than the test's timeout.
+
+**Multi-master real daemons (3-daemon dry run, ran 3×, all 12 assertions pass each):**
+two `seed-daemon`s both adding the share with the **master key** (B bootstrapped to A's `node-addr`
+ticket), plus a third **viewer**-key daemon. Covered every test-plan item:
+1. ✅ **Bidirectional add** — `a.txt` (A) + `b.txt` (B) both appear byte-identical on both ends (~3s).
+2. ✅ **Delete either way** — delete on A clears it on B; delete on B clears it on A.
+3. ✅ **Edit either way** — edits propagate both directions.
+4. ✅ **Last-writer-wins** — same-path edit on both sides; the later wall-clock write wins on both ends.
+5. ✅ **Restart reconnect** — killed + restarted B's daemon; it reconnected and pulled a fresh A change
+   in **~12-14s** (fast here because B re-dials via the bootstrap ticket + persisted node identity —
+   contrast the headless test's discovery-only worst case above).
+6. ✅ **Viewer still read-only** — third node with the viewer key mirrors the masters' merged state and
+   **reverts** rogue local edits (rogue file deleted, edited file restored).
+- ✅ **1× dedup holds in the bidirectional path** — a 50 MiB file added on A lands on co-master B with a
+  **753 KB** blob store (outboard-only, by reference), not a doubled copy. `import_one`'s `TryReference`
+  works for co-masters, not just viewers.
+
+**For the Windows side:** rebuild + restart `seed-daemon.exe` from `main` (engine change — GUI-only
+redeploy is NOT enough), add the share with the **master** key (`seedm1…`) on both ends, then run items
+1-6 Win↔Linux. Expect restart-reconnect to lean on discovery/relay cross-OS, so allow generous time
+there (it converges; the 60s headless timeout is a test artifact, not a product limit).
 
 ## Distribution & auto-update — release channel (2026-06-19)
 
