@@ -118,10 +118,16 @@ in the MSI) and then the **MSI** itself, via `scripts\sign-artifacts.ps1` — a
 (timestamp `http://timestamp.acs.microsoft.com`). The ~third-party GTK DLLs are left
 unsigned (standard practice; SmartScreen keys off the MSI + the launched exe).
 
-Signing is **opt-in**: it runs only when the metadata JSON is present
-(`$env:ARTIFACT_SIGNING_METADATA`, else repo-root `artifact-signing-metadata.json` —
-both git-ignored). Without it the build still succeeds and produces unsigned
-artifacts (fine for local testing / other contributors). The metadata is
+**Releases are signed by default.** The signing metadata is kept at repo-root
+`artifact-signing-metadata.json` (git-ignored), which is the path `sign-artifacts.ps1`
+looks for automatically — so a release `build-msi.ps1` signs the three exes + the MSI
+with no extra flags. **Do not publish an unsigned MSI as a release** (SmartScreen will
+warn users). Signing requires an authenticated Azure session for the Trusted Signing
+account (`az login`, or service-principal env vars) in addition to the metadata.
+
+Signing is technically skippable for **local testing / other contributors**: if the
+metadata JSON is absent (and `$env:ARTIFACT_SIGNING_METADATA` unset), the build still
+succeeds and produces unsigned artifacts. The metadata is
 `{ Endpoint, CodeSigningAccountName, CertificateProfileName }`; tools auto-resolve
 from the Windows SDK + Trusted Signing client tools (override with `SIGNTOOL_PATH` /
 `ARTIFACT_SIGNING_DLIB`).

@@ -5,9 +5,11 @@
 #   * GTK built/installed via gvsbuild (default C:\gtk) — see docs/windows-packaging.md
 #   * WiX 5 dotnet tool:  dotnet tool install --global wix --version "5.*"
 #     plus the UI + Util extensions (this script adds them if missing).
-#   * For signing (optional): the Trusted Signing client tools + Windows SDK, and
-#     artifact-signing-metadata.json at the repo root (or $env:ARTIFACT_SIGNING_METADATA).
-#     Without it the build still succeeds but the MSI/exes are UNSIGNED.
+#   * Signing: RELEASES ARE SIGNED BY DEFAULT. Keep artifact-signing-metadata.json
+#     at the repo root (git-ignored; or point $env:ARTIFACT_SIGNING_METADATA at it)
+#     plus the Trusted Signing client tools + Windows SDK and an authenticated Azure
+#     session (az login). If the metadata is absent the build still succeeds but the
+#     MSI/exes are UNSIGNED — do NOT ship that as a release (SmartScreen will warn).
 #   * The SeedSyncDaemon service must be STOPPED (a running service locks
 #     target\release\seed-daemon.exe and the release build will fail).
 #
