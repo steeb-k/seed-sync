@@ -3,10 +3,16 @@
  * Segoe UI typeface, the Windows accent blue, and slightly rounder controls so
  * the libadwaita UI feels closer to native Win11 Fluent. */
 
+/* GTK4 on Windows has no desktop font / text-scaling setting to read (GNOME
+ * supplies ~11pt and an optional text-scale; Windows supplies neither), so the
+ * default UI font renders noticeably smaller than on Linux. libadwaita sizes
+ * most controls relative to the font, so bumping the base size scales the whole
+ * UI up to match the Linux look. Tune this single value if it's still off. */
 window,
 popover,
 tooltip {
   font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+  font-size: 11pt;
 }
 
 /* Windows 11 default accent (blue). Redefining libadwaita's named colors at
