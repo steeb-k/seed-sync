@@ -139,22 +139,29 @@ jobs:
           toolchain: stable-msvc
       - uses: Swatinem/rust-cache@v2
 
-      # --- GTK via gvsbuild, cached (Option A). First run ~30-60 min; later runs
-      # restore C:\gtk from cache. Bump the key suffix to force a rebuild. ---
-      - name: Cache GTK (C:\gtk)
-        id: gtk
-        uses: actions/cache@v4
-        with:
-          path: C:\gtk
-          key: gtk-gvsbuild-gtk4-libadwaita-v1
-      - name: Build GTK with gvsbuild
-        if: steps.gtk.outputs.cache-hit != 'true'
+      # --- GTK from the OFFICIAL PREBUILT gvsbuild bundle (NOT from-source).
+      # `gvsbuild build gtk4 libadwaita` needs a full VS C++ toolchain that the
+      # runner doesn't expose to gvsbuild's detector ("Unable to find applicable
+      # Visual Studio"), and even past that it reliably breaks on gettext — see
+      # docs/windows-packaging.md §0. The prebuilt GTK4 zip already contains
+      # libadwaita; download + extract to C:\gtk (gives bin/lib/include/share). ---
+      - name: Install GTK (prebuilt gvsbuild bundle)
         shell: pwsh
+        env:
+          GVSBUILD_VER: "2026.4.1"
         run: |
-          py -m pip install --user pipx
-          py -m pipx ensurepath
-          pipx install gvsbuild
-          gvsbuild build gtk4 libadwaita
+          $zip = "GTK4_Gvsbuild_${env:GVSBUILD_VER}_x64.zip"
+          $url = "https://github.com/wingtk/gvsbuild/releases/download/${env:GVSBUILD_VER}/$zip"
+          Write-Host "Downloading $url"
+          curl.exe --proto '=https' --tlsv1.2 -L --retry 5 --retry-connrefused --fail -o $zip $url
+          New-Item -ItemType Directory -Force -Path C:\gtk | Out-Null
+          tar -xf $zip -C C:\gtk
+          foreach ($pc in 'gtk4.pc', 'libadwaita-1.pc') {
+            if (-not (Test-Path "C:\gtk\lib\pkgconfig\$pc")) {
+              Write-Error "GTK bundle missing lib\pkgconfig\$pc after extract"; exit 1
+            }
+          }
+          Write-Host "GTK ready at C:\gtk (gtk4 + libadwaita pkgconfig present)"
 
       - name: Install WiX 5
         shell: pwsh

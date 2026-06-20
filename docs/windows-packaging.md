@@ -6,15 +6,19 @@ Windows machine. Primary development moves here per the project plan.
 
 ## 0. One-time dev setup
 
-1. Install **rustup** with the MSVC toolchain: `rustup default stable-msvc`.
+1. Install **rustup** with the MSVC toolchain: `rustup default stable-msvc`
+   (Rust ≥ 1.94 — `libsqlite3-sys`'s bundled Windows build uses `cfg_select!`).
 2. Install **Visual Studio Build Tools** (MSVC C++), Git, and the `gh` CLI.
-3. Install **gvsbuild** and build the GTK stack (this takes a while):
+3. Install the GTK stack from the **official prebuilt gvsbuild bundle** — do NOT
+   build from source. `gvsbuild build gtk4 libadwaita` reliably fails on gettext
+   (and needs a full VS C++ toolchain its detector can't always find), so we use
+   the prebuilt release zip, which already includes libadwaita:
    ```pwsh
-   py -m pip install --user pipx; py -m pipx ensurepath
-   pipx install gvsbuild
-   gvsbuild build gtk4 libadwaita
-   # output lands in C:\gtk by default
+   $ver = "2026.4.1"   # github.com/wingtk/gvsbuild/releases
+   curl.exe -L -o gtk.zip "https://github.com/wingtk/gvsbuild/releases/download/$ver/GTK4_Gvsbuild_${ver}_x64.zip"
+   mkdir C:\gtk; tar -xf gtk.zip -C C:\gtk   # gives C:\gtk\{bin,lib,include,share}
    ```
+   The release CI does exactly this (`.github/workflows/release.yml`).
 4. Point the gtk-rs build at it:
    ```pwsh
    $env:PKG_CONFIG_PATH = "C:\gtk\lib\pkgconfig"
