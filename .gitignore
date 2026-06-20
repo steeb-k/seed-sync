@@ -21,7 +21,6 @@
 
 # Code-signing material (Azure Trusted Signing account/profile names; local only)
 /signing-example/
-/artifact-signing-metadata.json
 
 # Editor / OS
 .idea/
