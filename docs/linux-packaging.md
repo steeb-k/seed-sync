@@ -115,9 +115,12 @@ old inode while the new file is `mv`'d into place for the next run.
 
 ## Caveats / gotchas for maintainers
 - **ABI portability.** The tarball is dynamically linked against the build host's glibc + GTK.
-  Targets need **GTK 4.10+ / libadwaita 1.4+** and **glibc ≥ the build image's** (hence
-  ubuntu-22.04 in CI). Very new distros are fine; very old ones may not be. If a specific
-  internal fleet consolidates on one distro, prefer a real native package then (see Future work).
+  CI builds on **ubuntu-24.04** — not 22.04, because the GUI requires **GTK 4.10+** (the `v4_10`
+  feature) and 22.04 only ships GTK 4.6, which fails the build. Targets therefore need **GTK 4.10+ /
+  libadwaita 1.4+** and a correspondingly modern **glibc (≥ 2.39)** — in practice Ubuntu 24.04+,
+  Fedora 39+, Debian 13+, or a rolling distro (Arch/CachyOS). Older distros can't run the app anyway
+  (no GTK 4.10+), so this floor isn't an extra restriction. If a fleet consolidates on one distro,
+  prefer a real native package then (see Future work).
 - **Version bump is mandatory per release** — the updater is version-driven. CI fails the
   release if the tag doesn't match the Cargo version (guard in `release.yml`).
 - **systemd --user requires a user session bus.** On headless/SSH boxes without a logind

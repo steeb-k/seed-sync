@@ -21,9 +21,10 @@ env:
 jobs:
   linux:
     name: Linux tarball -> seed-sync-binaries
-    # ubuntu-22.04 deliberately: older glibc/GTK ABI => the tarball runs on a
-    # wider range of target distros.
-    runs-on: ubuntu-22.04
+    # ubuntu-24.04: the GUI needs GTK 4.10+ (the gtk4 `v4_10` feature), and 22.04
+    # only ships GTK 4.6 — too old to build. 24.04 has GTK 4.14. The resulting
+    # glibc floor (2.39) is moot since targets need GTK 4.10+ at runtime anyway.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - name: Install GTK4 + Libadwaita + D-Bus + ImageMagick
