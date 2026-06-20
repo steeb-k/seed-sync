@@ -46,6 +46,7 @@ done
 # Installer/updater wrapper + docs (tarball root)
 install -m 0755 "$PKG_SRC/seed-sync"   "$STAGE/seed-sync"
 install -m 0644 "$PKG_SRC/INSTALL.txt" "$STAGE/INSTALL.txt"
+install -m 0644 "$ROOT/LICENSE"        "$STAGE/LICENSE"
 
 # Desktop entry + AppStream metadata
 install -m 0644 "$PKG_SRC/$APP_ID.desktop"       "$STAGE/share/applications/$APP_ID.desktop"

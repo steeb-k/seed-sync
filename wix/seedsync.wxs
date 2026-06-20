@@ -28,7 +28,7 @@
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package Name="Seed Sync"
-           Manufacturer="steeb-k"
+           Manufacturer="kznjk LLC"
            Version="$(Version)"
            UpgradeCode="51862F05-49F8-4AB0-BE4A-2831849E2BF6"
            Scope="perMachine"
@@ -45,7 +45,7 @@
     <Icon Id="AppIcon" SourceFile="$(DistDir)\bin\seed-gui.exe" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
 
-    <!-- WixUI_Minimal: a single Welcome+License page (shows the GPL-3.0 license),
+    <!-- WixUI_Minimal: a single Welcome+License page (shows the proprietary EULA),
          then progress + finish. No folder chooser; installs to Program Files. -->
     <ui:WixUI Id="WixUI_Minimal" />
     <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
