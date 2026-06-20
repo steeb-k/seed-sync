@@ -497,8 +497,10 @@ calls `seed-daemon run` directly, like systemd), keyring `apple-native` (Keychai
   + the x86_64 Rust target are present: builds both slices, `lipo`s every Mach-O. Verified — the
   `…macos-universal.tar.gz` has **fat (arm64+x86_64) binaries + all 57 dylibs**, both slices run (native
   + Rosetta), and **both are self-contained under a sandbox denying both brew prefixes**.
-- 🟡 **5. CI** 🍎 — `release.yml` macos-14 job added (brew gtk4+libadwaita → `package-macos.sh` → publish
-  with the same tag/version guard). **Not yet run on a runner** — validate on the first macOS release tag.
+- 🟡 **5. CI** 🍎 — `release.yml` macos-14 job builds **universal** (sets up Rosetta + a 2nd x86_64
+  Homebrew on the runner → `package-macos.sh` → publish, same tag/version guard). **Not yet run on a
+  runner** — the second-Homebrew/Rosetta setup must be validated on the first macOS release tag.
+  (The v1.1.0 macOS-universal asset was published manually, since v1.1.0 predated this job.)
 - ⏳ **6. Sync matrix** 🔀 — once published, fold macOS into the Windows⇄Linux⇄macOS sync tests (mirror,
   self-heal, dedup, multi-master converge, presence) — new columns in the status board.
 

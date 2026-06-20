@@ -55,19 +55,19 @@ jobs:
           fail_on_unmatched_files: true
 
   macos:
-    name: macOS tarball -> seed-sync-binaries
-    # macos-14 is the Apple Silicon (arm64) runner. Phase 1 ships an arm64-only
-    # asset (seed-sync-<ver>-macos-arm64.tar.gz); the universal2 lipo step (which
-    # needs an x86_64 Homebrew prefix under Rosetta) is future work — see
-    # docs/macos-packaging.md. Xcode CLT (install_name_tool/codesign/otool) is
-    # preinstalled on the runner; the bundler ad-hoc signs the relocated dylibs.
+    name: macOS universal tarball -> seed-sync-binaries
+    # macos-14 is the Apple Silicon (arm64) runner. We ship a UNIVERSAL2 asset
+    # (seed-sync-<ver>-macos-universal.tar.gz): the preinstalled arm64 Homebrew
+    # (/opt/homebrew) supplies the arm64 GTK closure, and a SECOND x86_64 Homebrew
+    # at /usr/local (under Rosetta) supplies the x86_64 closure — package-macos.sh
+    # builds both Rust slices and lipo's every Mach-O. Both brews install the same
+    # GTK version (latest bottle) so the dylib sets match. Xcode CLT
+    # (install_name_tool/codesign/otool/lipo/iconutil) is preinstalled; the bundler
+    # ad-hoc signs the relocated dylibs. NOTE: the second-Homebrew + Rosetta setup
+    # is the heaviest/most novel part — validate it on the first macOS release tag.
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: Install GTK4 + libadwaita
-        run: brew install gtk4 libadwaita pkg-config
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - name: Sanity-check the tag matches Cargo.toml
         run: |
           CARGO_VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
@@ -76,7 +76,22 @@ jobs:
             echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VER"
             exit 1
           fi
-      - name: Build the release tarball (bundle + relocate + ad-hoc sign)
+      - name: Install arm64 GTK4 + libadwaita
+        run: brew install gtk4 libadwaita pkg-config
+      - name: Ensure Rosetta 2
+        run: sudo softwareupdate --install-rosetta --agree-to-license || true
+      - name: Install x86_64 Homebrew + GTK4 (for the universal x86_64 slice)
+        run: |
+          # A second, x86_64 Homebrew at /usr/local under Rosetta. The runner has
+          # passwordless sudo, so the bootstrap runs non-interactively.
+          NONINTERACTIVE=1 arch -x86_64 /bin/bash -c \
+            "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+          arch -x86_64 /usr/local/bin/brew install gtk4 libadwaita pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the universal tarball (bundle + relocate + lipo + ad-hoc sign)
         run: scripts/package-macos.sh
       - name: Publish to seed-sync-binaries
         uses: softprops/action-gh-release@v2

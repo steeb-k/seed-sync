@@ -141,11 +141,18 @@ all 57 dylibs, both slices run (native + Rosetta), both self-contained under a n
   `Homebrew/Library/Homebrew/os/mac/pkgconfig/<macOS-major>` (system-lib stubs: zlib/libffi/expat/…),
   plus `PKG_CONFIG_ALLOW_CROSS=1`. Without the per-version stubs dir, gobject/cairo/fontconfig fail to
   resolve their system deps.
-- **CI:** an arm64 runner only ships arm64 unless it sets up the x86_64 Homebrew/Rosetta prefix too.
+- **CI:** the `macos-14` job sets up the x86_64 Homebrew/Rosetta prefix itself (below) so it ships
+  universal, not arm64-only.
 
 ## CI (built — not yet run on a runner)
 
-A `macos` job is added to `.github/workflows/release.yml` on **`macos-14`** (Apple Silicon runner):
+The `macos` job in `.github/workflows/release.yml` on **`macos-14`** now builds **universal** by
+bootstrapping a second x86_64 Homebrew on the runner: tag↔version guard, `brew install gtk4 libadwaita`
+(arm64), `softwareupdate --install-rosetta`, a NONINTERACTIVE x86_64 Homebrew at `/usr/local` +
+`arch -x86_64 brew install gtk4 libadwaita pkg-config`, `dtolnay/rust-toolchain` with
+`targets: x86_64-apple-darwin`, then `scripts/package-macos.sh` (auto-detects the x86_64 brew →
+universal) and publishes to `seed-sync-binaries`. **The second-Homebrew + Rosetta setup is the
+heaviest/most novel part — validate it on the first macOS release tag.** Older form, for reference:
 `brew install gtk4 libadwaita pkg-config`, the tag↔Cargo-version guard (same as Linux), run
 `scripts/package-macos.sh`, publish `dist/*.tar.gz` to `seed-sync-binaries` with `SEED_BINARIES_TOKEN`
 and `fail_on_unmatched_files: true`. Ships **arm64** (universal needs the x86_64 Homebrew/Rosetta setup
