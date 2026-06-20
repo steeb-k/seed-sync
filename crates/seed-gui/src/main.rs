@@ -202,7 +202,70 @@ fn setup_runtime_env() {
     }
 }
 
-#[cfg(not(windows))]
+/// On macOS, point GLib/GTK at the bundled runtime resources relative to this
+/// executable, so the self-contained tarball install (GTK dylibs relocated to
+/// `../lib`) finds its GSettings schemas, gdk-pixbuf loaders, and Adwaita icon
+/// theme without a system/Homebrew GTK. Mirrors the Windows function. Every set
+/// is guarded by `exists()`, so a dev build run against Homebrew GTK (no bundled
+/// `share/`+`lib/` next to the exe) is a no-op and keeps using the system paths.
+/// Must run before any GLib/GTK call.
+#[cfg(target_os = "macos")]
+fn setup_runtime_env() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // Installed binaries are reached through ~/.local/bin symlinks into the real
+    // prefix, and current_exe() can hand back the symlink path — canonicalize so
+    // the prefix resolves to the install root, not the symlink's parent. Without
+    // this, the bundled share/lib/etc aren't found and GTK silently falls back to
+    // a system/Homebrew prefix (absent on a user's machine → file-chooser crash).
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    // <prefix>/bin/seed-gui -> prefix is the install root (holds share/, lib/).
+    let Some(prefix) = exe.parent().and_then(|bin| bin.parent()) else {
+        return;
+    };
+    let set_if = |var: &str, p: PathBuf| {
+        if p.exists() && std::env::var_os(var).is_none() {
+            std::env::set_var(var, &p);
+        }
+    };
+    set_if(
+        "GSETTINGS_SCHEMA_DIR",
+        prefix.join("share/glib-2.0/schemas"),
+    );
+    set_if(
+        "GDK_PIXBUF_MODULE_FILE",
+        prefix.join("lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"),
+    );
+    set_if(
+        "GDK_PIXBUF_MODULEDIR",
+        prefix.join("lib/gdk-pixbuf-2.0/2.10.0/loaders"),
+    );
+    // fontconfig (pulled in by pango): the bundled libfontconfig has a compiled-in
+    // config path under the Homebrew prefix, absent on a user's machine. Point it
+    // at our bundled fonts.conf, which references the system macOS font dirs.
+    set_if("FONTCONFIG_PATH", prefix.join("etc/fonts"));
+    // Prepend our share/ so the bundled Adwaita icon theme is found by GTK.
+    let share = prefix.join("share");
+    if share.exists() {
+        let val = match std::env::var_os("XDG_DATA_DIRS") {
+            Some(cur) if !cur.is_empty() => {
+                let mut s = std::ffi::OsString::from(&share);
+                s.push(":");
+                s.push(cur);
+                s
+            }
+            _ => {
+                let mut s = std::ffi::OsString::from(&share);
+                s.push(":/usr/local/share:/usr/share");
+                s
+            }
+        };
+        std::env::set_var("XDG_DATA_DIRS", val);
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn setup_runtime_env() {}
 
 fn main() -> glib::ExitCode {
@@ -454,7 +517,6 @@ fn build_ui(
     add_box.append(&add_share_btn);
     add_popover.set_child(Some(&add_box));
     add_btn.set_popover(Some(&add_popover));
-    header.pack_start(&add_btn);
 
     // Gear menu: node address + quit.
     let gear_btn = gtk::MenuButton::builder()
@@ -476,9 +538,24 @@ fn build_ui(
     gear_box.append(&quit_btn);
     gear_popover.set_child(Some(&gear_box));
     gear_btn.set_popover(Some(&gear_popover));
-    // Packed on the left beside "+": the top-right corner now belongs to the
-    // window controls (and the close button's rounded corner), so keep it clear.
-    header.pack_start(&gear_btn);
+
+    // Header actions: "+" (add) then gear (settings). Their side depends on where
+    // the platform draws its window controls. On macOS the traffic-light controls
+    // own the LEFT corner, so the actions go to the RIGHT to avoid crowding them.
+    // On Windows the controls are on the right (with the close button's rounded
+    // corner), so the actions stay on the LEFT; Linux follows the same layout.
+    #[cfg(target_os = "macos")]
+    {
+        // pack_end packs right-to-left: pack gear first so it lands in the corner,
+        // then "+" to its left — a [＋][gear] group tucked against the right edge.
+        header.pack_end(&gear_btn);
+        header.pack_end(&add_btn);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        header.pack_start(&add_btn);
+        header.pack_start(&gear_btn);
+    }
 
     // --- share list ---
     let listbox = gtk::ListBox::builder()
