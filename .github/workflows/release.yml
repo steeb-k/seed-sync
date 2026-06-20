@@ -194,3 +194,46 @@ jobs:
           name: ${{ github.ref_name }}
           files: target/wix/*.msi
           fail_on_unmatched_files: true
+
+  notes:
+    name: Release notes (min OS + deps)
+    # Runs LAST (needs the three publish jobs) so it sets the release body after
+    # the assets are attached — the asset jobs never touch the body, so this is
+    # the single, deterministic writer. `always()` so the notes still post even
+    # if one platform's build fails (the run is a smoke test; we want the result
+    # visible either way).
+    needs: [linux, macos, windows]
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Compute version (tag minus leading v)
+        id: ver
+        run: echo "ver=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - name: Publish release notes
+        uses: softprops/action-gh-release@v2
+        with:
+          repository: steeb-k/seed-sync-binaries
+          token: ${{ secrets.SEED_BINARIES_TOKEN }}
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            **S.E.E.D. (Seed Sync) ${{ github.ref_name }}** — P2P mirrored-folder sync.
+
+            ### Downloads
+            - **Linux x86_64** — `seed-sync-${{ steps.ver.outputs.ver }}-linux-x86_64.tar.gz`
+            - **macOS universal** (Apple Silicon + Intel) — `seed-sync-${{ steps.ver.outputs.ver }}-macos-universal.tar.gz`
+            - **Windows x86_64** (signed MSI) — `seed-sync-${{ steps.ver.outputs.ver }}-windows-x86_64.msi`
+
+            ### System requirements
+
+            **Linux** — GTK is *not* bundled; install the runtime packages first:
+            - GTK 4.10+, libadwaita 1.4+, libdbus-1
+            - Debian/Ubuntu: `libgtk-4-1 libadwaita-1-0 libdbus-1-3`
+            - Fedora: `gtk4 libadwaita dbus-libs`
+            - Arch: `gtk4 libadwaita dbus`
+
+            **macOS** — macOS **14 (Sonoma)** or later; universal (Apple Silicon + Intel).
+            No Homebrew or other runtime needed — GTK4 + libadwaita are bundled in the app.
+
+            **Windows** — **Windows 10 (64-bit)** or later. GTK4 + libadwaita and all
+            libraries are bundled in the signed MSI; no separate runtime install required.
