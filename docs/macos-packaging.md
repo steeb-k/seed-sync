@@ -146,19 +146,40 @@ all 57 dylibs, both slices run (native + Rosetta), both self-contained under a n
 
 ## CI (built — not yet run on a runner)
 
-The `macos` job in `.github/workflows/release.yml` on **`macos-14`** now builds **universal** by
-bootstrapping a second x86_64 Homebrew on the runner: tag↔version guard, `brew install gtk4 libadwaita`
-(arm64), `softwareupdate --install-rosetta`, a NONINTERACTIVE x86_64 Homebrew at `/usr/local` +
+The `macos` job in `.github/workflows/release.yml` builds **universal** by bootstrapping a second
+x86_64 Homebrew on the runner: tag↔version guard, `brew install gtk4 libadwaita` (arm64),
+`softwareupdate --install-rosetta`, a NONINTERACTIVE x86_64 Homebrew at `/usr/local` +
 `arch -x86_64 brew install gtk4 libadwaita pkg-config`, `dtolnay/rust-toolchain` with
 `targets: x86_64-apple-darwin`, then `scripts/package-macos.sh` (auto-detects the x86_64 brew →
-universal) and publishes to `seed-sync-binaries`. **The second-Homebrew + Rosetta setup is the
-heaviest/most novel part — validate it on the first macOS release tag.** Older form, for reference:
-`brew install gtk4 libadwaita pkg-config`, the tag↔Cargo-version guard (same as Linux), run
-`scripts/package-macos.sh`, publish `dist/*.tar.gz` to `seed-sync-binaries` with `SEED_BINARIES_TOKEN`
-and `fail_on_unmatched_files: true`. Ships **arm64** (universal needs the x86_64 Homebrew/Rosetta setup
-from Phase 2). **Validate on the first macOS release tag** — the runner's Xcode CLT provides
-`install_name_tool`/`codesign`/`otool`/`iconutil`. Until a tag runs this job, the macOS asset isn't on
-`seed-sync-binaries`, so the live `curl | sh` install can't find it yet.
+universal) and publishes to `seed-sync-binaries` with `SEED_BINARIES_TOKEN`, `fail_on_unmatched_files:
+true`. The runner's Xcode CLT provides `install_name_tool`/`codesign`/`otool`/`lipo`/`iconutil`. **The
+second-Homebrew + Rosetta setup is the heaviest/most novel part — validate it on the first release tag.**
+
+### Minimum macOS version is set by the build host — pin `macos-14`
+The bundle's real floor is the `minos` (LC_BUILD_VERSION) of the **bundled GTK dylibs**, which Homebrew
+stamps with the macOS version of the build machine. Our Rust binaries are low (≈11), but GTK dominates:
+
+| Build host | arm64 GTK `minos` | x86_64 GTK `minos` | Effective floor |
+|---|---|---|---|
+| `macos-14` runner (Sonoma) | **14** | 13–14 | **macOS 14** (recommended) |
+| `macos-15` runner (Sequoia) | 15 | 14–15 | macOS 15 |
+| a dev box on macOS 26 | 26 | 14 | macOS 26 on Apple Silicon (too high to ship) |
+
+So **always cut the release on `macos-14`** (the *oldest* Apple-Silicon GitHub runner) to reach the
+widest install base — Apple Silicon ≥ 14 and Intel ≥ 14. GitHub has no older Apple-Silicon runner, so
+macOS 14 (Sonoma) is the practical arm64 floor for hosted CI; a lower floor needs a self-hosted older
+Mac. (On Apple Silicon dyld always loads the arm64 slice, so the arm64 `minos` is what gates those
+machines — the x86_64 slice's lower floor only helps Intel Macs.)
+
+> **Broader Intel coverage (optional, more CI):** build the x86_64 slice on a `macos-13` (Ventura,
+> Intel) runner and the arm64 slice on `macos-14`, upload both as artifacts, then `lipo` + sign + publish
+> in a third job. That drops the Intel floor to macOS 13 while Apple Silicon stays at 14. Not wired up;
+> the single-runner `macos-14` build (x86_64 via Rosetta) is the default.
+
+**Caveat for the current release:** the `v1.1.0` macOS asset was published *manually* from a macOS-26
+dev box, so its arm64 slice needs macOS 26. Re-cut via the `macos-14` CI job to drop it to macOS 14.
+
+Until a tag runs this job, the CI-built macOS asset isn't on `seed-sync-binaries`.
 
 ## Caveats / gotchas
 
