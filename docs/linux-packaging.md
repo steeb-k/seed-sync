@@ -157,7 +157,8 @@ Self-replacement of `seed-sync` is safe: `apply_tree` writes the new file to a t
   `cargo-generate-rpm`) + self-hosted apt/pacman repos, if a fleet standardizes.
 - A GUI "Check for updates" affordance (the daemon/GUI could surface the timer's result).
 - Code signing / minisign-style artifact signatures for tamper-evidence.
-- macOS packaging.
+- macOS packaging — **now in design**, mirrors this model (script/tarball + launchd, bundled GTK,
+  ad-hoc signed). See `docs/macos-packaging.md`.
 
 See also: `docs/windows-packaging.md` (the MSI side) and the release/update handoff section
 in `docs/cross-os-testing.md` (what the Windows updater must mirror).

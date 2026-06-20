@@ -1,8 +1,10 @@
-# Cross-OS testing log (shared: Windows ⇄ Linux)
+# Cross-OS testing log (shared: Windows ⇄ Linux ⇄ macOS)
 
-A shared scratchpad for the two Claude instances testing Seed Sync's Windows↔Linux
-sync (M4 Checkpoint #3). Both machines have this repo checked out; the human syncs
-git between them.
+A shared scratchpad for the instances testing Seed Sync's cross-OS sync.
+Windows↔Linux is green (M4 Checkpoint #3); **macOS is the next platform being brought
+up** (build + packaging first, then folded into the sync matrix — see "macOS bring-up"
+below and `docs/macos-packaging.md`). Each machine has this repo checked out; the human
+syncs git between them.
 
 ## How to use this file
 - **Read it first** at the start of a session to catch up on what the other side found.
@@ -451,6 +453,73 @@ for the Windows instance** to build its half. Full Linux design lives in `docs/l
    `MajorUpgrade` already in place).
 
 **Still to validate live on Windows:** build the signed MSI, install it, confirm SmartScreen-clean +
-`Get-AuthenticodeSignature` Valid on the exes + MSI; the WixUI_Minimal GPL page shows; the SeedSyncUpdate
-task exists; and an end-to-end self-update (publish a newer tag → task picks it up → silent upgrade →
+`Get-AuthenticodeSignature` Valid on the exes + MSI; the WixUI_Minimal license page shows the
+proprietary EULA (relicensed 2026-06-20, `(c) kznjk LLC` — was GPL-3.0); the SeedSyncUpdate task
+exists; and an end-to-end self-update (publish a newer tag → task picks it up → silent upgrade →
 service restarts).
+
+## macOS bring-up (planned, 2026-06-20)
+
+Third platform. Strategy: **follow the Linux script/tarball model**, not a packaged installer —
+it maps 1:1 in shape AND a `curl | sh` tarball install sidesteps Gatekeeper quarantine, so an
+ad-hoc-signed build needs no Apple Developer account. Full maintainer guide: `docs/macos-packaging.md`.
+
+**Locked decisions (human, 2026-06-20):**
+- **Universal2** binary (arm64 + x86_64). *Implemented phased:* arm64-only bundle first to prove the
+  pipeline, then `lipo` in the x86_64 slice. (Gotcha: Homebrew GTK is single-arch, so universal GTK
+  needs both arch slices of every dylib lipo'd together — two brew prefixes or a from-source build.)
+- **Bundle GTK4 + libadwaita dylibs** into the tarball (self-contained; no user Homebrew). Relocate
+  with `install_name_tool`/`dylibbundler`, ship gdk-pixbuf loaders + compiled GSettings schemas +
+  Adwaita resources.
+- **Ad-hoc signing only** (no notarization). Re-sign every binary/dylib AFTER relocation (mandatory
+  on Apple Silicon or the kernel kills them); rely on the `curl | sh` quarantine dodge for Gatekeeper.
+
+**Already macOS-aware in the code (de-risks the build):** tray (`tray.rs`, `tray-icon`/NSStatusItem),
+GUI open-folder + platform branches (`main.rs`), daemon runs via the `not(windows)` path (so launchd
+calls `seed-daemon run` directly, like systemd), keyring `apple-native` (Keychain), `directories`
+→ `~/Library/Application Support`.
+
+**Bring-up checklist (🍎 macOS-only unless marked 🔀):**
+- ⏳ **0. Builds at all** 🍎 — `cargo build --release` on macOS with GTK4/libadwaita present (brew first,
+  to prove the app compiles/runs before tackling bundling).
+- ⏳ **1. GTK dylib bundling** 🍎 — relocate + re-sign; app launches with zero external dylib deps
+  (`otool -L` shows only @rpath/@executable_path + system frameworks).
+- ⏳ **2. launchd** 🍎 — daemon LaunchAgent runs `seed-daemon run`; GUI autostart; update timer
+  (`StartCalendarInterval`) runs `seed-sync --update`.
+- ⏳ **3. `seed-sync` wrapper** 🍎 — install/update/uninstall/status via `launchctl`; quarantine-dodge
+  verified (`xattr` shows no `com.apple.quarantine` after `curl | sh`).
+- ⏳ **4. Universal2** 🍎 — `lipo`'d binaries + dylibs run native on both arches (`file` shows 2 arches).
+- ⏳ **5. CI** 🍎 — `release.yml` macOS job (macos-14 runner) attaches `…macos-universal.tar.gz` to the
+  same `seed-sync-binaries` release.
+- ⏳ **6. Sync matrix** 🔀 — once it runs, fold macOS into the Windows⇄Linux⇄macOS sync tests (mirror,
+  self-heal, dedup, multi-master converge, presence) — new columns in the status board.
+
+### [MACOS] START HERE — handoff from the Windows side (2026-06-20)
+You're now on the Apple Silicon Mac. Planning is done on Windows; this is the build/packaging kickoff.
+
+1. **Read `docs/macos-packaging.md` first** — it's the full design (file inventory, bundling/relocation/
+   re-sign procedure, phased universal2 plan, CI job). The "Locked decisions" above are authoritative:
+   **universal2** (phased: arm64 first), **bundle GTK dylibs**, **ad-hoc signing**, **script/tarball**
+   model (not `.dmg`/`.pkg`).
+2. **Phase 1 — just prove it builds & runs** (no bundling yet):
+   - `brew install gtk4 libadwaita pkg-config`; confirm Rust ≥ 1.85 (`rust-version` in Cargo.toml).
+   - `vendor/iroh-blobs` must be present for the `[patch.crates-io]` to resolve (it's in the repo).
+   - `cargo build --release` (arm64 native). The icon `build.rs` is a no-op off-Windows; the daemon
+     compiles via the `not(windows)` path, so `seed-daemon run` is the launchd entrypoint (like systemd).
+   - Launch `target/release/seed-gui` and confirm the window + tray render against Homebrew GTK before
+     touching bundling. **Watch-for:** if the file-chooser crashes, it's GSettings schemas — point
+     `GSETTINGS_SCHEMA_DIR` at Homebrew's `share/glib-2.0/schemas` for this pre-bundle run (the bundled
+     build compiles its own; same class of bug we hit on Windows).
+3. **Then proceed through the checklist 1→6.** New files go in `packaging/macos/` + `scripts/` per the
+   inventory in `docs/macos-packaging.md`. Adapt `packaging/linux/seed-sync` (swap `systemctl`→`launchctl`,
+   paths→`~/Library/...`) and the Linux `web-install.sh`.
+4. **Signing reminder:** every `install_name_tool` / `lipo` invalidates the ad-hoc signature →
+   `codesign --force -s -` last, **inside-out** (dylibs before the executables that load them), or
+   Apple Silicon kills the process. Verify the quarantine dodge: after a `curl | sh` install,
+   `xattr` should show **no** `com.apple.quarantine`.
+5. **Universal:** ship arm64 first (`…macos-arm64.tar.gz`), switch the asset name to `…macos-universal`
+   only once the x86_64 slice is lipo'd in (needs the second Homebrew prefix — see the doc's Phase 2).
+6. **Don't reintroduce GPL** — the project is proprietary now (`LICENSE`, `(c) kznjk LLC`; relicensed
+   2026-06-20). Keep the proprietary EULA; the macOS tarball should bundle `LICENSE` like Linux does.
+7. **Log findings back here tagged `[MACOS]`** (date, short-hash commits) so the Windows/Linux sides
+   can sync — same convention as the `[WIN]`/`[LINUX]` entries below.
