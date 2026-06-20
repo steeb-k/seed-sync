@@ -1,9 +1,13 @@
 # macOS packaging, distribution & auto-update — maintainer guide
 
-> **Status: PLANNED (2026-06-20). Nothing here is built yet.** This is the design record
-> for bringing S.E.E.D. (Seed Sync) to macOS. It mirrors `docs/linux-packaging.md`; sections
-> marked _(planned)_ describe files/flows that still need to be written. As pieces land,
-> drop the _(planned)_ marker and fill in the real command output.
+> **Status: BUILT (arm64), 2026-06-20.** Bring-up checklist 0–3 are done and verified on Apple
+> Silicon (see `docs/cross-os-testing.md` → [MACOS]). The build → bundle → `.app` → install →
+> launchd → update flow works end-to-end, including a `sandbox-exec` "no Homebrew" proof. Still
+> open: universal2 (x86_64 `lipo`), running the CI job on a runner + publishing the macOS asset to
+> `seed-sync-binaries`, and the unified hosted bootstrap. One design change from the original plan:
+> we ship a **`SEED Sync.app` bundle _inside_ the curl|sh tarball** (installed to `~/Applications`)
+> rather than loose binaries — this keeps the quarantine dodge while giving a real Dock/Applications
+> icon. Details below; `_(planned)_` markers remain only on what's genuinely not built.
 
 ## Why the Linux model, not a `.dmg`/`.pkg`
 
@@ -50,45 +54,55 @@ Same public artifact repo, same "installed version is the source of truth" rule 
 reads `seed-daemon --version` and compares to the latest release tag), same **mandatory Cargo
 version bump per release**. Asset name convention: **`seed-sync-<ver>-macos-universal.tar.gz`**.
 
-## Files to build _(planned — `packaging/macos/`)_
+## Files built (`packaging/macos/` + `scripts/`)
 
 | File | Purpose |
 |---|---|
-| `scripts/package-macos.sh` _(planned)_ | The macOS analog of `scripts/package-linux.sh`: `cargo build --release` for each target arch, **bundle + relocate + re-sign GTK dylibs**, `lipo` to universal, stage the tree, write `dist/seed-sync-<ver>-macos-universal.tar.gz`. `--skip-build` to repackage. |
-| `scripts/bundle-gtk-macos.sh` _(planned)_ | The hard part (analog of `bundle-gtk-windows.ps1`): copy the GTK/libadwaita/pixbuf/cairo/pango/… dylib closure into `lib/`, rewrite install names to `@executable_path/../lib` with `install_name_tool`, copy the gdk-pixbuf `loaders.cache` + loaders, compile + bundle GSettings schemas (`glib-compile-schemas`), bundle the Adwaita icon theme, then **ad-hoc re-sign** every relocated binary/dylib (`codesign -s - --force`). |
-| `packaging/macos/seed-sync` _(planned)_ | The one wrapper — install/update/uninstall/status, per-user, using `launchctl` instead of `systemctl`. Mirrors `packaging/linux/seed-sync` (shared `apply_tree` logic). |
-| `packaging/macos/web-install.sh` _(planned)_ | `curl \| sh` bootstrap (POSIX sh). Same shape as the Linux one; selects the `…macos-universal.tar.gz` asset. **This is what dodges quarantine.** |
-| `packaging/macos/io.github.steeb_k.SeedSync.daemon.plist` _(planned)_ | launchd **LaunchAgent** that runs `seed-daemon run`, `KeepAlive`, `RunAtLoad`. The macOS analog of `seed-daemon.service`. |
-| `packaging/macos/io.github.steeb_k.SeedSync.update.plist` _(planned)_ | LaunchAgent with `StartCalendarInterval` (daily) running `seed-sync --update`. Analog of the systemd timer. |
-| `packaging/macos/io.github.steeb_k.SeedSync.gui.plist` _(planned)_ | LaunchAgent `RunAtLoad` for the tray GUI (`seed-gui --hidden`). Analog of the `.desktop` autostart entry. |
+| `scripts/package-macos.sh` ✅ | The macOS analog of `scripts/package-linux.sh`: `cargo build --release`, build the **`SEED Sync.app`** (binaries → `Contents/MacOS`), run the bundler over `Contents/`, write `Info.plist` + `Resources/AppIcon.icns` (sips + iconutil from `icon/appIcon.png`), seal the bundle, tar `dist/seed-sync-<ver>-macos-<arch>.tar.gz`. `--skip-build` to repackage. arm64 today; universal `lipo` = phase 2. |
+| `scripts/bundle-gtk-macos.sh` ✅ | The hard part: walk the `seed-gui` otool closure + the gdk-pixbuf/librsvg loader modules, copy every non-system dylib into `lib/`, rewrite install names to `@executable_path/../lib` (handles absolute `/opt/homebrew/*` **and** `@rpath/*` — librsvg uses `@rpath`), regenerate `loaders.cache`, compile GSettings schemas, bundle the fontconfig config, **ad-hoc re-sign** inside-out. `BUNDLE_BINDIR=MacOS` targets a `.app`'s `Contents/`. No icon theme needed (GTK4 embeds its icons). |
+| `packaging/macos/seed-sync` ✅ | The wrapper — install/update/uninstall/status, per-user, via `launchctl bootstrap/bootout`. Installs the `.app` to `~/Applications`, symlinks the CLI into `~/.local/bin`. |
+| `packaging/macos/Info.plist` ✅ | App bundle metadata (`CFBundleExecutable=seed-gui`, `CFBundleIconFile=AppIcon`, identifier, `__VERSION__` rewritten from Cargo). What makes NSBundle resolve → the Dock/Applications icon. |
+| `packaging/macos/web-install.sh` ✅ | `curl \| sh` bootstrap; selects the macOS asset, unpacks, runs `SEED Sync.app`'s sibling `seed-sync --install`. **Dodges quarantine.** (Superseded for hosting by the unified cross-OS `packaging/web-install.sh` — _planned_.) |
+| `packaging/macos/io.github.steeb_k.SeedSync.daemon.plist` ✅ | LaunchAgent: `__APP__/Contents/MacOS/seed-daemon run`, `KeepAlive`, `RunAtLoad`. Analog of `seed-daemon.service`. |
+| `packaging/macos/io.github.steeb_k.SeedSync.update.plist` ✅ | LaunchAgent: `RunAtLoad` + daily `StartCalendarInterval` → `__BIN__/seed-sync --update` (the real-file wrapper, not the in-app copy, so a self-update can't yank it). |
+| `packaging/macos/io.github.steeb_k.SeedSync.gui.plist` ✅ | LaunchAgent `RunAtLoad` for the tray GUI (`__APP__/Contents/MacOS/seed-gui --hidden`), Aqua-only. Analog of the `.desktop` autostart. |
 
-## Tarball layout _(planned)_
+## Tarball layout (built)
 
 ```
-seed-sync-<ver>-macos-universal/
-├── bin/{seed-daemon,seed-gui,seed-cli}     # universal2, ad-hoc signed, @executable_path rpaths
-├── lib/                                     # bundled GTK/Adwaita/pixbuf/... dylibs (universal, re-signed)
-│   ├── gdk-pixbuf-2.0/.../loaders/ + loaders.cache
-│   └── ...
-├── share/
-│   ├── glib-2.0/schemas/gschemas.compiled   # compiled GSettings schemas (file-chooser etc.)
-│   └── icons/...                            # Adwaita/hicolor app + theme icons
-├── seed-sync                                # the wrapper; also copied to ~/.local/bin on install
+seed-sync-<ver>-macos-arm64/
+├── SEED Sync.app/
+│   └── Contents/
+│       ├── Info.plist                         # CFBundleExecutable=seed-gui, CFBundleIconFile=AppIcon
+│       ├── MacOS/{seed-daemon,seed-gui,seed-cli}   # ad-hoc signed; @executable_path/../lib
+│       ├── lib/                               # bundled GTK/pixbuf/... dylibs (re-signed)
+│       │   └── gdk-pixbuf-2.0/.../loaders/ + loaders.cache
+│       ├── share/glib-2.0/schemas/gschemas.compiled   # compiled GSettings schemas (file-chooser)
+│       ├── etc/fonts/fonts.conf               # fontconfig (points at system macOS font dirs)
+│       └── Resources/AppIcon.icns             # Dock/Applications icon
+├── seed-sync                                  # the wrapper (bootstrap; copied to ~/.local/bin on install)
 ├── INSTALL.txt
-└── LaunchAgents/                            # the three .plist templates (paths rewritten on install)
+├── LICENSE
+└── LaunchAgents/                              # the three .plist templates (__APP__/__BIN__/__LOG__ rewritten)
 ```
 
-## Where things land on the user's machine _(planned, per-user, no root)_
+GTK4 embeds its own icon resource, so no Adwaita/hicolor icon theme is bundled. ~22 MB tarball.
+
+## Where things land on the user's machine (per-user, no root)
 
 ```
-~/.local/bin/                     seed-daemon, seed-gui, seed-cli, seed-sync (+ bundled lib/, share/)
+~/Applications/SEED Sync.app/     the self-contained app (binaries + bundled lib/share/etc + icns)
+~/.local/bin/                     seed-gui, seed-daemon, seed-cli (symlinks into the .app) + seed-sync (real file)
 ~/Library/LaunchAgents/           io.github.steeb_k.SeedSync.{daemon,update,gui}.plist
+~/Library/Logs/SeedSync/          seed-daemon.log, seed-update.log
 ~/Library/Application Support/    DATA: state.db, blobs/, docs/, node.key, seed.sock
                                    (directories crate: ProjectDirs "io.github"/"steeb_k"/"SeedSync")
 ```
 
-The keychain (`keyring` `apple-native`) holds the master seed. `launchctl bootstrap gui/$UID
-<plist>` loads the agents; `launchctl bootout` on uninstall.
+The Keychain (`keyring` `apple-native`) holds the master seed. `launchctl bootstrap gui/$UID <plist>`
+loads the agents; `launchctl bootout` on uninstall. The CLI symlinks are why `@executable_path` must
+resolve through a symlink — `setup_runtime_env` calls `fs::canonicalize` so the prefix is the real
+`.app`, not the symlink's parent (see the gotcha in `cross-os-testing.md`).
 
 ## The bundling process (the hard part) _(planned)_
 
@@ -121,35 +135,50 @@ The keychain (`keyring` `apple-native`) holds the master seed. `launchctl bootst
   - **From-source universal GTK** (gvsbuild-grade effort) — last resort.
   - Re-sign after `lipo` (lipo invalidates signatures too). Switch asset to `…macos-universal.tar.gz`.
 
-## CI _(planned)_
+## CI (built — not yet run on a runner)
 
-Add a `macos` job to `.github/workflows/release.yml` on **`macos-14`** (Apple Silicon runner):
-`brew install gtk4 libadwaita`, build, run `scripts/package-macos.sh`, assert the tag matches the
-Cargo version (same guard as Linux), publish the universal tarball to `seed-sync-binaries` with
-`SEED_BINARIES_TOKEN`, `fail_on_unmatched_files: true`. (Universal build on an arm64 runner needs the
-x86_64 Homebrew/Rosetta setup from Phase 2 — until then the CI job ships arm64.)
+A `macos` job is added to `.github/workflows/release.yml` on **`macos-14`** (Apple Silicon runner):
+`brew install gtk4 libadwaita pkg-config`, the tag↔Cargo-version guard (same as Linux), run
+`scripts/package-macos.sh`, publish `dist/*.tar.gz` to `seed-sync-binaries` with `SEED_BINARIES_TOKEN`
+and `fail_on_unmatched_files: true`. Ships **arm64** (universal needs the x86_64 Homebrew/Rosetta setup
+from Phase 2). **Validate on the first macOS release tag** — the runner's Xcode CLT provides
+`install_name_tool`/`codesign`/`otool`/`iconutil`. Until a tag runs this job, the macOS asset isn't on
+`seed-sync-binaries`, so the live `curl | sh` install can't find it yet.
 
 ## Caveats / gotchas
 
 - **Re-sign AFTER every mutation.** `install_name_tool` and `lipo` both invalidate the ad-hoc
   signature; Apple Silicon refuses to run an invalidly-signed Mach-O. Always `codesign --force -s -`
-  last, inside-out.
-- **GSettings schemas** must be compiled and discoverable or the GTK file-chooser crashes on open
-  (same failure mode fixed on Windows). Bundle `gschemas.compiled` and set `GSETTINGS_SCHEMA_DIR`.
-- **gdk-pixbuf loaders** must be bundled + the cache regenerated, or icons/images fail to load.
+  last, inside-out (dylibs/loaders first, then the binaries, then seal the `.app`).
+- **`@executable_path` through symlinks.** The installed binaries are `~/.local/bin` symlinks into the
+  `.app`. `std::env::current_exe()` may hand back the *symlink* path → wrong prefix → bundled
+  schemas/loaders not found. On a dev box GLib silently falls back to Homebrew's copies, masking it; a
+  brew-less Mac then crashes the file-chooser. **Fix:** `fs::canonicalize` the exe in `setup_runtime_env`.
+  Catch it with `sandbox-exec -p '(version 1)(allow default)(deny file-read* (subpath "/opt/homebrew"))'`
+  — the real "no Homebrew" test on a machine that still has brew.
+- **fontconfig compiled-in config path.** libfontconfig has a baked-in `/opt/homebrew/etc/fonts` dir
+  (absent on users' Macs). Bundle the Homebrew `fonts.conf` (it references the system macOS font dirs)
+  to `etc/fonts/` and set `FONTCONFIG_PATH`; the stale brew cachedir falls through to the xdg cache.
+- **`loaders.cache` must be generated against a launchable bundle.** `gdk-pixbuf-query-loaders` dlopens
+  each module, so after relocation the modules must be re-signed AND `@executable_path/../lib` must
+  resolve — the bundler runs a temporary copy of `query-loaders` from the stage's bindir to satisfy both.
+- **Don't put the shell wrapper inside `Contents/MacOS`.** `codesign` of the bundle treats files there as
+  code and fails to seal an unsigned script. The `seed-sync` wrapper ships at the tarball root only.
+- **GSettings schemas** must be compiled + discoverable or the file-chooser crashes (Windows parallel).
 - **launchd is per-user (`gui/$UID` domain).** Needs an active GUI session (Aqua); headless/SSH-only
-  Macs won't load Aqua agents — the wrapper should warn and still place files (mirrors the Linux
-  systemd-session caveat).
-- **Quarantine dodge is install-path-specific.** It holds for `curl | sh`. If a user instead
-  downloads the tarball in a browser, it *will* be quarantined; document `xattr -dr
-  com.apple.quarantine <dir>` as the escape hatch, or revisit notarization later.
+  Macs won't load Aqua agents — the wrapper warns and still places files.
+- **Quarantine dodge is install-path-specific.** It holds for `curl | sh`. A browser download *will* be
+  quarantined; the escape hatch is `xattr -dr com.apple.quarantine "<dir>"`.
 - **Version bump is mandatory per release** (updater is version-driven; CI guard fails otherwise).
 
 ## Future work (not built)
 
+- **Universal2** — `lipo` the x86_64 slice in (Phase 2 above); switch the asset to `…macos-universal`.
+- **Unified hosted bootstrap** — `steeb-k.github.io/seed-install.sh` should detect the OS and serve the
+  Linux or macOS path from one script (`packaging/web-install.sh`).
 - Developer ID signing + **notarization** (clean install from any source, incl. a future `.dmg`) —
   needs an Apple Developer account ($99/yr). Keeps ad-hoc as the default; notarize on top.
-- A real `.app` bundle + `.dmg` for users who prefer drag-to-Applications (would need notarization).
+- A `.dmg` for drag-to-Applications (would need notarization; the `.app` already exists).
 - Sparkle-style in-app updates (vs the launchd timer).
 
 See also: `docs/linux-packaging.md` (the model this mirrors), `docs/windows-packaging.md` (the MSI

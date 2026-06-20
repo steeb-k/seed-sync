@@ -480,18 +480,23 @@ calls `seed-daemon run` directly, like systemd), keyring `apple-native` (Keychai
 → `~/Library/Application Support`.
 
 **Bring-up checklist (🍎 macOS-only unless marked 🔀):**
-- ⏳ **0. Builds at all** 🍎 — `cargo build --release` on macOS with GTK4/libadwaita present (brew first,
-  to prove the app compiles/runs before tackling bundling).
-- ⏳ **1. GTK dylib bundling** 🍎 — relocate + re-sign; app launches with zero external dylib deps
-  (`otool -L` shows only @rpath/@executable_path + system frameworks).
-- ⏳ **2. launchd** 🍎 — daemon LaunchAgent runs `seed-daemon run`; GUI autostart; update timer
-  (`StartCalendarInterval`) runs `seed-sync --update`.
-- ⏳ **3. `seed-sync` wrapper** 🍎 — install/update/uninstall/status via `launchctl`; quarantine-dodge
-  verified (`xattr` shows no `com.apple.quarantine` after `curl | sh`).
-- ⏳ **4. Universal2** 🍎 — `lipo`'d binaries + dylibs run native on both arches (`file` shows 2 arches).
-- ⏳ **5. CI** 🍎 — `release.yml` macOS job (macos-14 runner) attaches `…macos-universal.tar.gz` to the
-  same `seed-sync-binaries` release.
-- ⏳ **6. Sync matrix** 🔀 — once it runs, fold macOS into the Windows⇄Linux⇄macOS sync tests (mirror,
+- ✅ **0. Builds at all** 🍎 — `cargo build --release` clean on Apple Silicon (Rust 1.96, Homebrew GTK
+  4.22 / libadwaita 1.9). All three binaries, 0 warnings; `seed-daemon 1.1.0` runs.
+- ✅ **1. GTK dylib bundling** 🍎 — `scripts/bundle-gtk-macos.sh` walks the `seed-gui` closure (45 dylibs
+  + 12 pixbuf/SVG loaders), relocates to `@executable_path/../lib`, compiles schemas, bundles pixbuf
+  cache + fontconfig, ad-hoc re-signs inside-out. **Verified no-Homebrew via a `sandbox-exec` profile
+  that denies `/opt/homebrew`** — app runs with 0 Homebrew dylibs, no schema/GTK errors.
+- ✅ **2. launchd** 🍎 — three LaunchAgents (`packaging/macos/*.plist`): daemon (`RunAtLoad`+`KeepAlive`),
+  update (`RunAtLoad`+daily `StartCalendarInterval` → `seed-sync --update`), gui (`--hidden`, Aqua).
+  All three load + run from the installed app.
+- ✅ **3. `seed-sync` wrapper** 🍎 — `packaging/macos/seed-sync`: install/update/uninstall/status via
+  `launchctl bootstrap/bootout`. Installs a **`SEED Sync.app`** bundle to `~/Applications` (Dock +
+  Applications icon, no root), CLI symlinks in `~/.local/bin`. End-to-end install + IPC roundtrip
+  (`seed-cli list`/`node-addr`) verified; update agent reached the live repo and reported "up to date".
+- ⏳ **4. Universal2** 🍎 — still arm64-only (`…macos-arm64.tar.gz`). `lipo` x86_64 slice = phase 2.
+- 🟡 **5. CI** 🍎 — `release.yml` macos-14 job added (brew gtk4+libadwaita → `package-macos.sh` → publish
+  with the same tag/version guard). **Not yet run on a runner** — validate on the first macOS release tag.
+- ⏳ **6. Sync matrix** 🔀 — once published, fold macOS into the Windows⇄Linux⇄macOS sync tests (mirror,
   self-heal, dedup, multi-master converge, presence) — new columns in the status board.
 
 ### [MACOS] START HERE — handoff from the Windows side (2026-06-20)
@@ -523,3 +528,38 @@ You're now on the Apple Silicon Mac. Planning is done on Windows; this is the bu
    2026-06-20). Keep the proprietary EULA; the macOS tarball should bundle `LICENSE` like Linux does.
 7. **Log findings back here tagged `[MACOS]`** (date, short-hash commits) so the Windows/Linux sides
    can sync — same convention as the `[WIN]`/`[LINUX]` entries below.
+
+### [MACOS] 2026-06-20 — bring-up checklist 0–3 done (build → bundle → .app → install)
+Apple Silicon (arm64), Homebrew GTK 4.22 / libadwaita 1.9, Rust 1.96. New files: `scripts/{bundle-gtk,
+package}-macos.sh`, `packaging/macos/` (wrapper + 3 plists + `Info.plist` + `web-install.sh` +
+`INSTALL.txt`), `.github/workflows/release.yml` macos job. Code: `seed-gui/src/main.rs` got a macOS
+`setup_runtime_env` + the header-action move.
+
+- ✅ **Builds + runs** clean against Homebrew GTK; the existing macOS `#[cfg]` branches (tray via
+  `tray-icon`, `open`, daemon spawn) work as-is.
+- ✅ **UI native tweak:** on macOS the window controls (traffic lights) own the LEFT, so the `＋`/gear
+  header actions are packed on the RIGHT (`#[cfg(target_os = "macos")]`; Windows/Linux keep them left).
+- ✅ **Self-contained bundle** — only `seed-gui` links Homebrew (daemon/CLI are system-only). Homebrew's C
+  libs cross-reference by absolute `/opt/homebrew/opt/*` paths; its **Rust-built librsvg uses `@rpath`** —
+  the bundler handles both. PNG/JPEG are built into libgdk_pixbuf; the **SVG loader (librsvg) is needed
+  for symbolic icons** and lives in librsvg's own loaders dir. No Adwaita icon theme is installed — GTK4
+  uses its **embedded** icon resource, so no icon-theme bundling needed.
+- ✅ **Proved no-Homebrew** with `sandbox-exec` denying `/opt/homebrew` (faithful "no brew" sim): runs
+  alive, **0 Homebrew dylibs**, no errors. **Gotcha it caught:** binaries are reached via `~/.local/bin`
+  symlinks, and `std::env::current_exe()` can return the *symlink* path → wrong prefix → bundled schemas
+  not found → on a dev box GLib silently falls back to Homebrew's schemas (masking it), but a real
+  brew-less machine would crash the file-chooser. **Fix:** `fs::canonicalize` the exe in setup_runtime_env.
+- ✅ **fontconfig gotcha:** bundled libfontconfig has a compiled-in `/opt/homebrew/etc/fonts` config path
+  (absent on users' Macs). Bundle the Homebrew `fonts.conf` (it points at the system macOS font dirs) and
+  set `FONTCONFIG_PATH`; the stale brew cachedir falls through to the xdg `~/.cache/fontconfig` entry.
+- ✅ **Distribution = a `SEED Sync.app` inside the curl|sh tarball**, installed to `~/Applications` (not a
+  `.dmg`). Keeps the quarantine dodge + ad-hoc signing, AND gives a real Dock/Applications icon (generated
+  from `icon/appIcon.png` via `iconutil`). `@executable_path/../lib` resolves through the install symlink
+  to `Contents/lib` (dyld + canonicalize confirm symlink launch resolves to the real bundle).
+- ✅ **launchd + wrapper** verified end-to-end: install from tarball → app in `~/Applications`, 3 agents
+  load + run from the app, daemon listens, `seed-cli list`/`node-addr` IPC roundtrips, update agent hits
+  the live `seed-sync-binaries` repo and reports "up to date". Uninstall path implemented (not live-tested).
+- ⏳ **Not done yet:** universal2 (x86_64 lipo), the macos CI job has not run on a runner, the macOS asset
+  isn't published to `seed-sync-binaries` yet (so the live `curl|sh` install won't find it until a release
+  tag with the macos job runs), and the hosted `steeb-k.github.io/seed-install.sh` needs the unified
+  cross-OS bootstrap. The sync matrix (item 6) is untouched.
