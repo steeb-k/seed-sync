@@ -26,10 +26,12 @@ if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 New-Item -ItemType Directory -Force -Path "$dist\bin" | Out-Null
 
-# 1. Our binaries.
+# 1. Our binaries + the auto-update engine (installed alongside; the MSI registers
+#    it as the SeedSyncUpdate scheduled task).
 Copy-Item "$root\target\$Target\seed-gui.exe"    "$dist\bin\"
 Copy-Item "$root\target\$Target\seed-daemon.exe" "$dist\bin\"
 Copy-Item "$root\target\$Target\seed-cli.exe"    "$dist\bin\"
+Copy-Item "$root\packaging\windows\seed-sync-update.ps1" "$dist\bin\"
 
 # 2. GTK runtime DLLs (everything the linker pulled in lives in gvsbuild's bin).
 Copy-Item "$gbin\*.dll" "$dist\bin\"

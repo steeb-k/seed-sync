@@ -79,33 +79,76 @@ problem. Authoring lives in `wix\seedsync.wxs`.
 
 ```pwsh
 dotnet tool install --global wix --version "5.*"   # one-time
-pwsh -File scripts\build-msi.ps1                    # release build + bundle + wix build
-#   -> target\wix\SeedSync-0.1.0.msi
+pwsh -File scripts\build-msi.ps1                    # build + bundle + sign + wix build + sign MSI
+#   -> target\wix\seed-sync-<version>-windows-x86_64.msi
 ```
+
+`build-msi.ps1` needs the **UI + Util** WiX extensions; it adds them automatically
+(`wix extension add -g WixToolset.UI.wixext WixToolset.Util.wixext`) on first run.
+The **version is single-sourced** from `Cargo.toml`'s `[workspace.package].version`
+(override with `-Version`), and the artifact name matches the Linux convention
+(`seed-sync-<version>-windows-x86_64.msi`) so both OSes' assets sit on the same
+release.
 
 `wix\seedsync.wxs` (per-machine, x64):
 - Installs the whole `dist\SeedSync` tree into `C:\Program Files\SeedSync`
-  (`bin\*.dll` globbed via `<Files>`; `share\`/`lib\` harvested; the four exes
-  explicit so the daemon can carry the service).
+  (`bin\*.dll` globbed via `<Files>`; `share\`/`lib\` harvested; the four exes +
+  the updater script explicit so the daemon can carry the service).
 - Registers **SeedSyncDaemon** as a LocalSystem, auto-start service via
   `<ServiceInstall>` + `<ServiceControl>` (`Arguments="service"`, matching
   `service.rs`); MSI starts it on install and waits for it to stop on
   uninstall/upgrade before removing files.
-- Start-menu + desktop shortcuts to `seed-gui.exe`; `MajorUpgrade` for in-place
-  upgrades.
+- **WixUI_Minimal** UI: a single Welcome+License page (shows the GPL-3.0 license,
+  generated to `wix\license.rtf` from the repo `LICENSE` at build time), then
+  progress + finish. No folder chooser.
+- Registers the **SeedSyncUpdate** scheduled task (daily auto-update, §3.2) via a
+  deferred `util:QuietExec64` custom action that runs the bundled updater script as
+  SYSTEM; the task is removed on a real uninstall but survives version upgrades.
+- Start-menu + desktop shortcuts to `seed-gui.exe`; `MajorUpgrade`
+  (`AllowSameVersionUpgrades`) for in-place upgrades — also what the silent updater
+  relies on.
 
 The daemon's data still lives machine-wide in `%PROGRAMDATA%\SeedSync` regardless
 of the Program Files install location (see §2).
 
-Not yet done: a custom installer UI (the WixUI extension — currently the default
-basic progress UI) and code signing.
+### 3.1 Code signing (Azure Trusted Signing)
+`build-msi.ps1` signs **our three exes** (before `wix build`, since they're embedded
+in the MSI) and then the **MSI** itself, via `scripts\sign-artifacts.ps1` — a
+`signtool … /dlib Azure.CodeSigning.Dlib.dll /dmdf <metadata.json>` wrapper
+(timestamp `http://timestamp.acs.microsoft.com`). The ~third-party GTK DLLs are left
+unsigned (standard practice; SmartScreen keys off the MSI + the launched exe).
 
-### Code signing (avoid SmartScreen)
-Deferred until there's a cert. Sign every exe + DLL **before** `wix build` (they're
-embedded in the MSI), then sign the MSI:
+Signing is **opt-in**: it runs only when the metadata JSON is present
+(`$env:ARTIFACT_SIGNING_METADATA`, else repo-root `artifact-signing-metadata.json` —
+both git-ignored). Without it the build still succeeds and produces unsigned
+artifacts (fine for local testing / other contributors). The metadata is
+`{ Endpoint, CodeSigningAccountName, CertificateProfileName }`; tools auto-resolve
+from the Windows SDK + Trusted Signing client tools (override with `SIGNTOOL_PATH` /
+`ARTIFACT_SIGNING_DLIB`).
+
+### 3.2 Auto-update (the Windows analog of the Linux timer)
+Distribution mirrors Linux: one **GitHub Release per `vX.Y.Z` tag** on the public
+`steeb-k/seed-sync-binaries` repo carries both OSes' assets. The Windows half is
+built + signed **locally** and attached to the Linux-created release:
+
 ```pwsh
-signtool sign /fd SHA256 /a /tr http://timestamp.digicert.com /td SHA256 <file>
+pwsh -File scripts\build-msi.ps1                    # -> signed MSI
+pwsh -File scripts\publish-msi.ps1                  # gh release upload to seed-sync-binaries vX.Y.Z
 ```
+
+`packaging\windows\seed-sync-update.ps1` (installed to `…\SeedSync\bin`) is the
+update engine, run as SYSTEM by the **SeedSyncUpdate** scheduled task (daily +
+shortly after boot). It compares `seed-daemon.exe --version` to the latest release
+tag and, when newer, downloads the `*windows-x86_64.msi` asset and applies it with
+`msiexec /i … /qn` — the MSI's `MajorUpgrade` stops the service, swaps files
+(GTK DLLs included), and restarts it. Modes: default = check+apply, `-Check` =
+report only, `-RegisterTask` / `-UnregisterTask` = used by the MSI. Logs to
+`%PROGRAMDATA%\SeedSync\update.log`.
+
+To cut a release: bump `[workspace.package].version` in `Cargo.toml`, commit, then
+`git tag vX.Y.Z && git push origin vX.Y.Z` (Linux `release.yml` builds + publishes
+the tarball and guards tag == Cargo version), and run the two scripts above on the
+Windows box.
 
 ## 4. Checkpoint #3 (end-to-end)
 

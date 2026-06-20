@@ -3,14 +3,20 @@
   Seed Sync MSI (WiX v4+ schema; built with WiX 5).
 
   Installs the self-contained portable bundle (dist\SeedSync: the three exes plus
-  the whole GTK runtime) into "Program Files\SeedSync", registers + starts the
-  LocalSystem "SeedSyncDaemon" service, and drops Start-menu + desktop shortcuts
-  to the GUI.
+  the whole GTK runtime and the updater script) into "Program Files\SeedSync",
+  registers + starts the LocalSystem "SeedSyncDaemon" service, registers the
+  "SeedSyncUpdate" scheduled task (daily auto-update), and drops Start-menu +
+  desktop shortcuts to the GUI.
 
-  Build (see scripts\build-msi.ps1) — -arch x64 so it installs to Program Files
-  (without it WiX builds a 32-bit MSI that lands in Program Files (x86)):
-    wix build -arch x64 wix\seedsync.wxs -d DistDir=dist\SeedSync -o target\wix\SeedSync-<ver>.msi
+  Build (see scripts\build-msi.ps1) — needs the UI + Util extensions and -arch x64
+  so it installs to Program Files (without it WiX builds a 32-bit MSI that lands in
+  Program Files (x86)):
+    wix build -arch x64 wix\seedsync.wxs ^
+      -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext ^
+      -d DistDir=dist\SeedSync -d Version=<ver> -d LicenseRtf=<path> ^
+      -o target\wix\seed-sync-<ver>-windows-x86_64.msi
 
+  Version is single-sourced from Cargo.toml (passed as $(Version) by build-msi.ps1).
   The runtime is harvested wholesale with <Files> (no hand-maintained file list).
   seed-daemon.exe is its own component so the service can be installed/started/
   stopped/removed declaratively (ServiceInstall + ServiceControl) — the MSI then
@@ -18,23 +24,47 @@
   registration matches a manual `seed-daemon.exe install` (crates\seed-daemon\src\
   service.rs): LocalSystem, auto-start, "service" launch argument.
 -->
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Package Name="Seed Sync"
            Manufacturer="steeb-k"
-           Version="0.1.0"
+           Version="$(Version)"
            UpgradeCode="51862F05-49F8-4AB0-BE4A-2831849E2BF6"
            Scope="perMachine"
            Compressed="yes">
 
     <SummaryInformation Description="Seed Sync — P2P mirrored-folder sync" />
-    <!-- AllowSameVersionUpgrades so reinstalling 0.1.0 (during iteration) replaces
-         any existing install instead of stacking a second registered product. -->
+    <!-- AllowSameVersionUpgrades so reinstalling the same version (during iteration,
+         and the silent updater's msiexec /i re-apply) replaces any existing install
+         instead of stacking a second registered product. -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
     <MediaTemplate EmbedCab="yes" />
 
     <Icon Id="AppIcon" SourceFile="$(DistDir)\bin\seed-gui.exe" />
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <!-- WixUI_Minimal: a single Welcome+License page (shows the GPL-3.0 license),
+         then progress + finish. No folder chooser; installs to Program Files. -->
+    <ui:WixUI Id="WixUI_Minimal" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicenseRtf)" />
+
+    <!-- Finish page: a pre-checked "Launch SEED Sync" checkbox that starts the GUI
+         as the logged-in user (Impersonate="yes") on a first-time install. -->
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch SEED Sync" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WixShellExecTarget" Value="[#seed_gui.exe]" />
+    <CustomAction Id="LaunchApplication" BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixShellExec" Impersonate="yes" Return="ignore" />
+    <UI>
+      <!-- DialogRef resolves the dialog symbol from the UI extension so the
+           Publish below links. NB: in WiX v5 the finish dialog is "ExitDialog"
+           (the v3 name was "ExitDlg"). -->
+      <DialogRef Id="ExitDialog" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchApplication"
+               Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 and NOT Installed" />
+    </UI>
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="SeedSync">
@@ -44,9 +74,10 @@
       </Directory>
     </StandardDirectory>
 
-    <!-- bin\ is only DLLs + four exes (see scripts\bundle-gtk-windows.ps1). The
-         GTK DLLs are globbed; the exes are listed so the daemon can carry the
-         service. (WiX 5's <Files> has no Exclude, hence the explicit split.) -->
+    <!-- bin\ is only DLLs + four exes + the updater script (see
+         scripts\bundle-gtk-windows.ps1). The GTK DLLs are globbed; the exes are
+         listed so the daemon can carry the service. (WiX 5's <Files> has no
+         Exclude, hence the explicit split.) -->
     <ComponentGroup Id="BinDlls" Directory="BinDir">
       <Files Include="$(DistDir)\bin\*.dll" />
     </ComponentGroup>
@@ -58,6 +89,11 @@
     </Component>
     <Component Id="GdbusExe" Directory="BinDir" Guid="*">
       <File Id="gdbus.exe" Source="$(DistDir)\bin\gdbus.exe" KeyPath="yes" />
+    </Component>
+    <!-- The auto-update engine + its registration helper. Referenced by the
+         scheduled-task custom action below via [#UpdateScript]. -->
+    <Component Id="UpdateScriptComp" Directory="BinDir" Guid="*">
+      <File Id="UpdateScript" Source="$(DistDir)\bin\seed-sync-update.ps1" KeyPath="yes" />
     </Component>
 
     <!-- The GTK runtime (schemas, pixbuf loaders, icon themes). Harvested into
@@ -116,11 +152,37 @@
       <ComponentRef Id="GuiExe" />
       <ComponentRef Id="CliExe" />
       <ComponentRef Id="GdbusExe" />
+      <ComponentRef Id="UpdateScriptComp" />
       <ComponentGroupRef Id="ShareFiles" />
       <ComponentGroupRef Id="LibFiles" />
       <ComponentRef Id="DaemonExe" />
       <ComponentRef Id="StartMenuShortcut" />
       <ComponentRef Id="DesktopShortcut" />
     </Feature>
+
+    <!-- Daily auto-update Scheduled Task (the Windows analog of the Linux
+         systemd user timer). Registered as SYSTEM via the bundled updater
+         script on install; removed on a real uninstall (NOT a major-upgrade
+         removal, so the task survives version bumps). Deferred + no-impersonate
+         => runs in the elevated install context. Return="ignore" so a task
+         failure never blocks the install/uninstall. -->
+    <CustomAction Id="RegisterUpdateTask" BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixQuietExec64" Execute="deferred"
+                  Impersonate="no" Return="ignore" />
+    <SetProperty Id="RegisterUpdateTask" Sequence="execute" Before="RegisterUpdateTask"
+                 Condition="NOT REMOVE"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File &quot;[#UpdateScript]&quot; -RegisterTask" />
+
+    <CustomAction Id="UnregisterUpdateTask" BinaryRef="Wix4UtilCA_X64"
+                  DllEntry="WixQuietExec64" Execute="deferred"
+                  Impersonate="no" Return="ignore" />
+    <SetProperty Id="UnregisterUpdateTask" Sequence="execute" Before="UnregisterUpdateTask"
+                 Condition="REMOVE AND NOT UPGRADINGPRODUCTCODE"
+                 Value="&quot;[System64Folder]schtasks.exe&quot; /Delete /TN &quot;SeedSyncUpdate&quot; /F" />
+
+    <InstallExecuteSequence>
+      <Custom Action="RegisterUpdateTask" After="InstallServices" Condition="NOT REMOVE" />
+      <Custom Action="UnregisterUpdateTask" Before="RemoveFiles" Condition="REMOVE AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
   </Package>
 </Wix>

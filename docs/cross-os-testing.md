@@ -334,16 +334,23 @@ for the Windows instance** to build its half. Full Linux design lives in `docs/l
 / `--uninstall` / `--status`; daemon as `systemd --user`; a `systemd --user` **timer** (daily) runs
 `seed-sync --update`, which does stop-daemon → swap binaries → restart.
 
-**[WIN] TODO — mirror this on Windows:**
-1. **Publish step:** have the Windows build attach its MSI/zip to the `seed-sync-binaries` release for
-   the tag (same release the Linux job creates — `softprops/action-gh-release` upserts, so order doesn't
-   matter). Reuse the `SEED_BINARIES_TOKEN` secret. (Windows GUI+MSI build automation in CI is still
-   pending per earlier notes; until then the artifact can be attached manually to the release.)
-2. **Windows updater** mirroring `seed-sync --update`: query the latest release (public, no auth), compare
-   `seed-daemon.exe --version`, download the Windows artifact, **stop the `SeedSyncDaemon` service**, swap
-   binaries (or run the MSI silently with `msiexec /i … /qn`), restart the service. Mind the in-use GTK
-   runtime DLLs (the service must be stopped before replacing them).
-3. **Scheduled Task** as the Windows analog of the systemd timer — periodic auto-update check (e.g. daily),
-   running the updater for the installed user/service.
-4. Decide MSI-vs-zip: the MSI already does service registration + shortcuts; a silent MSI upgrade is the
-   natural "apply" step (the WiX `MajorUpgrade`/same-version-upgrade handling is already in place).
+**[WIN] DONE (2026-06-20) — Windows half built (code-complete; live-test pending):**
+1. **Publish step:** ✅ chosen approach = **local build+sign, then attach** (signing uses an Azure
+   Trusted Signing cert that stays off CI). `scripts\build-msi.ps1` produces a signed
+   `seed-sync-<ver>-windows-x86_64.msi` (naming matches the Linux tarball); `scripts\publish-msi.ps1`
+   does `gh release upload v<ver> … -R steeb-k/seed-sync-binaries --clobber` onto the same release the
+   Linux `release.yml` creates. (No Windows CI job — deliberate, per the signing constraint.)
+2. **Windows updater:** ✅ `packaging\windows\seed-sync-update.ps1` — queries the latest release (public,
+   no auth), compares `seed-daemon.exe --version`, downloads the `*windows-x86_64.msi` and applies it with
+   `msiexec /i … /qn`. The MSI's `MajorUpgrade` stops the service, swaps files (GTK DLLs included), and
+   restarts — so no manual binary-swap / DLL-in-use juggling.
+3. **Scheduled Task:** ✅ **SeedSyncUpdate** (daily + ~5 min after boot, SYSTEM), registered by the MSI via
+   a deferred `util:QuietExec64` custom action calling the updater `-RegisterTask`; removed on uninstall
+   (not on upgrade). Analog of the Linux systemd `--user` timer.
+4. **MSI-vs-zip:** ✅ MSI — silent `msiexec /qn` is the "apply" step (service registration + shortcuts +
+   `MajorUpgrade` already in place).
+
+**Still to validate live on Windows:** build the signed MSI, install it, confirm SmartScreen-clean +
+`Get-AuthenticodeSignature` Valid on the exes + MSI; the WixUI_Minimal GPL page shows; the SeedSyncUpdate
+task exists; and an end-to-end self-update (publish a newer tag → task picks it up → silent upgrade →
+service restarts).

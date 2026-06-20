@@ -16,6 +16,12 @@
 *.msi
 *.wixobj
 *.wixpdb
+# generated from LICENSE by build-msi.ps1
+/wix/license.rtf
+
+# Code-signing material (Azure Trusted Signing account/profile names; local only)
+/signing-example/
+/artifact-signing-metadata.json
 
 # Editor / OS
 .idea/
