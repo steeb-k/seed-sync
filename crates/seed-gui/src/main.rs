@@ -268,6 +268,52 @@ fn setup_runtime_env() {
 #[cfg(not(any(windows, target_os = "macos")))]
 fn setup_runtime_env() {}
 
+/// macOS: present the window when the user reopens the app (Dock click, Finder
+/// double-click, `open`), which GTK4 doesn't surface as a GApplication `activate`.
+/// We observe `NSApplicationDidBecomeActiveNotification` and poke the reveal
+/// channel; the GTK-side consumer (see `build_ui`) calls `window.present()`. The
+/// observer block runs on the main (Cocoa == GTK) thread; `try_send` is enough.
+#[cfg(target_os = "macos")]
+fn install_reopen_handler(show_tx: async_channel::Sender<()>) {
+    use block2::RcBlock;
+    use objc2_app_kit::NSApplicationDidBecomeActiveNotification;
+    use objc2_foundation::{NSNotification, NSNotificationCenter};
+    use std::ptr::NonNull;
+
+    let block = RcBlock::new(move |_n: NonNull<NSNotification>| {
+        let _ = show_tx.try_send(());
+    });
+    let token = unsafe {
+        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(NSApplicationDidBecomeActiveNotification),
+            None,
+            None,
+            &block,
+        )
+    };
+    // The observer + block live for the whole process.
+    std::mem::forget(token);
+    std::mem::forget(block);
+}
+
+/// macOS: resign the app's "active" status when hiding the window to the tray.
+/// Otherwise the app stays the frontmost app with no visible window, and a later
+/// reopen (Dock click / `open`) is not an inactive→active transition, so the
+/// NSApplicationDidBecomeActive observer never fires and the window can't return.
+#[cfg(target_os = "macos")]
+fn macos_resign_active() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    if let Some(mtm) = MainThreadMarker::new() {
+        // hide: (not the deprecated/no-op deactivate) genuinely makes the app
+        // inactive + offscreen; the tray NSStatusItem is unaffected. A reopen then
+        // un-hides + re-activates, firing the DidBecomeActive observer.
+        NSApplication::sharedApplication(mtm).hide(None);
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn macos_resign_active() {}
+
 fn main() -> glib::ExitCode {
     setup_runtime_env();
 
@@ -313,6 +359,13 @@ fn main() -> glib::ExitCode {
         // Another instance owns the lock; we signaled it to show and now exit.
         return glib::ExitCode::SUCCESS;
     }
+    // macOS: GTK4 doesn't deliver the Dock/Finder "reopen" of a running app as a
+    // GApplication `activate`, so a double-click wouldn't re-show a tray-hidden
+    // window. Observe NSApplication becoming active and fire the same reveal
+    // channel a second launch uses, which presents the window on the GTK loop.
+    #[cfg(target_os = "macos")]
+    install_reopen_handler(show_tx.clone());
+
     // Keep a sender alive for the whole process so the reveal-channel stays open
     // (on Windows the watcher thread also holds one; on Linux it's otherwise
     // unused — GApplication's own D-Bus uniqueness handles a second launch).
@@ -320,9 +373,13 @@ fn main() -> glib::ExitCode {
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     app.connect_activate(move |app| {
-        // Re-activation (Linux GApplication uniqueness, or our reveal-signal)
-        // presents the existing window instead of building a second one.
+        // Re-activation (Linux GApplication uniqueness, macOS Dock/reopen, or our
+        // reveal-signal) presents the existing window instead of building a second
+        // one. After a close-to-tray the window is hidden (set_visible(false)), so
+        // explicitly un-hide before presenting or present() may not re-show it.
+        tracing::debug!("activate fired (windows={})", app.windows().len());
         if let Some(win) = app.windows().first() {
+            win.set_visible(true);
             win.present();
             return;
         }
@@ -849,9 +906,28 @@ fn build_ui(
     // Closing the window hides it to the tray instead of quitting, so the app
     // (and its tray icon) keeps running in the background.
     window.connect_close_request(|w| {
+        tracing::debug!("close-request -> hide to tray");
         w.set_visible(false);
+        macos_resign_active();
         glib::Propagation::Stop
     });
+
+    // macOS: Cmd+Q hides the window to the tray (the app keeps running in the
+    // background); Quit stays available from the tray menu. We rebind the standard
+    // quit accelerator to a hide action so the menu-bar/⌘Q shortcut closes the
+    // window instead of terminating the process.
+    #[cfg(target_os = "macos")]
+    {
+        let hide = gio::SimpleAction::new("hide-to-tray", None);
+        let w = window.clone();
+        hide.connect_activate(move |_, _| {
+            w.set_visible(false);
+            macos_resign_active();
+        });
+        app.add_action(&hide);
+        app.set_accels_for_action("app.hide-to-tray", &["<Meta>q"]);
+        app.set_accels_for_action("app.quit", &[]);
+    }
 
     // --- system tray (best effort; ignored if no StatusNotifier host) ---
     tray::install(

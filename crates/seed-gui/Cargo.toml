@@ -34,3 +34,12 @@ tray-icon.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = "0.3.5"
+
+# macOS only: observe NSApplication "did become active" so a Dock/Finder reopen of
+# the running app re-presents the (tray-hidden) window — GTK4 doesn't surface the
+# macOS reopen as a GApplication signal. objc2 is already in the tree via tray-icon.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSNotification", "NSOperation", "NSString", "NSObject", "NSThread", "block2"] }
+objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
+block2 = "0.6"
