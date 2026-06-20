@@ -48,11 +48,15 @@ if [ "$SKIP_BUILD" != 1 ]; then
   cargo build --release --target "$ARM_TGT" -p seed-daemon -p seed-gui -p seed-cli
   if [ "$UNIVERSAL" = 1 ]; then
     echo "package-macos: building x86_64 slice against $X86_BREW GTK"
-    # pkg-config must resolve the x86_64 GTK; ALLOW_CROSS since host=arm64.
-    PKG_CONFIG_PATH="$X86_BREW/lib/pkgconfig:$X86_BREW/share/pkgconfig" \
+    # pkg-config must resolve the x86_64 GTK closure with NO arm64 leakage, so set
+    # PKG_CONFIG_LIBDIR (replaces the default search path) to the x86_64 brew's
+    # per-formula pkgconfig dirs (covers keg-only) + linked lib/share + Homebrew's
+    # per-macOS-version stubs for system libs (zlib/libffi/expat/…). ALLOW_CROSS
+    # because the host (arm64) != target (x86_64).
+    macos_maj="$(sw_vers -productVersion | cut -d. -f1)"
+    x86_pc="$(ls -d "$X86_BREW"/opt/*/lib/pkgconfig 2>/dev/null | tr '\n' ':')$X86_BREW/lib/pkgconfig:$X86_BREW/share/pkgconfig:$X86_BREW/Homebrew/Library/Homebrew/os/mac/pkgconfig/$macos_maj"
+    PKG_CONFIG_LIBDIR="$x86_pc" \
     PKG_CONFIG_ALLOW_CROSS=1 \
-    PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 \
-    PKG_CONFIG_ALLOW_SYSTEM_CFLAGS=1 \
       cargo build --release --target "$X86_TGT" -p seed-daemon -p seed-gui -p seed-cli
   fi
 fi
