@@ -107,8 +107,8 @@ jobs:
   windows:
     name: Windows MSI -> seed-sync-binaries
     # Builds the signed MSI end to end and publishes it to the same release as
-    # Linux/macOS. GTK comes from gvsbuild (Option A: built once, then cached).
-    # Signing uses Azure Trusted Signing via OIDC — the cert never touches CI; the
+    # Linux/macOS. GTK comes from the prebuilt gvsbuild zip (see the GTK step).
+    # Signing uses Azure Artifact Signing via OIDC — the cert never touches CI; the
     # runner authenticates as a service principal and the dlib signs remotely.
     #
     # REQUIRED SETUP before this job can sign (one-time, by the maintainer) — DONE:
@@ -120,8 +120,7 @@ jobs:
     #      repo:steeb-k/seed-sync-gtk:ref:refs/tags/v* (any version tag).
     #   3. Repo secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID.
     # The job is independent, so even if Azure auth ever breaks the Linux + macOS
-    # assets still publish. (UNVALIDATED on a runner — the gvsbuild + dlib-install
-    # steps want a first-tag shakeout on Windows.)
+    # assets still publish. Validated end to end on a runner with v1.1.1.
     runs-on: windows-latest
     # The build is ~15 min; with signing + wix it finishes well under this. The cap
     # is a guard: a signing-auth misconfig can make signtool hang for ~an hour
