@@ -123,6 +123,10 @@ jobs:
     # assets still publish. (UNVALIDATED on a runner — the gvsbuild + dlib-install
     # steps want a first-tag shakeout on Windows.)
     runs-on: windows-latest
+    # The build is ~15 min; with signing + wix it finishes well under this. The cap
+    # is a guard: a signing-auth misconfig can make signtool hang for ~an hour
+    # (see the AZURE_TOKEN_CREDENTIALS note below), so fail fast instead.
+    timeout-minutes: 40
     permissions:
       id-token: write     # azure/login OIDC
       contents: read
@@ -192,6 +196,14 @@ jobs:
       # it reads artifact-signing-metadata.json and signs via the OIDC session). ---
       - name: Build + sign the MSI
         shell: pwsh
+        # Restrict the Azure Code Signing dlib's DefaultAzureCredential to the
+        # developer-credential set so it signs via the `az` session established by
+        # the OIDC login step. Unrestricted, it also probes Managed Identity (IMDS),
+        # which has no endpoint on the runner and hangs each signtool call for ~an
+        # hour. `dev` is the selector supported by the bundled Azure.Identity 1.14
+        # (single-credential selection needs 1.16+). build-msi.ps1 is unchanged.
+        env:
+          AZURE_TOKEN_CREDENTIALS: dev
         run: pwsh -File scripts\build-msi.ps1
 
       - name: Publish MSI to seed-sync-binaries
