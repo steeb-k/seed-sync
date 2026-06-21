@@ -21,7 +21,12 @@
 
 param(
     [string]$GtkRoot = "C:\gtk",
-    [string]$Version
+    [string]$Version,
+    # Skip the cargo build and package the existing target\release bins. CI builds
+    # in a separate step BEFORE `azure/login` so the short-lived federated signing
+    # token (~5 min) is still valid when [3/6]/[6/6] sign. Mirrors the
+    # --skip-build flag in package-linux.sh / package-macos.sh.
+    [switch]$SkipBuild
 )
 
 $ErrorActionPreference = "Stop"
@@ -38,10 +43,14 @@ $env:PKG_CONFIG_PATH = "$GtkRoot\lib\pkgconfig"
 $env:PATH = "$GtkRoot\bin;$env:USERPROFILE\.dotnet\tools;$env:PATH"
 $env:LIB = "$GtkRoot\lib;$env:LIB"
 
-Write-Host "[1/6] cargo build --release" -ForegroundColor Cyan
-& cargo build --release
-if ($LASTEXITCODE -ne 0) {
-    throw "cargo build failed. If it couldn't replace seed-daemon.exe, stop the service first: seed-daemon.exe stop"
+if ($SkipBuild) {
+    Write-Host "[1/6] cargo build --release (SKIPPED -SkipBuild)" -ForegroundColor Cyan
+} else {
+    Write-Host "[1/6] cargo build --release" -ForegroundColor Cyan
+    & cargo build --release
+    if ($LASTEXITCODE -ne 0) {
+        throw "cargo build failed. If it couldn't replace seed-daemon.exe, stop the service first: seed-daemon.exe stop"
+    }
 }
 
 Write-Host "[2/6] bundling the GTK runtime -> dist\SeedSync" -ForegroundColor Cyan
