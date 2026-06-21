@@ -81,16 +81,17 @@ foreach ($ch in $escaped.ToCharArray()) {
 Set-Content -Path $licenseRtf -Value $sb.ToString() -Encoding ASCII
 
 Write-Host "[5/6] wix build" -ForegroundColor Cyan
-# Ensure the UI + Util extensions are available, pinned to the installed wix
-# version (idempotent; needs network only the first time). `wix extension add`
-# takes the version as id/version, not a --version flag.
+# Ensure the UI + Util extensions are present at EXACTLY the installed wix engine
+# version. Add unconditionally (idempotent): a name-only "already present?" check
+# is unsafe because a runner may have these registered at a DIFFERENT version
+# (e.g. GitHub's preinstalled WiX) — `wix build` then fails with WIX0144 because
+# it can't find the engine-matched version. `wix extension add` takes the version
+# as id/version, not a --version flag.
 $wixVer = ((& wix --version) -split '\+')[0].Trim()
-$haveExt = (& wix extension list -g) 2>$null
 foreach ($ext in "WixToolset.UI.wixext", "WixToolset.Util.wixext") {
-    if ($haveExt -notmatch [regex]::Escape($ext)) {
-        Write-Host "  adding extension $ext/$wixVer" -ForegroundColor DarkGray
-        & wix extension add -g "$ext/$wixVer"
-    }
+    Write-Host "  ensuring extension $ext/$wixVer" -ForegroundColor DarkGray
+    & wix extension add -g "$ext/$wixVer"
+    if ($LASTEXITCODE -ne 0) { throw "wix extension add failed for $ext/$wixVer" }
 }
 
 $out = Join-Path $root "target\wix\seed-sync-$Version-windows-x86_64.msi"
