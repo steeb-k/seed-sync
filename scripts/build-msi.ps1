@@ -66,7 +66,7 @@ Write-Host "[4/6] generating the license RTF from LICENSE" -ForegroundColor Cyan
 $licenseRtf = Join-Path $root "wix\license.rtf"
 $plain = Get-Content -Raw (Join-Path $root "LICENSE")
 # Minimal RTF: escape RTF metacharacters, map newlines to \par. Non-ASCII becomes
-# \u escapes so any curly quotes etc. render correctly.
+# \u escapes so the GPL's curly quotes etc. render correctly.
 $escaped = $plain -replace '\\', '\\' -replace '\{', '\{' -replace '\}', '\}'
 $sb = [System.Text.StringBuilder]::new()
 [void]$sb.Append("{\rtf1\ansi\deff0{\fonttbl{\f0\fnil Segoe UI;}}\fs18`r`n")

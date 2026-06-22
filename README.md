@@ -82,7 +82,4 @@ auto-update work, and **`docs/windows-packaging.md`** for the MSI side.
 
 ## License
 
-Proprietary — Copyright (c) 2026 kznjk LLC. All rights reserved. The software is
-free to install and use, but may not be redistributed, modified, or
-reverse engineered. See [LICENSE](LICENSE) for the full End-User License
-Agreement.
+GPL-3.0-or-later.
