@@ -5242,7 +5242,7 @@ dependencies = [
 
 [[package]]
 name = "seed-cli"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -5255,7 +5255,7 @@ dependencies = [
 
 [[package]]
 name = "seed-core"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "bao-tree",
@@ -5290,7 +5290,7 @@ dependencies = [
 
 [[package]]
 name = "seed-daemon"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -5309,7 +5309,7 @@ dependencies = [
 
 [[package]]
 name = "seed-gui"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5333,7 +5333,7 @@ dependencies = [
 
 [[package]]
 name = "seed-ipc"
-version = "1.1.1"
+version = "1.1.2"
 dependencies = [
  "ciborium",
  "interprocess",
