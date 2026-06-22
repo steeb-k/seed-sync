@@ -1239,6 +1239,9 @@ impl Engine {
                 seqno: s.last_seqno,
                 percent,
                 ts,
+                // Stamp our own endpoint id so receivers attribute this presence to
+                // us directly, not to whichever member relayed it through the swarm.
+                from: Some(self.node.endpoint_id_bytes()),
             };
             out.push(crate::presence::PresenceBroadcast::new(
                 h.sender.clone(),

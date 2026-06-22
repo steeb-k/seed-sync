@@ -26,8 +26,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::PeerRoster;
 
-/// Current presence wire-format version.
-pub const PRESENCE_V: u8 = 1;
+/// Current presence wire-format version. v2 added [`Presence::from`] so reception
+/// can attribute a message to its *originator* rather than the gossip relay hop.
+pub const PRESENCE_V: u8 = 2;
 
 /// Presence wire message (CBOR), broadcast periodically on a share's topic.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,6 +44,24 @@ pub struct Presence {
     pub percent: u8,
     /// Sender's unix-seconds clock — informational / staleness only.
     pub ts: i64,
+    /// Originator's endpoint id (raw bytes). The gossip swarm relays messages
+    /// through intermediate members, rewriting `Message::delivered_from` to the
+    /// forwarding hop, so the transport can't tell us who actually *sent* this.
+    /// Carrying the id in the payload makes attribution correct for any number of
+    /// relay hops / members. `None` only for legacy v1 senders (serde default).
+    #[serde(default)]
+    pub from: Option<[u8; 32]>,
+}
+
+/// Resolve which member a presence message is *from*. Gossip relays rewrite
+/// `Message::delivered_from` to the forwarding hop, so trust the originator id
+/// carried in the payload (v2+) and fall back to the transport hop only for legacy
+/// v1 senders that omit it. Independent of hop count, so it scales to any number of
+/// masters/members.
+pub(crate) fn presence_origin(p: &Presence, delivered_from: EndpointId) -> EndpointId {
+    p.from
+        .and_then(|b| EndpointId::from_bytes(&b).ok())
+        .unwrap_or(delivered_from)
 }
 
 /// Derive a presence gossip topic for a share, domain-separated so it can't
@@ -123,13 +142,18 @@ pub(crate) async fn spawn_presence(
             let Ok(ev) = ev else { continue };
             match ev {
                 Event::Received(m) => {
-                    // Ignore our own broadcasts echoed back by the swarm.
-                    if m.delivered_from == self_id {
-                        continue;
-                    }
                     if let Ok(p) = decode(&m.content) {
+                        // Attribute by the payload's originator, not the relay hop
+                        // (`delivered_from`): once messages cross >1 hop the hop is
+                        // a forwarder, not the sender. This also lets us drop our
+                        // own presence relayed back with a foreign `delivered_from`,
+                        // which a bare `delivered_from == self_id` guard misses.
+                        let origin = presence_origin(&p, m.delivered_from);
+                        if origin == self_id {
+                            continue;
+                        }
                         if let Ok(mut r) = roster.lock() {
-                            r.note_presence(&m.delivered_from.to_string(), p);
+                            r.note_presence(&origin.to_string(), p);
                         }
                     }
                 }
@@ -176,11 +200,74 @@ mod tests {
             seqno: 42,
             percent: 73,
             ts: 1700,
+            from: Some([9u8; 32]),
         };
         let back = decode(&encode(&p)).unwrap();
         assert_eq!(back.name, "Desktop");
         assert_eq!(back.seqno, 42);
         assert_eq!(back.percent, 73);
         assert!(matches!(back.role, seed_ipc::Role::Viewer));
+        assert_eq!(back.from, Some([9u8; 32]));
+    }
+
+    /// A v1 message (no `from`) must still decode, defaulting `from` to `None` so
+    /// reception falls back to the transport hop.
+    #[test]
+    fn presence_v1_decodes_without_from() {
+        // Serialize a struct lacking `from` the way a v1 sender would have.
+        #[derive(serde::Serialize)]
+        struct PresenceV1 {
+            v: u8,
+            name: String,
+            role: seed_ipc::Role,
+            seqno: u64,
+            percent: u8,
+            ts: i64,
+        }
+        let v1 = PresenceV1 {
+            v: 1,
+            name: "Old".into(),
+            role: seed_ipc::Role::Master,
+            seqno: 1,
+            percent: 100,
+            ts: 1,
+        };
+        let mut buf = Vec::new();
+        ciborium::into_writer(&v1, &mut buf).unwrap();
+        let back = decode(&buf).unwrap();
+        assert_eq!(back.name, "Old");
+        assert_eq!(back.from, None);
+    }
+
+    /// Attribution must follow the originator id in the payload, not the gossip
+    /// relay hop. This is what keeps a member from being shown under a relaying
+    /// peer's id once the swarm grows past a direct link (any number of members).
+    #[test]
+    fn origin_prefers_payload_over_relay_hop() {
+        // EndpointIds are ed25519 public keys, so derive valid ones from signing
+        // keys rather than arbitrary bytes (which aren't on-curve).
+        let key_id = |seed: [u8; 32]| {
+            let bytes = ed25519_dalek::SigningKey::from_bytes(&seed)
+                .verifying_key()
+                .to_bytes();
+            EndpointId::from_bytes(&bytes).unwrap()
+        };
+        let origin = key_id([1u8; 32]);
+        let relay = key_id([2u8; 32]);
+        let p = Presence {
+            v: PRESENCE_V,
+            name: "A".into(),
+            role: seed_ipc::Role::Master,
+            seqno: 0,
+            percent: 100,
+            ts: 0,
+            from: Some(*origin.as_bytes()),
+        };
+        // delivered_from is the forwarding hop; attribution must ignore it.
+        assert_eq!(presence_origin(&p, relay), origin);
+
+        // Legacy v1 (no `from`) falls back to the transport hop.
+        let v1 = Presence { from: None, ..p };
+        assert_eq!(presence_origin(&v1, relay), relay);
     }
 }
