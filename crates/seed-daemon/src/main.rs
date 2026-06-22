@@ -274,6 +274,19 @@ async fn reconcile_loop(daemon: Daemon) {
             }
         }
 
+        // Actively grow each share's presence-gossip mesh toward all-to-all. Gossip's
+        // one-shot bootstrap leaves a fragile star (the creator bootstraps with no
+        // peers; leaves dial only the creator), so presence reaches 3+ member pools
+        // asymmetrically. Every ~6s, reconnect to every member doc-sync has discovered
+        // so each becomes a direct gossip neighbor. Built under a brief lock, run
+        // off-lock.
+        if tick_n.is_multiple_of(8) {
+            let rejoins = { daemon.engine.lock().await.presence_rejoins() };
+            for rejoin in rejoins {
+                rejoin.join().await;
+            }
+        }
+
         // Fingerprint the visible per-share state (membership counts + status)
         // so peer online/offline transitions refresh the GUI even on an otherwise
         // idle tick.

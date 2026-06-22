@@ -7,6 +7,13 @@
 //! and cannot write doc entries, so presence can't ride the replica. Gossip is
 //! ephemeral and any member may broadcast on the topic.
 //!
+//! Delivery: a single broadcast is best-effort, but the swarm's one-shot bootstrap
+//! is a fragile star (the creator subscribes with an empty bootstrap; leaves dial
+//! only the creator), so in a 3+ member pool epidemic relay reaches members
+//! asymmetrically. The engine therefore periodically reconnects the mesh toward
+//! all-to-all via [`PresenceRejoin`] using the peers doc-sync has discovered, so
+//! every member ends up a direct neighbor and `broadcast` reaches everyone.
+//!
 //! Trust: a message is attributed to its gossip `delivered_from` endpoint id,
 //! which iroh has already QUIC-authenticated. v1 does NOT sign the payload, so a
 //! share member could spoof another member's *name/health* on this channel — it
@@ -119,6 +126,33 @@ impl PresenceBroadcast {
     /// Send the broadcast (best-effort; gossip delivery is unreliable by design).
     pub async fn send(self) {
         let _ = self.sender.broadcast(self.bytes).await;
+    }
+}
+
+/// A pending request to actively connect this share's gossip subscription to a set
+/// of known member endpoint ids. The engine builds these under its lock (cloning
+/// the `GossipSender` + snapshotting the roster) and the daemon runs them off-lock.
+///
+/// Why this exists: `gossip.subscribe` bootstrap is one-shot, and the share creator
+/// subscribes with an *empty* bootstrap (its own id is filtered out), while leaves
+/// bootstrap only from the creator. That leaves a fragile star whose epidemic relay
+/// delivers presence asymmetrically once there are 3+ members. Periodically calling
+/// [`GossipSender::join_peers`] with every peer doc-sync has discovered grows the
+/// mesh toward all-to-all, so `broadcast` reaches everyone directly.
+pub struct PresenceRejoin {
+    sender: GossipSender,
+    peers: Vec<EndpointId>,
+}
+
+impl PresenceRejoin {
+    pub(crate) fn new(sender: GossipSender, peers: Vec<EndpointId>) -> Self {
+        Self { sender, peers }
+    }
+
+    /// Ask the gossip swarm to connect to these peers (best-effort; idempotent for
+    /// peers already in the active view).
+    pub async fn join(self) {
+        let _ = self.sender.join_peers(self.peers).await;
     }
 }
 

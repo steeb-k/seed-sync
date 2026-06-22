@@ -1251,6 +1251,37 @@ impl Engine {
         out
     }
 
+    /// Build this tick's gossip re-join requests — one per share with a live presence
+    /// channel — asking the swarm to connect to every member doc-sync has discovered.
+    /// Call under the engine lock (cheap: clones the gossip sender + snapshots the
+    /// roster); run the results off-lock via [`PresenceRejoin::join`].
+    ///
+    /// This repairs the presence mesh: gossip's one-shot bootstrap leaves a partitioned
+    /// star (the creator bootstraps with nothing; leaves only dial the creator), so
+    /// without this, presence reaches 3+ member pools asymmetrically. The peer set comes
+    /// from [`peer_providers`] (the master id carried in the key + every endpoint id the
+    /// roster learned from doc events), minus ourselves.
+    ///
+    /// [`PresenceRejoin::join`]: crate::presence::PresenceRejoin::join
+    pub fn presence_rejoins(&self) -> Vec<crate::presence::PresenceRejoin> {
+        let self_id = self.node.endpoint.id();
+        let mut out = Vec::new();
+        for s in self.shares.values() {
+            let Some(h) = s.presence.as_ref() else {
+                continue;
+            };
+            let peers: Vec<EndpointId> = peer_providers(&s.key, &s.roster)
+                .into_iter()
+                .filter(|id| *id != self_id)
+                .collect();
+            if peers.is_empty() {
+                continue;
+            }
+            out.push(crate::presence::PresenceRejoin::new(h.sender.clone(), peers));
+        }
+        out
+    }
+
     /// Reveal the keys for a share. Returns the master key only when this node
     /// holds master role for the share.
     pub fn reveal_keys(&self, share_id: &str) -> anyhow::Result<(Option<String>, String)> {

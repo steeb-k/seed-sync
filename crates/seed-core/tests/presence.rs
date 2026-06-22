@@ -84,3 +84,112 @@ async fn presence_propagates_name_and_health() -> anyhow::Result<()> {
     println!("presence name + health propagation OK");
     Ok(())
 }
+
+/// Whether `engine`'s roster shows a *remote* peer named `name` as an online master.
+/// `role` is `seed_ipc::Role`, which the test crate doesn't depend on by name, so
+/// match it via Debug (the enum derives it: "Master" / "Viewer").
+fn sees_online_master(engine: &Engine, share_id: &str, name: &str) -> bool {
+    engine
+        .peers(share_id)
+        .ok()
+        .map(|peers| {
+            peers.iter().any(|p| {
+                p.node_id != "This device"
+                    && p.name.as_deref() == Some(name)
+                    && p.online
+                    && format!("{:?}", p.role) == "Master"
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Three masters, all sharing one master key, must each see the *other two* as named,
+/// online masters. This is the all-to-all roster case that regressed: presence rides a
+/// gossip swarm whose one-shot bootstrap is a star (the creator bootstraps with no
+/// peers; B and C dial only the creator), so without active mesh repair the creator
+/// receives nobody's presence and the leaves only see each other through the creator.
+/// The fix drives `presence_rejoins()` each tick to connect every member doc-sync found.
+///
+/// NOTE: on loopback there's no NAT, so the raw star may already converge — this is
+/// primarily a wiring/regression smoke test that exercises the 3-node path and the
+/// `presence_rejoins()` plumbing. The authoritative check is the 3-machine deployment.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn presence_three_masters_all_to_all() -> anyhow::Result<()> {
+    let datas: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+    let folders: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
+
+    let mut a = Engine::new(datas[0].path()).await?;
+    let mut b = Engine::new(datas[1].path()).await?;
+    let mut c = Engine::new(datas[2].path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        a.wait_online().await;
+        b.wait_online().await;
+        c.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    a.set_device_name("alice")?;
+    b.set_device_name("bob")?;
+    c.set_device_name("carol")?;
+
+    // A creates; B and C join from the *master* key (so all three are masters),
+    // bootstrapping only from A — reproducing the star topology.
+    let created = a.create_share(folders[0].path(), vec![]).await?;
+    let a_addr = a.endpoint_addr();
+    let share = created.share_id.clone();
+    let share_b = b
+        .add_share(&created.master_key, folders[1].path(), vec![a_addr.clone()])
+        .await?;
+    let share_c = c
+        .add_share(&created.master_key, folders[2].path(), vec![a_addr])
+        .await?;
+    assert_eq!(share, share_b);
+    assert_eq!(share, share_c);
+
+    // Drive what the reconcile loop does on every node: broadcast presence and grow
+    // the gossip mesh toward all-to-all, until each node sees the other two.
+    let result = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            for e in [&a, &b, &c] {
+                for j in e.presence_broadcasts() {
+                    j.send().await;
+                }
+                for r in e.presence_rejoins() {
+                    r.join().await;
+                }
+            }
+            let converged = sees_online_master(&a, &share, "bob")
+                && sees_online_master(&a, &share, "carol")
+                && sees_online_master(&b, &share, "alice")
+                && sees_online_master(&b, &share, "carol")
+                && sees_online_master(&c, &share, "alice")
+                && sees_online_master(&c, &share, "bob");
+            if converged {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "roster didn't converge all-to-all: \
+         a_sees_bob={} a_sees_carol={} b_sees_alice={} b_sees_carol={} \
+         c_sees_alice={} c_sees_bob={}",
+        sees_online_master(&a, &share, "bob"),
+        sees_online_master(&a, &share, "carol"),
+        sees_online_master(&b, &share, "alice"),
+        sees_online_master(&b, &share, "carol"),
+        sees_online_master(&c, &share, "alice"),
+        sees_online_master(&c, &share, "bob"),
+    );
+
+    a.shutdown().await?;
+    b.shutdown().await?;
+    c.shutdown().await?;
+    println!("3-master all-to-all roster OK");
+    Ok(())
+}
