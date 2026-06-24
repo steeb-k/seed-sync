@@ -22,6 +22,7 @@ namespace key, so only master-key holders can write.
 | `seed-daemon` | Background sync daemon. Console process in dev; Windows service in production (same binary). |
 | `seed-gui` | GTK4 + Libadwaita GUI and system tray. IPC client to the daemon. |
 | `seed-cli` | Headless IPC client for scripted/loopback testing. |
+| `seed-mobile` | UniFFI facade over `seed-core` for the Android app (`android/`): owns the runtime + engine in-process, no IPC. |
 
 ## Building (Linux dev)
 
@@ -62,7 +63,18 @@ seed-sync --uninstall [--purge] # remove (--purge also deletes synced data)
 ```
 
 Maintainers: see **`docs/linux-packaging.md`** for how releases, the tarball, and
-auto-update work, and **`docs/windows-packaging.md`** for the MSI side.
+auto-update work, **`docs/windows-packaging.md`** for the MSI side, and
+**`docs/android-packaging.md`** for the Android APK (build + signing).
+
+## Installing (Android)
+
+A native Android app (Kotlin + Jetpack Compose, same engine via `seed-mobile`)
+is published as a sideloadable universal APK on the
+[`seed-sync-binaries`](https://github.com/steeb-k/seed-sync-binaries) releases.
+Requires **Android 11+**; on first run grant **All-Files Access** so the engine
+can mirror real folders. Not on Google Play (All-Files Access precludes it).
+Sources are in `android/`; see `android-app.md` for the design and
+`docs/android-packaging.md` to build/sign locally.
 
 ## Permission model
 
