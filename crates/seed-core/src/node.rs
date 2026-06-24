@@ -28,8 +28,17 @@ pub struct IrohNode {
 
 impl IrohNode {
     /// Bootstrap the node, creating the data dir layout if needed:
-    /// `node.key`, `blobs/`, `docs.redb`.
+    /// `node.key`, `blobs/`, `docs.redb`. The blob store lives under `data_dir`.
     pub async fn spawn(data_dir: &Path) -> anyhow::Result<Self> {
+        Self::spawn_with_blobs(data_dir, &data_dir.join("blobs")).await
+    }
+
+    /// Like [`spawn`](Self::spawn) but with the blob store rooted at an explicit
+    /// `blobs_dir`. On Android we keep `node.key` + `docs/` on internal storage
+    /// while placing `blobs/` on the same shared-storage volume as the synced
+    /// folders, so the engine's zero-copy reference export (rename/hardlink)
+    /// stays on one volume and never falls back to a full copy.
+    pub async fn spawn_with_blobs(data_dir: &Path, blobs_dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("create data dir {}", data_dir.display()))?;
 
@@ -41,7 +50,7 @@ impl IrohNode {
             .await
             .context("bind iroh endpoint")?;
 
-        let blobs_dir = data_dir.join("blobs");
+        let blobs_dir = blobs_dir.to_path_buf();
         let docs_dir = data_dir.join("docs");
         std::fs::create_dir_all(&blobs_dir).context("create blobs dir")?;
         std::fs::create_dir_all(&docs_dir).context("create docs dir")?;

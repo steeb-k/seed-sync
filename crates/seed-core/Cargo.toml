@@ -38,7 +38,6 @@ walkdir.workspace = true
 globset.workspace = true
 directories.workspace = true
 hostname.workspace = true
-keyring.workspace = true
 
 # diagnostics
 tracing.workspace = true
@@ -47,6 +46,12 @@ anyhow.workspace = true
 
 # shared IPC role/status types reused in summaries
 seed-ipc = { path = "../seed-ipc" }
+
+# OS keystore for share master seeds. No backend exists on Android, where it is
+# compiled out (secrets.rs) in favour of the DB fallback, so it is target-gated
+# off rather than pulled into the android build.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+keyring.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -1,0 +1,13 @@
+.gradle/
+build/
+local.properties
+app/build/
+app/src/main/jniLibs/
+app/src/main/java/uniffi/
+build.log
+logcat.txt
+# Throwaway test/debug screenshots captured at the android/ root (not resources).
+/*.png
+.idea/
+*.iml
+.cxx/

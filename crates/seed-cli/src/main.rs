@@ -52,6 +52,18 @@ enum Command {
         #[arg(long)]
         share: String,
     },
+    /// List the peers (and their friendly names) for a share.
+    Peers {
+        #[arg(long)]
+        share: String,
+    },
+    /// Print this device's display name.
+    DeviceName,
+    /// Set this device's display name (propagated to peers via presence).
+    SetName {
+        #[arg(long)]
+        name: String,
+    },
 }
 
 #[tokio::main]
@@ -76,6 +88,9 @@ async fn main() -> anyhow::Result<()> {
         Command::List => IpcRequest::ListShares,
         Command::Publish { share } => IpcRequest::Publish { share_id: share },
         Command::Reveal { share } => IpcRequest::RevealKeys { share_id: share },
+        Command::Peers { share } => IpcRequest::GetPeers { share_id: share },
+        Command::DeviceName => IpcRequest::GetDeviceName,
+        Command::SetName { name } => IpcRequest::SetDeviceName { name },
     };
 
     let resp = request(&cli.socket, req).await?;
@@ -143,6 +158,23 @@ fn print_response(resp: &IpcResponse) {
                 );
             }
         }
+        IpcResponse::Peers(peers) => {
+            if peers.is_empty() {
+                println!("(no peers)");
+            }
+            for p in peers {
+                println!(
+                    "{}  name={}  {:?}  online={}  seqno={}  {}%",
+                    p.node_id,
+                    p.name.as_deref().unwrap_or("-"),
+                    p.role,
+                    p.online,
+                    p.have_seqno,
+                    p.percent
+                );
+            }
+        }
+        IpcResponse::DeviceName(n) => println!("{n}"),
         IpcResponse::Ok => println!("ok"),
         IpcResponse::Err(e) => {
             eprintln!("error: {e}");

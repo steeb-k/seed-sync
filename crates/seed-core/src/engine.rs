@@ -864,13 +864,26 @@ pub struct Engine {
     /// summary reports `Paused`. Persisted in `settings["paused_all"]` so it
     /// survives a daemon restart and new shares added while paused stay paused.
     paused_all: StdMutex<bool>,
+    /// Transient "suspend sync" gate, separate from the user's pause switch. Set
+    /// by the host (e.g. Android's Wi-Fi-only / charging-only policy) to halt
+    /// reconcile without touching the user's pause state. Deliberately *not*
+    /// persisted: the host recomputes it from live conditions on every start.
+    sync_suspended: StdMutex<bool>,
 }
 
 impl Engine {
     /// Bootstrap the engine against a data directory, reloading any persisted
     /// shares (so the daemon is restart-safe).
     pub async fn new(data_dir: &Path) -> anyhow::Result<Self> {
-        let node = IrohNode::spawn(data_dir).await?;
+        Self::new_with_blobs(data_dir, &data_dir.join("blobs")).await
+    }
+
+    /// Like [`new`](Self::new) but with the blob store rooted at an explicit
+    /// `blobs_dir` (the rest of the layout — `state.db`, `node.key`, `docs/` —
+    /// stays under `data_dir`). Used on Android to co-locate `blobs/` with the
+    /// synced folders on shared storage; see [`IrohNode::spawn_with_blobs`].
+    pub async fn new_with_blobs(data_dir: &Path, blobs_dir: &Path) -> anyhow::Result<Self> {
+        let node = IrohNode::spawn_with_blobs(data_dir, blobs_dir).await?;
         let author = node.docs_api().author_default().await?;
         let db = crate::db::Db::open(&data_dir.join("state.db"))?;
         let device_name = db
@@ -887,6 +900,7 @@ impl Engine {
             reclaim_pending: std::collections::HashSet::new(),
             device_name: StdMutex::new(device_name),
             paused_all: StdMutex::new(paused_all),
+            sync_suspended: StdMutex::new(false),
         };
         engine.reload_shares().await?;
         Ok(engine)
@@ -932,6 +946,22 @@ impl Engine {
             *p = paused;
         }
         Ok(())
+    }
+
+    /// Whether the transient host sync gate is suspending sync (e.g. Android is
+    /// off Wi-Fi while "sync only on Wi-Fi" is enabled).
+    pub fn sync_suspended(&self) -> bool {
+        self.sync_suspended.lock().map(|s| *s).unwrap_or(false)
+    }
+
+    /// Set the transient sync gate. While set, no share reconciles (no folder
+    /// hashing, no blob transfer), but the user's pause state and per-share flags
+    /// are untouched, so clearing the gate resumes whatever wasn't user-paused.
+    /// Not persisted — the host re-applies it from live conditions on each start.
+    pub fn set_sync_suspended(&self, suspended: bool) {
+        if let Ok(mut s) = self.sync_suspended.lock() {
+            *s = suspended;
+        }
     }
 
     /// Resume everything: clear the global switch and every per-share pause flag.
@@ -1374,8 +1404,9 @@ impl Engine {
     /// or already-running share. A first-tick debounce gates whether local edits
     /// are treated as authoritative this round (so a file mid-copy isn't imported).
     pub fn make_reconcile_job(&mut self, share_id: &str) -> anyhow::Result<Option<ReconcileJob>> {
-        // Global pause suspends all sync activity regardless of per-share state.
-        if self.paused_all() {
+        // Global pause and the transient host sync gate (Wi-Fi-only / charging-only)
+        // both suspend all sync activity regardless of per-share state.
+        if self.paused_all() || self.sync_suspended() {
             return Ok(None);
         }
         let blobs = self.node.blobs.clone();

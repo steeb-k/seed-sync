@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/seed-ipc",
     "crates/seed-core",
+    "crates/seed-mobile",
     "crates/seed-daemon",
     "crates/seed-gui",
     "crates/seed-cli",

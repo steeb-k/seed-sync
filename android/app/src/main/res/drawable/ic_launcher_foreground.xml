@@ -1,0 +1,13 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- A simple seed/sprout glyph centered in the adaptive-icon safe zone. -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,34c-8,0 -14,6 -14,14c0,8 6,14 14,14c8,0 14,-6 14,-14C68,40 62,34 54,34zM52,66h4v12h-4z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,78c-10,0 -18,-4 -22,-10c8,2 16,2 22,6c6,-4 14,-4 22,-6C72,74 64,78 54,78z" />
+</vector>
