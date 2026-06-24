@@ -60,7 +60,14 @@ fun AppScreen(
     val shares by EngineHolder.shares.collectAsStateSafe(emptyList())
     val throughput by EngineHolder.throughput.collectAsStateSafe(EngineHolder.Throughput(0u, 0u))
     val deviceName by EngineHolder.deviceName.collectAsStateSafe("")
-    val suspendReason by io.github.steeb_k.seedsync.engine.SyncGate.suspendReason.collectAsStateSafe(null)
+    val gate by io.github.steeb_k.seedsync.engine.SyncGate.state
+        .collectAsStateSafe(io.github.steeb_k.seedsync.engine.SyncGate.GateState())
+    val suspendReason = when {
+        gate.needWifi && gate.needCharger -> "Sync paused — waiting for Wi-Fi and charger"
+        gate.needWifi -> "Sync paused — waiting for Wi-Fi"
+        gate.needCharger -> "Sync paused — waiting for charger"
+        else -> null
+    }
 
     var overflowOpen by remember { mutableStateOf(false) }
 

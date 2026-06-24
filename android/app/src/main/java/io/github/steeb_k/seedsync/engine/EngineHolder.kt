@@ -41,6 +41,10 @@ object EngineHolder {
     private val _running = MutableStateFlow(false)
     val running: StateFlow<Boolean> = _running.asStateFlow()
 
+    /** True when the global user pause switch is set (drives the notification toggle). */
+    private val _pausedAll = MutableStateFlow(false)
+    val pausedAll: StateFlow<Boolean> = _pausedAll.asStateFlow()
+
     // Engine calls block the calling thread (they `block_on` the Rust runtime),
     // so funnel them through an IO scope and never touch them from the main thread.
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -93,7 +97,10 @@ object EngineHolder {
 
     private fun refreshShares() {
         scope.launch {
-            engine?.let { _shares.value = it.listShares() }
+            engine?.let {
+                _shares.value = it.listShares()
+                _pausedAll.value = it.pausedAll()
+            }
         }
     }
 

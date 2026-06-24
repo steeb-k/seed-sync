@@ -36,9 +36,17 @@ object SyncGate {
     private val _chargingOnly = MutableStateFlow(false)
     val chargingOnly: StateFlow<Boolean> = _chargingOnly.asStateFlow()
 
-    /** Null when sync is running; otherwise a short reason for the UI banner. */
-    private val _suspendReason = MutableStateFlow<String?>(null)
-    val suspendReason: StateFlow<String?> = _suspendReason.asStateFlow()
+    /**
+     * Why the gate is currently holding sync, if at all. Both flags false means
+     * the gate is not suspending. Consumers (in-app banner, notification
+     * subtitle) phrase this however they like.
+     */
+    data class GateState(val needWifi: Boolean = false, val needCharger: Boolean = false) {
+        val suspended: Boolean get() = needWifi || needCharger
+    }
+
+    private val _state = MutableStateFlow(GateState())
+    val state: StateFlow<GateState> = _state.asStateFlow()
 
     // Live conditions, updated by the callbacks below.
     @Volatile private var onWifi = false
@@ -129,13 +137,7 @@ object SyncGate {
         val needWifi = _wifiOnly.value && !onWifi
         val needCharger = _chargingOnly.value && !charging
         val suspend = needWifi || needCharger
-        val reason = when {
-            needWifi && needCharger -> "Sync paused — waiting for Wi-Fi and charger"
-            needWifi -> "Sync paused — waiting for Wi-Fi"
-            needCharger -> "Sync paused — waiting for charger"
-            else -> null
-        }
-        _suspendReason.value = reason
+        _state.value = GateState(needWifi, needCharger)
         Log.i(TAG, "gate: onWifi=$onWifi charging=$charging -> suspend=$suspend")
         EngineHolder.setSyncSuspended(suspend)
     }

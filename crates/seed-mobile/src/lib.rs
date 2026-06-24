@@ -404,6 +404,14 @@ impl MobileEngine {
         })
     }
 
+    /// Whether the global user pause switch is set (every share suspended via
+    /// "Pause all" / the notification toggle). Distinct from the Wi-Fi/charging
+    /// gate and from per-share pauses.
+    pub fn paused_all(&self) -> bool {
+        self.rt
+            .block_on(async { self.inner.engine.lock().await.paused_all() })
+    }
+
     /// This device's display name (default: hostname). Mirrors `GetDeviceName`.
     pub fn device_name(&self) -> String {
         self.rt
