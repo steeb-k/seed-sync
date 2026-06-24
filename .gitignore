@@ -32,3 +32,6 @@ Thumbs.db
 # Secrets / local config
 .env
 .cargo/config.local.toml
+
+# Local build logs
+/cargo-*.log

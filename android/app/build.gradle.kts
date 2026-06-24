@@ -1,9 +1,19 @@
 import org.gradle.internal.os.OperatingSystem
+import java.util.Properties
 
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+}
+
+// Release signing material is read from a gitignored keystore.properties at the
+// android/ root (see docs/android-packaging.md). It is absent on fresh checkouts
+// and on CI without the secret — in that case release builds are produced
+// unsigned (and won't install); debug builds are unaffected.
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps = Properties().apply {
+    if (keystorePropsFile.exists()) keystorePropsFile.inputStream().use { load(it) }
 }
 
 android {
@@ -16,14 +26,32 @@ android {
         // modern scoped-storage branch and skip the legacy WRITE_EXTERNAL_STORAGE path.
         minSdk = 30
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.1.2"
+        // versionCode scheme: MAJOR*10000 + MINOR*100 + PATCH (so 1.2.0 -> 10200),
+        // monotonic and decodable. versionName tracks the workspace version.
+        versionCode = 10200
+        versionName = "1.2.0"
+    }
+
+    signingConfigs {
+        if (keystorePropsFile.exists()) {
+            create("release") {
+                storeFile = rootProject.file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // Sign with the release key when keystore.properties is present;
+            // otherwise the APK is left unsigned (won't install — by design).
+            if (keystorePropsFile.exists()) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 
