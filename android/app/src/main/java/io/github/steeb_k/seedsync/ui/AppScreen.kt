@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -260,9 +261,15 @@ private fun roleSuffix(role: Role) = when (role) {
 
 @Composable
 private fun ThroughputFooter(tp: EngineHolder.Throughput, deviceName: String) {
+    // The Surface fills to the bottom screen edge (tonal background behind the
+    // nav bar), while the content row is padded above the navigation/gesture
+    // area via navigationBarsPadding() so text isn't clipped on gesture-nav or
+    // curved-edge devices. Extra vertical padding gives it more height.
     Surface(tonalElevation = 2.dp) {
         Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+            Modifier.fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 16.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(deviceName, style = MaterialTheme.typography.labelMedium)

@@ -3,7 +3,9 @@
          window background and status-bar handling before Compose takes over. -->
     <style name="Theme.SeedSync" parent="android:Theme.Material.Light.NoActionBar">
         <item name="android:windowBackground">@android:color/white</item>
-        <item name="android:statusBarColor">@android:color/white</item>
-        <item name="android:windowLightStatusBar" tools:targetApi="m">true</item>
+        <!-- System-bar colors/icon contrast are handled at runtime by
+             enableEdgeToEdge() (auto light/dark). The deprecated statusBarColor /
+             windowLightStatusBar attrs are ignored on Android 15 and would fight
+             it, so they're intentionally omitted. -->
     </style>
 </resources>
