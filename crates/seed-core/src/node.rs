@@ -13,7 +13,7 @@ use iroh_blobs::{store::fs::FsStore, BlobsProtocol};
 use iroh_docs::{api::DocsApi, protocol::Docs};
 use iroh_gossip::net::Gossip;
 
-/// A running iroh node with the three protocols Seed Sync needs.
+/// A running iroh node with the three protocols SEED Sync needs.
 pub struct IrohNode {
     pub endpoint: Endpoint,
     pub blobs: FsStore,

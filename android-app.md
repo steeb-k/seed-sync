@@ -1,8 +1,8 @@
-# Android Port Plan — Seed Sync
+# Android Port Plan — SEED Sync
 
 ## Context
 
-Seed Sync works across Windows/macOS/Linux today. The architecture is unusually
+SEED Sync works across Windows/macOS/Linux today. The architecture is unusually
 well-suited to an Android port because the sync engine is already cleanly
 isolated:
 

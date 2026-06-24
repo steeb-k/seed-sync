@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# S.E.E.D. (Seed Sync) — install / update / uninstall wrapper (per-user, no root).
+# S.E.E.D. (SEED Sync) — install / update / uninstall wrapper (per-user, no root).
 #
 #   seed-sync --install [--no-auto-update] [--no-gui-autostart]
 #   seed-sync --update  [--check]
@@ -191,7 +191,7 @@ cmd_status() {
 
 usage() {
   cat <<'EOF'
-S.E.E.D. (Seed Sync) installer/updater
+S.E.E.D. (SEED Sync) installer/updater
 
   seed-sync --install [--no-auto-update] [--no-gui-autostart]
   seed-sync --update  [--check]

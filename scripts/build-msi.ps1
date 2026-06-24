@@ -1,4 +1,4 @@
-# Build the Seed Sync MSI end to end: release build -> GTK bundle -> sign exes ->
+# Build the SEED Sync MSI end to end: release build -> GTK bundle -> sign exes ->
 # wix build -> sign MSI.
 #
 # Prereqs:
@@ -37,7 +37,7 @@ if (-not $Version) {
     if (-not $line) { throw "could not read version from Cargo.toml" }
     $Version = $line.Matches[0].Groups[1].Value
 }
-Write-Host "Building Seed Sync MSI $Version" -ForegroundColor Cyan
+Write-Host "Building SEED Sync MSI $Version" -ForegroundColor Cyan
 
 $env:PKG_CONFIG_PATH = "$GtkRoot\lib\pkgconfig"
 $env:PATH = "$GtkRoot\bin;$env:USERPROFILE\.dotnet\tools;$env:PATH"

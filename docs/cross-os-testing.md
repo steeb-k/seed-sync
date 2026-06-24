@@ -1,6 +1,6 @@
 # Cross-OS testing log (shared: Windows ⇄ Linux ⇄ macOS)
 
-A shared scratchpad for the instances testing Seed Sync's cross-OS sync.
+A shared scratchpad for the instances testing SEED Sync's cross-OS sync.
 Windows↔Linux is green (M4 Checkpoint #3); **macOS is the next platform being brought
 up** (build + packaging first, then folded into the sync matrix — see "macOS bring-up"
 below and `docs/macos-packaging.md`). Each machine has this repo checked out; the human
@@ -76,10 +76,10 @@ Legend: ✅ pass · ❌ fail · ⏳ not yet · 🐧 Linux-doable · 🪟 Windows
   `ksni`/StatusNotifier tray (no GTK3/appindicator), driven by its own tokio runtime on a dedicated
   thread, events bridged to the GTK main loop over `async-channel`. Icon decoded from the embedded
   `appIcon.png` via `gdk-pixbuf` → ARGB32 at 22/32/48/64 px. Verified live on niri/quickshell: item
-  registers with the watcher (`org.kde.StatusNotifierItem-<pid>-1`, Title "Seed Sync", 4 icon sizes
+  registers with the watcher (`org.kde.StatusNotifierItem-<pid>-1`, Title "SEED Sync", 4 icon sizes
   served), icon renders, and all 4 behaviors work (right-click menu Open/Quit, left-click opens,
   close-to-tray hides + reopens, Quit exits). **Windows tray is a separate item (#12/13, 🪟):** if the
-  Seed Sync icon is missing in the *Windows* tray while other apps show, check for a `tray unavailable:
+  SEED Sync icon is missing in the *Windows* tray while other apps show, check for a `tray unavailable:
   {e}` warn from `TrayIconBuilder`.
 - Tooling note: no input-injection on this Wayland/niri session (no ydotool/wtype) — the human
   drives clicks; I focus the window (`niri msg action focus-window --id N`) + screenshot.

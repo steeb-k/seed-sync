@@ -1,4 +1,4 @@
-# Assemble a self-contained Windows distribution of Seed Sync.
+# Assemble a self-contained Windows distribution of SEED Sync.
 #
 # Prereqs (see docs/windows-packaging.md):
 #   * MSVC toolchain (rustup default stable-msvc)
@@ -21,7 +21,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $dist = Join-Path $root "dist\SeedSync"
 $gbin = Join-Path $GtkRoot "bin"
 
-Write-Host "Bundling Seed Sync from GTK at $GtkRoot -> $dist"
+Write-Host "Bundling SEED Sync from GTK at $GtkRoot -> $dist"
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 New-Item -ItemType Directory -Force -Path "$dist\bin" | Out-Null

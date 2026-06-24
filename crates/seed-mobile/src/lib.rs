@@ -1,4 +1,4 @@
-//! Seed Sync mobile facade.
+//! SEED Sync mobile facade.
 //!
 //! This crate is the Android equivalent of `seed-daemon`: it owns a tokio
 //! runtime and a single [`seed_core::Engine`], and exposes a flat, UniFFI-

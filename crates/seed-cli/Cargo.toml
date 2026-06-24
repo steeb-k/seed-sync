@@ -3,7 +3,7 @@ name = "seed-cli"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Headless Seed Sync IPC client for scripted testing (loopback harness)"
+description = "Headless SEED Sync IPC client for scripted testing (loopback harness)"
 
 [[bin]]
 name = "seed-cli"

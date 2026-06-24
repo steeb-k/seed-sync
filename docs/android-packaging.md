@@ -55,7 +55,7 @@ A 4096-bit RSA key, alias `seedsync`, 10000-day validity, was generated with:
 ```pwsh
 keytool -genkeypair -v -keystore android\keystore\seedsync-release.jks `
   -alias seedsync -keyalg RSA -keysize 4096 -validity 10000 `
-  -dname "CN=Seed Sync, O=kznjk LLC, C=US"
+  -dname "CN=SEED Sync, O=kznjk LLC, C=US"
 ```
 
 Build credentials are read from **`android/keystore.properties`** (gitignored):

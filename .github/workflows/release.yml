@@ -247,7 +247,7 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           body: |
-            **S.E.E.D. (Seed Sync) ${{ github.ref_name }}** — P2P mirrored-folder sync.
+            **S.E.E.D. (SEED Sync) ${{ github.ref_name }}** — P2P mirrored-folder sync.
 
             ### Downloads
             - **Linux x86_64** — `seed-sync-${{ steps.ver.outputs.ver }}-linux-x86_64.tar.gz`

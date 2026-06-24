@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">Seed Sync</string>
+    <string name="app_name">SEED Sync</string>
     <string name="notif_channel_sync">Sync service</string>
-    <string name="notif_title">Seed Sync is running</string>
+    <string name="notif_title">SEED Sync is running</string>
 </resources>

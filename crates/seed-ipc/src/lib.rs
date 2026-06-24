@@ -1,4 +1,4 @@
-//! Seed Sync IPC contract: the request/response/event types exchanged between the
+//! SEED Sync IPC contract: the request/response/event types exchanged between the
 //! unprivileged GUI/tray clients and the `seed-daemon` over a local socket
 //! (Unix domain socket on Linux, named pipe on Windows).
 //!

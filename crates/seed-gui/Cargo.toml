@@ -3,7 +3,7 @@ name = "seed-gui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Seed Sync GTK4/Libadwaita GUI + system tray (IPC client to seed-daemon)"
+description = "SEED Sync GTK4/Libadwaita GUI + system tray (IPC client to seed-daemon)"
 
 [[bin]]
 name = "seed-gui"

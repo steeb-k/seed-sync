@@ -1,4 +1,4 @@
-S.E.E.D. (Seed Sync) — macOS install
+S.E.E.D. (SEED Sync) — macOS install
 ====================================
 
 Per-user install, no root required. One command does it all:

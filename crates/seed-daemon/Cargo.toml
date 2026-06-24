@@ -3,7 +3,7 @@ name = "seed-daemon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Seed Sync background sync daemon (console in dev, Windows service in production)"
+description = "SEED Sync background sync daemon (console in dev, Windows service in production)"
 
 [[bin]]
 name = "seed-daemon"

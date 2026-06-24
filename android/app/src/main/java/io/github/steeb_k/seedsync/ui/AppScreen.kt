@@ -74,7 +74,7 @@ fun AppScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Seed Sync") },
+                title = { Text("SEED Sync") },
                 actions = {
                     IconButton(onClick = { overflowOpen = true }) {
                         Icon(Icons.Default.MoreVert, contentDescription = "Menu")

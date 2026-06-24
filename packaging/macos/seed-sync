@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# S.E.E.D. (Seed Sync) — install / update / uninstall wrapper (per-user, no root).
+# S.E.E.D. (SEED Sync) — install / update / uninstall wrapper (per-user, no root).
 # macOS analog of packaging/linux/seed-sync (launchd instead of systemd).
 #
 #   seed-sync --install [--no-auto-update] [--no-gui-autostart]
@@ -203,7 +203,7 @@ cmd_status() {
 
 usage() {
   cat <<'EOF'
-S.E.E.D. (Seed Sync) installer/updater — macOS
+S.E.E.D. (SEED Sync) installer/updater — macOS
 
   seed-sync --install [--no-auto-update] [--no-gui-autostart]
   seed-sync --update  [--check]

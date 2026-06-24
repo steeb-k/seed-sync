@@ -1,4 +1,4 @@
-S.E.E.D. (Seed Sync) — Linux install
+S.E.E.D. (SEED Sync) — Linux install
 ====================================
 
 Per-user install, no root required. One command does it all:

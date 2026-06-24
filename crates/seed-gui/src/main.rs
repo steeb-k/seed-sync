@@ -1,4 +1,4 @@
-//! Seed Sync GUI (GTK4 + Libadwaita): an unprivileged IPC client to the
+//! SEED Sync GUI (GTK4 + Libadwaita): an unprivileged IPC client to the
 //! `seed-daemon`. It shows the share list, drives the create/add/reveal/pause
 //! flows, and reflects live status. All networking lives in the daemon; this
 //! process only talks the IPC protocol.

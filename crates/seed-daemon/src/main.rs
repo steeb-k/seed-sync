@@ -1,4 +1,4 @@
-//! Seed Sync daemon entry point.
+//! SEED Sync daemon entry point.
 //!
 //! One binary, multiple runtime modes selected by subcommand:
 //!   * `run`     — foreground console process (development, and Linux default).

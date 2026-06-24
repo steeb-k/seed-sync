@@ -1,4 +1,4 @@
-//! The signed manifest — Seed Sync's trust root.
+//! The signed manifest — SEED Sync's trust root.
 //!
 //! iroh-docs replicas are multi-writer by nature and enforce **no** application
 //! permissions. We layer authority on top: the master holds an Ed25519 signing

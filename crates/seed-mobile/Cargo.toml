@@ -3,7 +3,7 @@ name = "seed-mobile"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Seed Sync mobile facade: a flat, UniFFI-friendly API over seed-core for Android"
+description = "SEED Sync mobile facade: a flat, UniFFI-friendly API over seed-core for Android"
 
 # `cdylib` is the `.so` loaded by the Android app via System.loadLibrary; `lib`
 # keeps the crate usable as a normal Rust dependency (host tests, the

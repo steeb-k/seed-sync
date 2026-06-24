@@ -1,4 +1,4 @@
-# Seed Sync
+# SEED Sync
 
 A Resilio Sync–style **P2P mirrored folder sync** app in Rust + GTK4/Libadwaita.
 

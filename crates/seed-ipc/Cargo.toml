@@ -3,7 +3,7 @@ name = "seed-ipc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Wire types + framing for the Seed Sync GUI<->daemon IPC channel"
+description = "Wire types + framing for the SEED Sync GUI<->daemon IPC channel"
 
 [features]
 # Off by default so pure consumers (e.g. anything only needing the types) stay

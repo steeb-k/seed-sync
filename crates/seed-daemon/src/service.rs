@@ -30,7 +30,7 @@ use windows_service::{
 };
 
 const SERVICE_NAME: &str = "SeedSyncDaemon";
-const SERVICE_DISPLAY: &str = "Seed Sync";
+const SERVICE_DISPLAY: &str = "SEED Sync";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
 
 /// SCM entry point (invoked when started by `seed-daemon service`).
@@ -120,7 +120,7 @@ pub fn manage(cmd: &str) -> WsResult<()> {
             };
             let service = manager
                 .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
-            service.set_description("Seed Sync P2P mirrored-folder sync daemon")?;
+            service.set_description("SEED Sync P2P mirrored-folder sync daemon")?;
             println!("installed service '{SERVICE_NAME}'");
         }
         "uninstall" => {

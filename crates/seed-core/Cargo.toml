@@ -3,7 +3,7 @@ name = "seed-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Seed Sync sync engine: iroh transport + crypto + filesystem mirroring"
+description = "SEED Sync sync engine: iroh transport + crypto + filesystem mirroring"
 
 [dependencies]
 # iroh stack

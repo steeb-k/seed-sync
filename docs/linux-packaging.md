@@ -1,6 +1,6 @@
 # Linux packaging, distribution & auto-update — maintainer guide
 
-This is the baseline for shipping S.E.E.D. (Seed Sync) on Linux and keeping installs
+This is the baseline for shipping S.E.E.D. (SEED Sync) on Linux and keeping installs
 up to date. It's the Linux counterpart to `docs/windows-packaging.md`.
 
 ## TL;DR for cutting a release

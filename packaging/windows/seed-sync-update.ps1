@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  S.E.E.D. (Seed Sync) Windows install-or-update engine + scheduled-task helper.
+  S.E.E.D. (SEED Sync) Windows install-or-update engine + scheduled-task helper.
 
   The Windows analog of packaging/linux/seed-sync-update. Compares the installed
   daemon version to the latest release in the PUBLIC steeb-k/seed-sync-binaries
@@ -71,7 +71,7 @@ function Register-UpdateTask {
 
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($daily, $boot) `
         -Principal $principal -Settings $settings `
-        -Description 'Seed Sync daily auto-update check' -Force | Out-Null
+        -Description 'SEED Sync daily auto-update check' -Force | Out-Null
     Write-Log "registered scheduled task '$TaskName'"
 }
 

@@ -1,5 +1,5 @@
 #!/bin/sh
-# S.E.E.D. (Seed Sync) macOS bootstrap — install, update, or remove in one command.
+# S.E.E.D. (SEED Sync) macOS bootstrap — install, update, or remove in one command.
 #
 #   curl -fsSL https://steeb-k.github.io/seed-install.sh | sh
 #
@@ -74,7 +74,7 @@ fi
 ACTION="${1:-${SEED_ACTION:-}}"
 if [ -z "$ACTION" ]; then
   if (exec 3</dev/tty) 2>/dev/null; then
-    say "S.E.E.D. (Seed Sync)"
+    say "S.E.E.D. (SEED Sync)"
     if [ -n "$INSTALLED" ]; then
       say "  Installed: v$INSTALLED"
       say ""

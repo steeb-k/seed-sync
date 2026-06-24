@@ -1304,7 +1304,7 @@ async fn export_path_impl(
                         Ok(()) => {}
                         Err(cause) => {
                             // EXDEV (18) on unix; ERROR_NOT_SAME_DEVICE (17) on
-                            // Windows. (Seed Sync patch: upstream only checked 18,
+                            // Windows. (SEED Sync patch: upstream only checked 18,
                             // so a cross-volume reference export failed on Windows.)
                             const ERR_CROSS: i32 = 18;
                             const ERR_NOT_SAME_DEVICE: i32 = 17;

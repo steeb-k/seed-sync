@@ -120,7 +120,7 @@ private fun NeedsPermission(onGrant: () -> Unit) {
     ) {
         Text("All-Files Access needed", style = MaterialTheme.typography.titleLarge)
         Text(
-            "Seed Sync mirrors real folders on shared storage, so it needs " +
+            "SEED Sync mirrors real folders on shared storage, so it needs " +
                 "All-Files Access. Your files are never uploaded to a server — they " +
                 "sync directly, end-to-end, to your other devices.",
             style = MaterialTheme.typography.bodyMedium,

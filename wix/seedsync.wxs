@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Seed Sync MSI (WiX v4+ schema; built with WiX 5).
+  SEED Sync MSI (WiX v4+ schema; built with WiX 5).
 
   Installs the self-contained portable bundle (dist\SeedSync: the three exes plus
   the whole GTK runtime and the updater script) into "Program Files\SeedSync",
@@ -27,14 +27,14 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
-  <Package Name="Seed Sync"
+  <Package Name="SEED Sync"
            Manufacturer="kznjk LLC"
            Version="$(Version)"
            UpgradeCode="51862F05-49F8-4AB0-BE4A-2831849E2BF6"
            Scope="perMachine"
            Compressed="yes">
 
-    <SummaryInformation Description="Seed Sync — P2P mirrored-folder sync" />
+    <SummaryInformation Description="SEED Sync — P2P mirrored-folder sync" />
     <!-- AllowSameVersionUpgrades so reinstalling the same version (during iteration,
          and the silent updater's msiexec /i re-apply) replaces any existing install
          instead of stacking a second registered product. -->
@@ -112,8 +112,8 @@
       <File Id="seed_daemon.exe" Source="$(DistDir)\bin\seed-daemon.exe" KeyPath="yes" />
       <ServiceInstall Id="SeedSyncSvc"
                       Name="SeedSyncDaemon"
-                      DisplayName="Seed Sync"
-                      Description="Seed Sync P2P mirrored-folder sync daemon"
+                      DisplayName="SEED Sync"
+                      Description="SEED Sync P2P mirrored-folder sync daemon"
                       Type="ownProcess"
                       Start="auto"
                       ErrorControl="normal"
@@ -130,7 +130,7 @@
     <StandardDirectory Id="ProgramMenuFolder">
       <Component Id="StartMenuShortcut" Guid="*">
         <Shortcut Id="GuiStartMenu" Name="SEED Sync GUI"
-                  Description="Open the Seed Sync app"
+                  Description="Open the SEED Sync app"
                   Target="[INSTALLFOLDER]bin\seed-gui.exe" Icon="AppIcon" />
         <RegistryValue Root="HKCU" Key="Software\SeedSync" Name="startmenu"
                        Type="integer" Value="1" KeyPath="yes" />
@@ -140,14 +140,14 @@
     <StandardDirectory Id="DesktopFolder">
       <Component Id="DesktopShortcut" Guid="*">
         <Shortcut Id="GuiDesktop" Name="SEED Sync GUI"
-                  Description="Open the Seed Sync app"
+                  Description="Open the SEED Sync app"
                   Target="[INSTALLFOLDER]bin\seed-gui.exe" Icon="AppIcon" />
         <RegistryValue Root="HKCU" Key="Software\SeedSync" Name="desktop"
                        Type="integer" Value="1" KeyPath="yes" />
       </Component>
     </StandardDirectory>
 
-    <Feature Id="Main" Title="Seed Sync" Level="1">
+    <Feature Id="Main" Title="SEED Sync" Level="1">
       <ComponentGroupRef Id="BinDlls" />
       <ComponentRef Id="GuiExe" />
       <ComponentRef Id="CliExe" />

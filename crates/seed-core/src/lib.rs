@@ -1,4 +1,4 @@
-//! Seed Sync core sync engine.
+//! SEED Sync core sync engine.
 //!
 //! This crate owns everything that is *not* GUI or IPC transport: the iroh
 //! endpoint and blob/doc/gossip stores, the multi-master sync engine, share
