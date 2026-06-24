@@ -35,3 +35,4 @@ Thumbs.db
 
 # Local build logs
 /cargo-*.log
+/msi-build.log
