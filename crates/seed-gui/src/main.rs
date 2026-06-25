@@ -1676,10 +1676,11 @@ fn show_keys_dialog(
     bootstrap: Option<&str>,
 ) {
     let dialog = adw::MessageDialog::new(Some(window), Some("Share keys"), None);
-    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    // Each key gets a QR the phone app can scan to add the share — no copying a
-    // giant string. Master + viewer keys carry a QR; the bootstrap address stays
-    // text (it's rarely scanned and the key already embeds discovery info).
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    // Each key row has a "QR" button that pops out a scannable code for the phone
+    // app — no copying a giant string, and the dialog stays compact (the QR is in
+    // a popover, not inline). Master + viewer keys carry a QR; the bootstrap
+    // address stays text (rarely scanned; the key already embeds discovery info).
     if let Some(m) = master {
         vbox.append(&key_field_qr("Master key (write — keep secret)", m));
     }
@@ -1689,26 +1690,60 @@ fn show_keys_dialog(
             vbox.append(&key_field("Bootstrap address (this device)", b));
         }
     }
-    // QRs make the dialog tall; scroll rather than overflow the screen.
-    let scroller = gtk::ScrolledWindow::builder()
-        .child(&vbox)
-        .propagate_natural_height(true)
-        .max_content_height(560)
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .build();
-    dialog.set_extra_child(Some(&scroller));
+    dialog.set_extra_child(Some(&vbox));
     dialog.add_response("close", "Close");
     dialog.set_default_response(Some("close"));
     dialog.set_close_response("close");
     dialog.present();
 }
 
-/// A [`key_field`] with a scannable QR of the value below it.
+/// A key field (label + read-only entry + copy) plus a "QR" button that pops out
+/// a scannable QR of the value, so the dialog stays compact.
 fn key_field_qr(label: &str, value: &str) -> gtk::Box {
-    let outer = key_field(label, value);
-    if let Some(pic) = qr_picture(value) {
-        outer.append(&pic);
+    let outer = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    outer.append(
+        &gtk::Label::builder()
+            .label(label)
+            .halign(gtk::Align::Start)
+            .css_classes(["caption-heading"])
+            .build(),
+    );
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let entry = gtk::Entry::builder()
+        .text(value)
+        .editable(false)
+        .hexpand(true)
+        .build();
+    let copy = gtk::Button::builder()
+        .icon_name("edit-copy-symbolic")
+        .tooltip_text("Copy")
+        .css_classes(["flat"])
+        .build();
+    {
+        let value = value.to_string();
+        copy.connect_clicked(move |btn| {
+            btn.clipboard().set_text(&value);
+        });
     }
+    row.append(&entry);
+    row.append(&copy);
+    // QR pop-out: a MenuButton whose popover holds the scannable code.
+    if let Some(pic) = qr_picture(value) {
+        let qr_btn = gtk::MenuButton::builder()
+            .label("QR")
+            .tooltip_text("Show a scannable QR code")
+            .css_classes(["flat"])
+            .build();
+        let popover = gtk::Popover::new();
+        pic.set_margin_top(8);
+        pic.set_margin_bottom(8);
+        pic.set_margin_start(8);
+        pic.set_margin_end(8);
+        popover.set_child(Some(&pic));
+        qr_btn.set_popover(Some(&popover));
+        row.append(&qr_btn);
+    }
+    outer.append(&row);
     outer
 }
 
@@ -1719,7 +1754,7 @@ fn qr_picture(data: &str) -> Option<gtk::Picture> {
     let width = code.width();
     let colors = code.to_colors();
     let quiet = 4usize;
-    let scale = 4usize;
+    let scale = 6usize; // ~6 px/module → comfortably scannable in the popover
     let modules = width + quiet * 2;
     let px = modules * scale;
     let mut buf = vec![255u8; px * px * 3]; // white background
