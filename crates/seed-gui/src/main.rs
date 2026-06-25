@@ -739,8 +739,15 @@ fn build_ui(
     split.set_max_sidebar_width(440.0);
     split.set_sidebar_width_fraction(0.6);
     let (peers_panel, peers_list) = build_peers_panel(&split, &peers_share);
+    // The single overlay slot is shared between the peers flyout and the share-keys
+    // flyout (mutually exclusive); a stack swaps which one the slot shows. Keys live
+    // in their own NavigationView so a key's QR can push a second page (the QR layer).
+    let keys_nav = adw::NavigationView::new();
+    let sidebar_stack = gtk::Stack::new();
+    sidebar_stack.add_named(&peers_panel, Some("peers"));
+    sidebar_stack.add_named(&keys_nav, Some("keys"));
     split.set_content(Some(&content));
-    split.set_sidebar(Some(&peers_panel));
+    split.set_sidebar(Some(&sidebar_stack));
     // Closing the panel by any means (swipe, Escape, back button) clears the
     // active share so the 2s tick stops re-fetching and stale replies are dropped.
     {
@@ -834,6 +841,8 @@ fn build_ui(
         let split = split.clone();
         let peers_list = peers_list.clone();
         let peers_share = peers_share.clone();
+        let sidebar_stack = sidebar_stack.clone();
+        let keys_nav = keys_nav.clone();
         let tray_speeds = tray_speeds.clone();
         let rows: Rc<RefCell<HashMap<String, RowWidgets>>> = Rc::new(RefCell::new(HashMap::new()));
         glib::spawn_future_local(async move {
@@ -893,7 +902,12 @@ fn build_ui(
                         ));
                     }
                     UiMsg::Keys { master, viewer } => {
-                        show_keys_dialog(&window, master.as_deref(), &viewer, None)
+                        // Keys and peers share one overlay slot; opening keys takes
+                        // it over. Clear the active share so the 2s peers tick stops.
+                        *peers_share.borrow_mut() = None;
+                        show_keys_panel(&keys_nav, &split, master.as_deref(), &viewer, None);
+                        sidebar_stack.set_visible_child_name("keys");
+                        split.set_show_sidebar(true);
                     }
                     UiMsg::NodeAddr(a) => show_text_dialog(
                         &window,
@@ -907,6 +921,7 @@ fn build_ui(
                         // an in-flight 2s refresh after switching shares).
                         if peers_share.borrow().as_deref() == Some(share_id.as_str()) {
                             update_peers_panel(&peers_list, &peers);
+                            sidebar_stack.set_visible_child_name("peers");
                             split.set_show_sidebar(true);
                         }
                     }
@@ -1743,38 +1758,80 @@ fn show_add_dialog(window: &adw::ApplicationWindow, net: &Net, device_name: &Rc<
     dialog.present();
 }
 
-/// Show a dialog with the share's keys (selectable + copyable).
-fn show_keys_dialog(
-    window: &adw::ApplicationWindow,
+/// Populate the keys flyout for a share and reset it to its root page. The panel
+/// shares the right-hand overlay slot with the peers flyout (see [`build_peers_panel`]);
+/// the caller switches the sidebar stack to it and reveals the sidebar. Rebuilt
+/// per open since keys differ per share — `nav.replace` also discards any QR page
+/// left pushed from a previous viewing.
+///
+/// Each key's "QR" button pushes a second page onto `nav` (the QR layer), rather
+/// than a `GtkPopover`: a popover is a Wayland `xdg_popup` the compositor must fit
+/// around its button, and a large master-key code often can't be placed and
+/// silently fails to map. An in-window nav page has no such constraint.
+fn show_keys_panel(
+    nav: &adw::NavigationView,
+    split: &adw::OverlaySplitView,
     master: Option<&str>,
     viewer: &str,
     bootstrap: Option<&str>,
 ) {
-    let dialog = adw::MessageDialog::new(Some(window), Some("Share keys"), None);
-    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    // Each key row has a "QR" button that pops out a scannable code for the phone
-    // app — no copying a giant string, and the dialog stays compact (the QR is in
-    // a popover, not inline). Master + viewer keys carry a QR; the bootstrap
-    // address stays text (rarely scanned; the key already embeds discovery info).
+    let vbox = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(8)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(12)
+        .build();
+    // Master + viewer keys carry a QR; the bootstrap address stays text (rarely
+    // scanned; the key already embeds discovery info).
     if let Some(m) = master {
-        vbox.append(&key_field_qr("Master key (write — keep secret)", m));
+        vbox.append(&key_field_qr(
+            nav,
+            "Master key (write — keep secret)",
+            "Master key",
+            m,
+        ));
     }
-    vbox.append(&key_field_qr("Viewer key (read-only)", viewer));
+    vbox.append(&key_field_qr(nav, "Viewer key (read-only)", "Viewer key", viewer));
     if let Some(b) = bootstrap {
         if !b.is_empty() {
             vbox.append(&key_field("Bootstrap address (this device)", b));
         }
     }
-    dialog.set_extra_child(Some(&vbox));
-    dialog.add_response("close", "Close");
-    dialog.set_default_response(Some("close"));
-    dialog.set_close_response("close");
-    dialog.present();
+    let scroller = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&vbox)
+        .build();
+
+    // Top bar: a back button that dismisses the whole flyout (matches the peers
+    // panel). No window controls — this is an in-window panel, not its own window.
+    let header = adw::HeaderBar::new();
+    header.set_show_start_title_buttons(false);
+    header.set_show_end_title_buttons(false);
+    header.set_show_back_button(false);
+    header.set_title_widget(Some(&adw::WindowTitle::new("Share keys", "")));
+    let back = gtk::Button::builder()
+        .icon_name("go-previous-symbolic")
+        .tooltip_text("Back")
+        .css_classes(["flat", "circular"])
+        .build();
+    {
+        let split = split.clone();
+        back.connect_clicked(move |_| split.set_show_sidebar(false));
+    }
+    header.pack_start(&back);
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&scroller));
+
+    nav.replace(&[adw::NavigationPage::new(&toolbar, "Share keys")]);
 }
 
-/// A key field (label + read-only entry + copy) plus a "QR" button that pops out
-/// a scannable QR of the value, so the dialog stays compact.
-fn key_field_qr(label: &str, value: &str) -> gtk::Box {
+/// A key field (label + read-only entry + copy) plus a "QR" button that pushes a
+/// scannable QR of the value onto `nav` as a second layer, so the panel stays compact.
+fn key_field_qr(nav: &adw::NavigationView, label: &str, qr_title: &str, value: &str) -> gtk::Box {
     let outer = gtk::Box::new(gtk::Orientation::Vertical, 2);
     outer.append(
         &gtk::Label::builder()
@@ -1802,24 +1859,54 @@ fn key_field_qr(label: &str, value: &str) -> gtk::Box {
     }
     row.append(&entry);
     row.append(&copy);
-    // QR pop-out: a MenuButton whose popover holds the scannable code.
-    if let Some(pic) = qr_picture(value) {
-        let qr_btn = gtk::MenuButton::builder()
+    // The QR button pushes a second nav page holding the scannable code (see
+    // `show_keys_panel` for why a nav page rather than a popover).
+    if qrcode::QrCode::new(value.as_bytes()).is_ok() {
+        let qr_btn = gtk::Button::builder()
             .label("QR")
             .tooltip_text("Show a scannable QR code")
             .css_classes(["flat"])
             .build();
-        let popover = gtk::Popover::new();
-        pic.set_margin_top(8);
-        pic.set_margin_bottom(8);
-        pic.set_margin_start(8);
-        pic.set_margin_end(8);
-        popover.set_child(Some(&pic));
-        qr_btn.set_popover(Some(&popover));
+        let nav = nav.clone();
+        let qr_title = qr_title.to_string();
+        let value = value.to_string();
+        qr_btn.connect_clicked(move |_| {
+            if let Some(page) = qr_nav_page(&qr_title, &value) {
+                nav.push(&page);
+            }
+        });
         row.append(&qr_btn);
     }
     outer.append(&row);
     outer
+}
+
+/// A NavigationView page rendering `value` as a scannable QR code, titled `title`.
+/// The flyout's NavigationView supplies the back arrow that returns to the keys.
+fn qr_nav_page(title: &str, value: &str) -> Option<adw::NavigationPage> {
+    let pic = qr_picture(value)?;
+    // Fill the page (minus margins) and scale to the largest square that fits both
+    // width *and* height — `qr_picture` uses `ContentFit::Contain`, so the QR keeps
+    // its aspect ratio and is bounded by whichever dimension is smaller.
+    pic.set_hexpand(true);
+    pic.set_vexpand(true);
+    pic.set_halign(gtk::Align::Fill);
+    pic.set_valign(gtk::Align::Fill);
+    pic.set_margin_top(16);
+    pic.set_margin_bottom(16);
+    pic.set_margin_start(16);
+    pic.set_margin_end(16);
+
+    let header = adw::HeaderBar::new();
+    header.set_show_start_title_buttons(false);
+    header.set_show_end_title_buttons(false);
+    // show-back-button defaults true → NavigationView renders the back arrow.
+    header.set_title_widget(Some(&adw::WindowTitle::new(title, "")));
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&pic));
+
+    Some(adw::NavigationPage::new(&toolbar, title))
 }
 
 /// Render `data` as a QR code into a GTK picture (black modules on white, with a
@@ -1829,7 +1916,7 @@ fn qr_picture(data: &str) -> Option<gtk::Picture> {
     let width = code.width();
     let colors = code.to_colors();
     let quiet = 4usize;
-    let scale = 6usize; // ~6 px/module → comfortably scannable in the popover
+    let scale = 6usize; // ~6 px/module native; the Picture scales to fit the page
     let modules = width + quiet * 2;
     let px = modules * scale;
     let mut buf = vec![255u8; px * px * 3]; // white background
@@ -1858,11 +1945,10 @@ fn qr_picture(data: &str) -> Option<gtk::Picture> {
         &bytes,
         px * 3,
     );
+    // `can_shrink` (the default) + `Contain` lets the caller scale the code down to
+    // fit the available space without distorting it; sizing is left to the caller.
     let pic = gtk::Picture::for_paintable(&texture);
-    pic.set_size_request(px as i32, px as i32);
-    pic.set_can_shrink(false);
-    pic.set_halign(gtk::Align::Center);
-    pic.set_margin_top(6);
+    pic.set_content_fit(gtk::ContentFit::Contain);
     Some(pic)
 }
 
