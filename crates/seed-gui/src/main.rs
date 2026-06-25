@@ -44,7 +44,12 @@ enum UiMsg {
         viewer: String,
     },
     NodeAddr(String),
-    Peers(Vec<PeerInfo>),
+    /// Peers for a specific share. The `share_id` lets the pump drop replies for
+    /// a panel that's since been closed or switched to a different share.
+    Peers {
+        share_id: String,
+        peers: Vec<PeerInfo>,
+    },
     /// This device's current display name (from the daemon), cached in the GUI.
     DeviceName(String),
     Throughput {
@@ -520,6 +525,11 @@ fn build_ui(
     // This device's display name, fetched from the daemon at startup and kept in
     // sync; used to prefill the create/add "Your name" field and the gear dialog.
     let device_name: Rc<RefCell<String>> = Rc::new(RefCell::new(String::new()));
+    // The share whose peers the flyout panel is currently showing, or `None` when
+    // the panel is closed. Set when a share's members button is clicked; cleared
+    // when the panel hides. The 2s tick re-fetches this share's peers so the
+    // status dots update live, and the pump uses it to ignore stale replies.
+    let peers_share: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
     // State shared with the tray (which lives partly on other threads). The
     // message pump writes it from the daemon's summaries/throughput; the tray
@@ -716,7 +726,32 @@ fn build_ui(
     content.append(&header);
     content.append(&view_stack);
     content.append(&status_bar);
-    toast_overlay.set_child(Some(&content));
+
+    // The peers/members view is a flyout: an overlay sidebar that slides in from
+    // the right over the share list. Kept permanently `collapsed` so it always
+    // overlays (with libadwaita's scrim) rather than docking side-by-side, at any
+    // window width. Hidden until a share's members button reveals it.
+    let split = adw::OverlaySplitView::new();
+    split.set_collapsed(true);
+    split.set_sidebar_position(gtk::PackType::End);
+    split.set_show_sidebar(false);
+    split.set_min_sidebar_width(300.0);
+    split.set_max_sidebar_width(440.0);
+    split.set_sidebar_width_fraction(0.6);
+    let (peers_panel, peers_list) = build_peers_panel(&split, &peers_share);
+    split.set_content(Some(&content));
+    split.set_sidebar(Some(&peers_panel));
+    // Closing the panel by any means (swipe, Escape, back button) clears the
+    // active share so the 2s tick stops re-fetching and stale replies are dropped.
+    {
+        let peers_share = peers_share.clone();
+        split.connect_show_sidebar_notify(move |s| {
+            if !s.shows_sidebar() {
+                *peers_share.borrow_mut() = None;
+            }
+        });
+    }
+    toast_overlay.set_child(Some(&split));
     window.set_content(Some(&toast_overlay));
 
     // --- wire actions ---
@@ -796,6 +831,9 @@ fn build_ui(
         let view_stack = view_stack.clone();
         let pause_all_btn = pause_all_btn.clone();
         let paused_state = paused_state.clone();
+        let split = split.clone();
+        let peers_list = peers_list.clone();
+        let peers_share = peers_share.clone();
         let tray_speeds = tray_speeds.clone();
         let rows: Rc<RefCell<HashMap<String, RowWidgets>>> = Rc::new(RefCell::new(HashMap::new()));
         glib::spawn_future_local(async move {
@@ -826,7 +864,7 @@ fn build_ui(
                                 updated_lbl.set_text(&format!("Last updated: {}", fmt_time(ts)));
                             }
                         }
-                        update_list(&listbox, &shares, &net, &window, &rows);
+                        update_list(&listbox, &shares, &net, &window, &rows, &peers_share);
                         // "All paused" drives both the status page and the tray/gear
                         // labels. Notify the tray only when it actually flips.
                         all_paused = !shares.is_empty() && shares.iter().all(|s| s.paused);
@@ -863,7 +901,15 @@ fn build_ui(
                         "Hand this to a peer as the bootstrap address when adding the share.",
                         &a,
                     ),
-                    UiMsg::Peers(peers) => show_peers_dialog(&window, &peers),
+                    UiMsg::Peers { share_id, peers } => {
+                        // Drop replies for a panel that's since closed or moved to
+                        // another share (e.g. a slow first fetch racing a close, or
+                        // an in-flight 2s refresh after switching shares).
+                        if peers_share.borrow().as_deref() == Some(share_id.as_str()) {
+                            update_peers_panel(&peers_list, &peers);
+                            split.set_show_sidebar(true);
+                        }
+                    }
                     UiMsg::DeviceName(name) => *device_name.borrow_mut() = name,
                     UiMsg::Throughput { down, up } => {
                         down_lbl.set_text(&format!("↓ {}", fmt_speed(down)));
@@ -896,9 +942,23 @@ fn build_ui(
     });
     {
         let net = net.clone();
+        let peers_share = peers_share.clone();
         net.refresh();
         glib::timeout_add_local(Duration::from_millis(2000), move || {
             net.refresh();
+            // Keep the open peers flyout live: re-fetch its share so the status
+            // dots track peers going on/offline without reopening. `peers_share`
+            // is `None` while the panel is closed, so this is a no-op then.
+            if let Some(share_id) = peers_share.borrow().clone() {
+                let rid = share_id.clone();
+                net.send(IpcRequest::GetPeers { share_id }, move |res| match res {
+                    Ok(IpcResponse::Peers(p)) => Some(UiMsg::Peers {
+                        share_id: rid,
+                        peers: p,
+                    }),
+                    _ => None,
+                });
+            }
             glib::ControlFlow::Continue
         });
     }
@@ -1120,6 +1180,7 @@ fn update_list(
     net: &Net,
     window: &adw::ApplicationWindow,
     rows: &Rc<RefCell<HashMap<String, RowWidgets>>>,
+    peers_share: &Rc<RefCell<Option<String>>>,
 ) {
     let mut rows = rows.borrow_mut();
     rows.retain(|id, rw| {
@@ -1148,14 +1209,19 @@ fn update_list(
             rw.keys_item
                 .set_sensitive(!matches!(s.status, ShareStatus::Indexing));
         } else {
-            let rw = build_row(s, net, window);
+            let rw = build_row(s, net, window, peers_share);
             listbox.append(&rw.row);
             rows.insert(s.share_id.clone(), rw);
         }
     }
 }
 
-fn build_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> RowWidgets {
+fn build_row(
+    s: &ShareSummary,
+    net: &Net,
+    window: &adw::ApplicationWindow,
+    peers_share: &Rc<RefCell<Option<String>>>,
+) -> RowWidgets {
     let row = gtk::ListBoxRow::new();
     let hbox = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -1241,13 +1307,22 @@ fn build_row(s: &ShareSummary, net: &Net, window: &adw::ApplicationWindow) -> Ro
     {
         let net = net.clone();
         let id = s.share_id.clone();
+        let peers_share = peers_share.clone();
         members.connect_clicked(move |_| {
+            // Mark this share active *before* the request returns so the 2s tick
+            // and the pump's stale-reply guard both key off it. The flyout itself
+            // is revealed when the peers reply lands (see the pump's Peers arm).
+            *peers_share.borrow_mut() = Some(id.clone());
+            let rid = id.clone();
             net.send(
                 IpcRequest::GetPeers {
                     share_id: id.clone(),
                 },
-                |res| match res {
-                    Ok(IpcResponse::Peers(p)) => Some(UiMsg::Peers(p)),
+                move |res| match res {
+                    Ok(IpcResponse::Peers(p)) => Some(UiMsg::Peers {
+                        share_id: rid,
+                        peers: p,
+                    }),
                     _ => Some(UiMsg::Toast("could not load peers".into())),
                 },
             );
@@ -1801,78 +1876,127 @@ fn show_text_dialog(window: &adw::ApplicationWindow, title: &str, subtitle: &str
 }
 
 /// Show the peers known for a share.
-fn show_peers_dialog(window: &adw::ApplicationWindow, peers: &[PeerInfo]) {
-    let dialog = adw::MessageDialog::new(Some(window), Some("Members"), None);
-    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+/// Build the peers/members flyout once: a back-button top bar over a scrolling
+/// list. Returned widget is set as the `OverlaySplitView`'s sidebar; the inner
+/// `ListBox` is repopulated by [`update_peers_panel`] each time peers arrive.
+fn build_peers_panel(
+    split: &adw::OverlaySplitView,
+    peers_share: &Rc<RefCell<Option<String>>>,
+) -> (gtk::Widget, gtk::ListBox) {
+    let toolbar = adw::ToolbarView::new();
 
-    if peers.is_empty() {
-        vbox.append(
-            &gtk::Label::builder()
-                .label("No peers seen yet.")
-                .css_classes(["dim-label"])
-                .build(),
-        );
-    } else {
-        let list = gtk::ListBox::builder().css_classes(["boxed-list"]).build();
-        for p in peers {
-            let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-            row.set_margin_start(8);
-            row.set_margin_end(8);
-            row.set_margin_top(6);
-            row.set_margin_bottom(6);
+    // Top bar: a back button that dismisses the flyout, plus the "Members" title.
+    // No window controls — this is an in-window panel, not its own window.
+    let header = adw::HeaderBar::new();
+    header.set_show_start_title_buttons(false);
+    header.set_show_end_title_buttons(false);
+    header.set_title_widget(Some(&adw::WindowTitle::new("Members", "")));
+    let back = gtk::Button::builder()
+        .icon_name("go-previous-symbolic")
+        .tooltip_text("Back")
+        .css_classes(["flat", "circular"])
+        .build();
+    {
+        let split = split.clone();
+        let peers_share = peers_share.clone();
+        back.connect_clicked(move |_| {
+            split.set_show_sidebar(false);
+            *peers_share.borrow_mut() = None;
+        });
+    }
+    header.pack_start(&back);
+    toolbar.add_top_bar(&header);
 
-            // One dead-simple health dot: green = fully synced, yellow = under
-            // 100% (downloading or behind), gray = offline. Word label on hover.
-            let (css, tip) = if !p.online {
-                ("health-off", "Offline".to_string())
-            } else if p.percent >= 100 {
-                ("health-ok", "Synced".to_string())
-            } else {
-                ("health-sync", format!("{}% synced", p.percent))
-            };
-            let dot = gtk::Label::new(Some("●"));
-            dot.add_css_class("health-dot");
-            dot.add_css_class(css);
-            dot.set_tooltip_text(Some(&tip));
+    let list = gtk::ListBox::builder()
+        .css_classes(["boxed-list"])
+        .selection_mode(gtk::SelectionMode::None)
+        .valign(gtk::Align::Start)
+        .margin_start(12)
+        .margin_end(12)
+        .margin_top(6)
+        .margin_bottom(12)
+        .build();
+    let scroller = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&list)
+        .build();
+    toolbar.set_content(Some(&scroller));
 
-            // Name (falls back to the short id); the local row is tagged.
-            let display = p.name.clone().unwrap_or_else(|| p.node_id.clone());
-            let label_text = if p.node_id == "This device" {
-                format!("{display} (this device)")
-            } else {
-                display
-            };
-            let name_lbl = gtk::Label::builder()
-                .label(&label_text)
-                .halign(gtk::Align::Start)
-                .hexpand(true)
-                .ellipsize(gtk::pango::EllipsizeMode::End)
-                .build();
+    (toolbar.upcast(), list)
+}
 
-            let role = gtk::Label::builder()
-                .label(role_str(p.role))
-                .halign(gtk::Align::End)
-                .css_classes(["dim-label", "caption"])
-                .build();
-
-            row.append(&dot);
-            row.append(&name_lbl);
-            row.append(&role);
-            list.append(&row);
-        }
-        vbox.append(&list);
+/// Repopulate the flyout's peer list in place (clear, then rebuild). Called on
+/// every peers reply, so it must be cheap and idempotent.
+fn update_peers_panel(list: &gtk::ListBox, peers: &[PeerInfo]) {
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
     }
 
-    let scroller = gtk::ScrolledWindow::builder()
-        .propagate_natural_height(true)
-        .max_content_height(360)
-        .child(&vbox)
-        .build();
-    dialog.set_extra_child(Some(&scroller));
-    dialog.add_response("close", "Close");
-    dialog.set_default_response(Some("close"));
-    dialog.set_close_response("close");
-    dialog.present();
+    if peers.is_empty() {
+        let empty = gtk::Label::builder()
+            .label("No peers seen yet.")
+            .css_classes(["dim-label"])
+            .margin_top(12)
+            .margin_bottom(12)
+            .build();
+        list.append(&empty);
+        return;
+    }
+
+    for p in peers {
+        let row = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+        row.set_margin_start(10);
+        row.set_margin_end(10);
+        row.set_margin_top(8);
+        row.set_margin_bottom(8);
+
+        // One dead-simple health dot: green = fully synced, yellow = under
+        // 100% (downloading or behind), gray = offline. Word label on hover.
+        let (css, tip) = if !p.online {
+            ("health-off", "Offline".to_string())
+        } else if p.percent >= 100 {
+            ("health-ok", "Synced".to_string())
+        } else {
+            ("health-sync", format!("{}% synced", p.percent))
+        };
+        let dot = gtk::Label::new(Some("●"));
+        dot.add_css_class("health-dot");
+        dot.add_css_class(css);
+        dot.set_tooltip_text(Some(&tip));
+
+        // Name (falls back to the short id); the local row is tagged.
+        let display = p.name.clone().unwrap_or_else(|| p.node_id.clone());
+        let label_text = if p.node_id == "This device" {
+            format!("{display} (this device)")
+        } else {
+            display
+        };
+        let name_lbl = gtk::Label::builder()
+            .label(&label_text)
+            .halign(gtk::Align::Start)
+            .hexpand(true)
+            .ellipsize(gtk::pango::EllipsizeMode::End)
+            .build();
+
+        let role = gtk::Label::builder()
+            .label(role_str(p.role))
+            .halign(gtk::Align::End)
+            .css_classes(["dim-label", "caption"])
+            .build();
+
+        // Trailing action slot: empty for now, reserved so per-peer controls
+        // (master boots a member; local rename) can be dropped in without
+        // reflowing the row. Holds the panel's horizontal headroom open.
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
+        actions.set_halign(gtk::Align::End);
+
+        row.append(&dot);
+        row.append(&name_lbl);
+        row.append(&role);
+        row.append(&actions);
+        list.append(&row);
+    }
 }
 
 /// A labeled, selectable key value with a copy button.
