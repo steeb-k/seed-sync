@@ -29,6 +29,7 @@ import uniffi.seed_mobile.ShareSummary
 fun SeedAppHost(pickFolder: (onResolved: (String?) -> Unit) -> Unit) {
     val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
+    val deviceName by EngineHolder.deviceName.collectAsStateSafe("")
 
     var dialog by remember { mutableStateOf<Dialog?>(null) }
 
@@ -87,7 +88,10 @@ fun SeedAppHost(pickFolder: (onResolved: (String?) -> Unit) -> Unit) {
         is Dialog.Keys -> KeysDialog(d.masterKey, d.viewerKey, d.isMaster) { dialog = null }
         is Dialog.NodeAddr -> NodeAddrDialog(d.addr) { dialog = null }
         is Dialog.Peers -> PeersDialog(d.peers) { dialog = null }
-        is Dialog.Settings -> SettingsDialog(onDismiss = { dialog = null })
+        is Dialog.Settings -> SettingsDialog(
+            onDismiss = { dialog = null },
+            onEditDeviceName = { dialog = Dialog.DeviceName(deviceName) }
+        )
         is Dialog.AddExisting -> AddExistingDialog(
             onDismiss = { dialog = null },
             onPickFolder = { onResolved -> pickFolder(onResolved) },

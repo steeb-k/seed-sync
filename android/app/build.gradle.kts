@@ -93,6 +93,10 @@ dependencies {
 
     implementation("androidx.work:work-runtime-ktx:2.10.0")
 
+    // QR scanning for "add existing share" (camera -> key). Standalone (no Play
+    // Services), fits the sideload/F-Droid distribution.
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
     // Required at runtime by the UniFFI-generated Kotlin bindings.
     implementation("net.java.dev.jna:jna:5.15.0@aar")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")

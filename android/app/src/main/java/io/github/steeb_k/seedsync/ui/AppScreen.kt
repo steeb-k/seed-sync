@@ -17,6 +17,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
@@ -90,10 +91,6 @@ fun AppScreen(
                             onClick = { overflowOpen = false; actions.onOpenSettings() }
                         )
                         DropdownMenuItem(
-                            text = { Text("Device name…") },
-                            onClick = { overflowOpen = false; actions.onEditDeviceName(deviceName) }
-                        )
-                        DropdownMenuItem(
                             text = { Text("Show this device's address…") },
                             onClick = { overflowOpen = false; actions.onShowNodeAddr() }
                         )
@@ -110,11 +107,27 @@ fun AppScreen(
             )
         },
         floatingActionButton = {
-            FloatingActionButton(onClick = { actions.onCreateShare() }) {
-                Icon(Icons.Default.Add, contentDescription = "Create share")
+            var fabMenuOpen by remember { mutableStateOf(false) }
+            Box {
+                FloatingActionButton(onClick = { fabMenuOpen = true }) {
+                    Icon(Icons.Default.Add, contentDescription = "Add a share")
+                }
+                // Sub-menu mirroring the desktop "+" popover (create vs add).
+                DropdownMenu(expanded = fabMenuOpen, onDismissRequest = { fabMenuOpen = false }) {
+                    DropdownMenuItem(
+                        text = { Text("Create new share…") },
+                        onClick = { fabMenuOpen = false; actions.onCreateShare() }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Add existing share…") },
+                        onClick = { fabMenuOpen = false; actions.onAddExisting() }
+                    )
+                }
             }
         },
-        bottomBar = { ThroughputFooter(throughput, deviceName) }
+        bottomBar = {
+            ThroughputFooter(throughput, deviceName, onEdit = { actions.onEditDeviceName(deviceName) })
+        }
     ) { padding ->
         Column(Modifier.fillMaxSize().padding(padding)) {
             suspendReason?.let { SuspendBanner(it) }
@@ -157,7 +170,7 @@ private fun EmptyState(modifier: Modifier = Modifier) {
             Text("No shares yet", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.size(8.dp))
             Text(
-                "Tap + to share a folder, or use the menu to add one from a key.",
+                "Tap + to create a new share or add an existing one from a key.",
                 style = MaterialTheme.typography.bodyMedium
             )
         }
@@ -260,7 +273,11 @@ private fun roleSuffix(role: Role) = when (role) {
 }
 
 @Composable
-private fun ThroughputFooter(tp: EngineHolder.Throughput, deviceName: String) {
+private fun ThroughputFooter(
+    tp: EngineHolder.Throughput,
+    deviceName: String,
+    onEdit: () -> Unit,
+) {
     // The Surface fills to the bottom screen edge (tonal background behind the
     // nav bar), while the content row is padded above the navigation/gesture
     // area via navigationBarsPadding() so text isn't clipped on gesture-nav or
@@ -269,10 +286,17 @@ private fun ThroughputFooter(tp: EngineHolder.Throughput, deviceName: String) {
         Row(
             Modifier.fillMaxWidth()
                 .navigationBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 14.dp),
+                .padding(start = 16.dp, end = 16.dp, top = 6.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(deviceName, style = MaterialTheme.typography.labelMedium)
+            IconButton(onClick = onEdit, modifier = Modifier.size(34.dp)) {
+                Icon(
+                    Icons.Default.Edit,
+                    contentDescription = "Rename this device",
+                    modifier = Modifier.size(17.dp)
+                )
+            }
             Spacer(Modifier.weight(1f))
             Text("↓ ${humanRate(tp.downBps)}   ↑ ${humanRate(tp.upBps)}",
                 style = MaterialTheme.typography.labelMedium)

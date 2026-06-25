@@ -6,11 +6,17 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.QrCodeScanner
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -23,6 +29,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import uniffi.seed_mobile.PeerInfo
 
 @Composable
@@ -95,6 +103,11 @@ fun AddExistingDialog(
     var key by remember { mutableStateOf("") }
     var folder by remember { mutableStateOf("") }
     var bootstrap by remember { mutableStateOf("") }
+    // Scan a key QR from the desktop app (ZXing handles the camera-permission
+    // prompt). The scanned contents are the key string.
+    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        result.contents?.let { key = it.trim() }
+    }
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = {
@@ -112,6 +125,24 @@ fun AddExistingDialog(
                     label = { Text("Share key (master or viewer)") },
                     singleLine = true, modifier = Modifier.fillMaxWidth()
                 )
+                TextButton(onClick = {
+                    scanLauncher.launch(
+                        ScanOptions().apply {
+                            setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                            setPrompt("Scan a key QR from the SEED Sync desktop app")
+                            setBeepEnabled(false)
+                            setOrientationLocked(false)
+                        }
+                    )
+                }) {
+                    Icon(
+                        androidx.compose.material.icons.Icons.Default.QrCodeScanner,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(Modifier.size(6.dp))
+                    Text("Scan QR code")
+                }
                 Spacer(Modifier.size(8.dp))
                 Row {
                     OutlinedTextField(
@@ -134,16 +165,38 @@ fun AddExistingDialog(
 }
 
 @Composable
-fun SettingsDialog(onDismiss: () -> Unit) {
+fun SettingsDialog(onDismiss: () -> Unit, onEditDeviceName: () -> Unit) {
     val gate = io.github.steeb_k.seedsync.engine.SyncGate
     val wifiOnly by gate.wifiOnly.collectAsStateSafe(false)
     val chargingOnly by gate.chargingOnly.collectAsStateSafe(false)
+    val deviceName by io.github.steeb_k.seedsync.engine.EngineHolder.deviceName.collectAsStateSafe("")
     AlertDialog(
         onDismissRequest = onDismiss,
         confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
         title = { Text("Settings") },
         text = {
             Column {
+                // Device name (moved here from the overflow menu); tapping opens
+                // the rename dialog. The footer pencil is the quick shortcut.
+                Row(
+                    modifier = Modifier.fillMaxWidth()
+                        .clickable { onEditDeviceName() }
+                        .padding(vertical = 6.dp),
+                    verticalAlignment = androidx.compose.ui.Alignment.CenterVertically
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Device name", style = androidx.compose.material3.MaterialTheme.typography.bodyLarge)
+                        Text(
+                            deviceName.ifEmpty { "—" },
+                            style = androidx.compose.material3.MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Icon(
+                        androidx.compose.material.icons.Icons.Default.Edit,
+                        contentDescription = "Rename this device"
+                    )
+                }
+                HorizontalDivider(Modifier.padding(vertical = 8.dp))
                 SettingSwitch(
                     title = "Sync only on Wi-Fi",
                     subtitle = "Pause syncing on cellular data",

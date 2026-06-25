@@ -1676,21 +1676,84 @@ fn show_keys_dialog(
     bootstrap: Option<&str>,
 ) {
     let dialog = adw::MessageDialog::new(Some(window), Some("Share keys"), None);
-    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let vbox = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    // Each key gets a QR the phone app can scan to add the share — no copying a
+    // giant string. Master + viewer keys carry a QR; the bootstrap address stays
+    // text (it's rarely scanned and the key already embeds discovery info).
     if let Some(m) = master {
-        vbox.append(&key_field("Master key (write — keep secret)", m));
+        vbox.append(&key_field_qr("Master key (write — keep secret)", m));
     }
-    vbox.append(&key_field("Viewer key (read-only)", viewer));
+    vbox.append(&key_field_qr("Viewer key (read-only)", viewer));
     if let Some(b) = bootstrap {
         if !b.is_empty() {
             vbox.append(&key_field("Bootstrap address (this device)", b));
         }
     }
-    dialog.set_extra_child(Some(&vbox));
+    // QRs make the dialog tall; scroll rather than overflow the screen.
+    let scroller = gtk::ScrolledWindow::builder()
+        .child(&vbox)
+        .propagate_natural_height(true)
+        .max_content_height(560)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .build();
+    dialog.set_extra_child(Some(&scroller));
     dialog.add_response("close", "Close");
     dialog.set_default_response(Some("close"));
     dialog.set_close_response("close");
     dialog.present();
+}
+
+/// A [`key_field`] with a scannable QR of the value below it.
+fn key_field_qr(label: &str, value: &str) -> gtk::Box {
+    let outer = key_field(label, value);
+    if let Some(pic) = qr_picture(value) {
+        outer.append(&pic);
+    }
+    outer
+}
+
+/// Render `data` as a QR code into a GTK picture (black modules on white, with a
+/// 4-module quiet zone). Returns `None` if the data is too large to encode.
+fn qr_picture(data: &str) -> Option<gtk::Picture> {
+    let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
+    let width = code.width();
+    let colors = code.to_colors();
+    let quiet = 4usize;
+    let scale = 4usize;
+    let modules = width + quiet * 2;
+    let px = modules * scale;
+    let mut buf = vec![255u8; px * px * 3]; // white background
+    for y in 0..width {
+        for x in 0..width {
+            if colors[y * width + x] == qrcode::Color::Dark {
+                let ox = (x + quiet) * scale;
+                let oy = (y + quiet) * scale;
+                for dy in 0..scale {
+                    let row = (oy + dy) * px;
+                    for dx in 0..scale {
+                        let i = (row + ox + dx) * 3;
+                        buf[i] = 0;
+                        buf[i + 1] = 0;
+                        buf[i + 2] = 0;
+                    }
+                }
+            }
+        }
+    }
+    let bytes = glib::Bytes::from(&buf);
+    let texture = gtk::gdk::MemoryTexture::new(
+        px as i32,
+        px as i32,
+        gtk::gdk::MemoryFormat::R8g8b8,
+        &bytes,
+        px * 3,
+    );
+    let pic = gtk::Picture::for_paintable(&texture);
+    pic.set_size_request(px as i32, px as i32);
+    pic.set_can_shrink(false);
+    pic.set_halign(gtk::Align::Center);
+    pic.set_margin_top(6);
+    Some(pic)
 }
 
 fn show_text_dialog(window: &adw::ApplicationWindow, title: &str, subtitle: &str, text: &str) {
