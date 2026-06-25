@@ -131,6 +131,8 @@ fun AddExistingDialog(
                             setDesiredBarcodeFormats(ScanOptions.QR_CODE)
                             setPrompt("Scan a key QR from the SEED Sync desktop app")
                             setBeepEnabled(false)
+                            // Portrait scanner instead of ZXing's landscape default.
+                            setCaptureActivity(io.github.steeb_k.seedsync.PortraitCaptureActivity::class.java)
                             setOrientationLocked(false)
                         }
                     )

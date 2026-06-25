@@ -49,6 +49,16 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- Portrait QR scanner (ZXing's default CaptureActivity is sensorLandscape). -->
+        <activity
+            android:name=".PortraitCaptureActivity"
+            android:screenOrientation="portrait"
+            android:stateNotNeeded="true"
+            android:clearTaskOnLaunch="true"
+            android:exported="false"
+            android:theme="@style/zxing_CaptureTheme"
+            android:windowSoftInputMode="stateAlwaysHidden" />
+
         <receiver
             android:name=".BootReceiver"
             android:enabled="true"
