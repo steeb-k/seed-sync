@@ -576,6 +576,19 @@ fn to_hash(bytes: &[u8]) -> anyhow::Result<Hash> {
 /// What a [`ReconcileJob::run`] decided, applied back into engine state under the
 /// lock by [`Engine::finish_reconcile`]: index mutations to persist, the new
 /// folder signature, this node's recomputed health, and any blob copies to reclaim.
+/// Bookkeeping for a content download currently in flight, so it can be both
+/// deduplicated and **cancelled** (e.g. when its share is paused) instead of
+/// running to completion. Keyed by blob hash in the shared in-flight map.
+struct InflightDownload {
+    /// Which share kicked it off (so pausing that share can cancel just its
+    /// downloads).
+    share_id: String,
+    /// Aborts the detached download task. Aborting drops the download future
+    /// (and, for a swarm, its `JoinSet` of part tasks), closing the connections;
+    /// already-fetched chunks persist on disk and resume on the next attempt.
+    abort: tokio::task::AbortHandle,
+}
+
 pub struct ReconcileOutcome {
     changed: bool,
     health: u8,
@@ -624,11 +637,11 @@ pub struct ReconcileJob {
     /// This node's own endpoint id, filtered out of the candidate set (no point
     /// dialing ourselves).
     self_id: EndpointId,
-    /// Content downloader (cloned node handle) and the shared in-flight set, used
+    /// Content downloader (cloned node handle) and the shared in-flight map, used
     /// by [`ReconcileJob::ensure_download`] to fetch missing blobs from a
-    /// load-balanced provider set.
+    /// load-balanced provider set (and to cancel them on pause).
     downloader: Downloader,
-    downloads_inflight: Arc<StdMutex<HashSet<Hash>>>,
+    downloads_inflight: Arc<StdMutex<HashMap<Hash, InflightDownload>>>,
     /// Live peer roster, read at download time to pick current online providers
     /// (dynamic discovery), rather than relying on the job-creation snapshot in
     /// `providers`.
@@ -713,6 +726,21 @@ impl ReconcileJob {
         live_providers_from(&self.roster, self.self_id, self.master_id)
     }
 
+    /// Bytes of `hash` already present on disk, including a partially-downloaded
+    /// blob (chunk granularity). Lets health/percent reflect real progress on a
+    /// large in-flight file. Returns 0 if the blob is unknown or the query fails.
+    async fn local_bytes(&self, hash: Hash) -> u64 {
+        match self
+            .blobs
+            .remote()
+            .local_for_request(GetRequest::blob(hash))
+            .await
+        {
+            Ok(info) => info.local_bytes(),
+            Err(_) => 0,
+        }
+    }
+
     /// Ensure a download of `hash` (of `size` bytes) is in flight. Idempotent: a
     /// hash already downloading is skipped, so repeated reconcile ticks don't pile
     /// up duplicate fetches. Runs detached; the next reconcile re-checks `has()` and
@@ -726,21 +754,19 @@ impl ReconcileJob {
     /// reassembles the verified ranges into the complete blob. Small blobs (or when
     /// only one source is available) take the simple whole-blob path.
     fn ensure_download(&self, hash: Hash, size: u64) {
+        // Already downloading this blob? (cheap pre-check)
         {
-            let mut inflight = match self.downloads_inflight.lock() {
+            let inflight = match self.downloads_inflight.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
-            if !inflight.insert(hash) {
-                return; // already downloading this blob
+            if inflight.contains_key(&hash) {
+                return;
             }
         }
         let (peers, master) = self.live_providers();
         if peers.is_empty() && master.is_none() {
             // Nobody to pull from yet (no peers, we are the only/master node).
-            if let Ok(mut g) = self.downloads_inflight.lock() {
-                g.remove(&hash);
-            }
             return;
         }
         // Full fallback set for the simple path: master last so peers are preferred.
@@ -754,7 +780,7 @@ impl ReconcileJob {
         let master_id = self.master_id;
         let inflight = self.downloads_inflight.clone();
         let share = self.share_id.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let res = if swarm {
                 swarm_download(&downloader, &blobs, hash, size, &roster, self_id, master_id).await
             } else {
@@ -770,6 +796,26 @@ impl ReconcileJob {
                 g.remove(&hash);
             }
         });
+
+        // Register the abort handle so a pause can cancel this transfer. If another
+        // tick registered the same hash while we were spawning, cancel this duplicate.
+        let abort = handle.abort_handle();
+        match self.downloads_inflight.lock() {
+            Ok(mut inflight) => {
+                if inflight.contains_key(&hash) {
+                    abort.abort();
+                } else {
+                    inflight.insert(
+                        hash,
+                        InflightDownload {
+                            share_id: self.share_id.clone(),
+                            abort,
+                        },
+                    );
+                }
+            }
+            Err(_) => abort.abort(),
+        }
     }
 
     /// Materialize a remote file to disk if its content has arrived. Returns
@@ -1160,12 +1206,24 @@ impl ReconcileJob {
         // for *every* role. A source master that already has all its content computes
         // 100 naturally; a master or viewer still fetching missing blobs reports the
         // real percentage instead of a misleading 100. An empty view is 100.
+        //
+        // For an incomplete file we count the chunk bytes already on disk (not 0), so
+        // the percent climbs with real progress on a large in-flight blob instead of
+        // staying flat until it finishes and jumping straight to done. The blob store
+        // tracks this at chunk granularity (that's how the resumable swarm works), so
+        // it's accurate and survives restarts.
         let mut total_bytes: u64 = 0;
         let mut present_bytes: u64 = 0;
         for re in remote.values() {
             total_bytes += re.size;
-            if re.size == 0 || self.blobs.blobs().has(to_hash(&re.hash)?).await? {
+            if re.size == 0 {
+                continue;
+            }
+            let hash = to_hash(&re.hash)?;
+            if self.blobs.blobs().has(hash).await? {
                 present_bytes += re.size;
+            } else {
+                present_bytes += self.local_bytes(hash).await.min(re.size);
             }
         }
         let health = if total_bytes == 0 {
@@ -1234,13 +1292,14 @@ pub struct Engine {
     /// being published off-lock, keyed by share id. Shared with each in-flight
     /// [`PublishJob`] so [`Engine::list_summaries`] can report a moving percent.
     progress: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
-    /// Content hashes with an engine-driven download currently in flight. Shared
-    /// with each [`ReconcileJob`] so a hash isn't re-queued every reconcile tick
-    /// while its blob streams in. Global (content is addressed by hash, so the
-    /// same blob referenced from two shares is fetched once). Entries are removed
-    /// when the download task settles; a still-missing blob is simply re-queued on
-    /// the next tick (free retry).
-    downloads_inflight: Arc<StdMutex<HashSet<Hash>>>,
+    /// Content downloads currently in flight, keyed by blob hash, each with its
+    /// share id and an abort handle. Shared with each [`ReconcileJob`] so a hash
+    /// isn't re-queued every reconcile tick while its blob streams in, AND so a
+    /// pause can cancel the running transfer. Global (content is addressed by hash,
+    /// so the same blob referenced from two shares is fetched once). Entries are
+    /// removed when the task settles or is cancelled; a still-missing blob is
+    /// re-queued on the next tick (free retry, resuming from on-disk chunks).
+    downloads_inflight: Arc<StdMutex<HashMap<Hash, InflightDownload>>>,
     /// Hashes whose orphaned owned blob copy (left by a cross-volume reference
     /// export) still needs deleting. Retried each reconcile until iroh releases
     /// the file handle — see [`try_reclaim_owned_data`].
@@ -1287,7 +1346,7 @@ impl Engine {
             shares: HashMap::new(),
             db,
             progress: Arc::new(StdMutex::new(HashMap::new())),
-            downloads_inflight: Arc::new(StdMutex::new(HashSet::new())),
+            downloads_inflight: Arc::new(StdMutex::new(HashMap::new())),
             reclaim_pending: std::collections::HashSet::new(),
             device_name: StdMutex::new(device_name),
             paused_all: StdMutex::new(paused_all),
@@ -1336,6 +1395,9 @@ impl Engine {
         if let Ok(mut p) = self.paused_all.lock() {
             *p = paused;
         }
+        if paused {
+            self.cancel_all_downloads();
+        }
         Ok(())
     }
 
@@ -1352,6 +1414,9 @@ impl Engine {
     pub fn set_sync_suspended(&self, suspended: bool) {
         if let Ok(mut s) = self.sync_suspended.lock() {
             *s = suspended;
+        }
+        if suspended {
+            self.cancel_all_downloads();
         }
     }
 
@@ -2033,6 +2098,31 @@ impl Engine {
     }
 
     /// Pause or resume a share (persisted; the reconcile loop skips paused shares).
+    /// Abort in-flight content downloads belonging to `share_id` so a large
+    /// transfer stops promptly when the share is paused (rather than running to
+    /// completion). Already-fetched chunks stay on disk and resume on unpause.
+    fn cancel_downloads_for_share(&self, share_id: &str) {
+        if let Ok(mut inflight) = self.downloads_inflight.lock() {
+            inflight.retain(|_hash, dl| {
+                if dl.share_id == share_id {
+                    dl.abort.abort();
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+    }
+
+    /// Abort ALL in-flight content downloads (global pause / sync-suspend).
+    fn cancel_all_downloads(&self) {
+        if let Ok(mut inflight) = self.downloads_inflight.lock() {
+            for (_hash, dl) in inflight.drain() {
+                dl.abort.abort();
+            }
+        }
+    }
+
     pub fn set_paused(&mut self, share_id: &str, paused: bool) -> anyhow::Result<()> {
         let state = self
             .shares
@@ -2040,6 +2130,11 @@ impl Engine {
             .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
         state.paused = paused;
         self.db.set_paused(share_id, paused)?;
+        // Stop any transfer already running for this share; the reconcile gate
+        // (make_reconcile_job) prevents new ones while paused.
+        if paused {
+            self.cancel_downloads_for_share(share_id);
+        }
         Ok(())
     }
 

@@ -914,6 +914,180 @@ async fn locked_files_do_not_block_share_and_sync_after_unlock() -> anyhow::Resu
     Ok(())
 }
 
+/// Health/percent must reflect *real* byte progress on a large in-flight file:
+/// while a big blob downloads, the reported percent climbs through intermediate
+/// values instead of staying flat at the pre-download number and jumping straight
+/// to done. Regression guard for "Syncing 18%" sitting still until a big file
+/// finishes (old behavior counted an incomplete file as 0 bytes present).
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn health_reports_partial_progress_during_download() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let mut master = Engine::new(a_data.path()).await?;
+    let mut viewer = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        master.wait_online().await;
+        viewer.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    // Large enough that the transfer spans many reconcile/poll ticks, so partial
+    // percentages are observable (not an instant 0 -> 100 jump).
+    let content = gen_bytes(32 * 1024 * 1024);
+    std::fs::write(a_folder.path().join("big.bin"), &content)?;
+    let created = master.create_share(a_folder.path(), vec![]).await?;
+    let share_id = viewer
+        .add_share(
+            &created.viewer_key,
+            b_folder.path(),
+            vec![master.endpoint_addr()],
+        )
+        .await?;
+    let want = snapshot(a_folder.path());
+
+    let percent_of = |v: &Engine| -> u8 {
+        v.list_summaries()
+            .into_iter()
+            .find(|s| s.share_id == share_id)
+            .map(|s| s.percent)
+            .unwrap_or(0)
+    };
+
+    let mut saw_partial = false;
+    let mut max_partial = 0u8;
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
+    loop {
+        let _ = viewer.apply(&share_id).await?;
+        let pct = percent_of(&viewer);
+        if pct > 0 && pct < 100 {
+            saw_partial = true;
+            max_partial = max_partial.max(pct);
+        }
+        if snapshot(b_folder.path()) == want {
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("timed out while downloading (last percent {pct})");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(
+        std::fs::read(b_folder.path().join("big.bin"))?,
+        content,
+        "file must have synced correctly"
+    );
+    assert!(
+        saw_partial,
+        "percent must climb through intermediate values during a large download \
+         (never observed a value strictly between 0 and 100)"
+    );
+    // Final state reads 100.
+    assert_eq!(percent_of(&viewer), 100, "completed share should read 100%");
+    println!("partial-progress OK: observed intermediate percent up to {max_partial}%, then 100%");
+
+    master.shutdown().await?;
+    viewer.shutdown().await?;
+    Ok(())
+}
+
+/// Pausing a share must actually STOP an in-flight download, not just stop
+/// starting new ones. Regression guard for the reported bug where pausing in the
+/// GUI did nothing and the transfer ran to completion until the service was
+/// stopped. We pause mid-download and assert the viewer stops receiving bytes
+/// (without the fix it would keep pulling the rest of the file).
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn pausing_a_share_stops_in_flight_download() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let mut master = Engine::new(a_data.path()).await?;
+    let mut viewer = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        master.wait_online().await;
+        viewer.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    // Loopback transfers run at multiple GB/s, so we can't reliably pause at a low
+    // *percentage*. Instead use a large file and pause at the FIRST observed partial
+    // (caught with a tight loop), leaving plenty that would still arrive if the
+    // transfer weren't cancelled — which a small absolute byte threshold detects.
+    let content = gen_bytes(256 * 1024 * 1024);
+    std::fs::write(a_folder.path().join("big.bin"), &content)?;
+    let created = master.create_share(a_folder.path(), vec![]).await?;
+    let share_id = viewer
+        .add_share(
+            &created.viewer_key,
+            b_folder.path(),
+            vec![master.endpoint_addr()],
+        )
+        .await?;
+
+    let percent_of = |v: &Engine| -> u8 {
+        v.list_summaries()
+            .into_iter()
+            .find(|s| s.share_id == share_id)
+            .map(|s| s.percent)
+            .unwrap_or(0)
+    };
+
+    // Pause at the first sign of *partial* progress. Note the percent reads 100
+    // before the manifest syncs (empty view), drops to a partial value once the
+    // file is known and downloading, then returns to 100 when complete — so we
+    // pause on the first value strictly between 0 and 100 (never on 100), and let
+    // the deadline catch a genuine "too fast to observe" case.
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    let paused_at;
+    loop {
+        let _ = viewer.apply(&share_id).await?;
+        let pct = percent_of(&viewer);
+        if (1..100).contains(&pct) {
+            viewer.set_paused(&share_id, true)?;
+            paused_at = pct;
+            break;
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("never observed a partial download state (manifest not syncing?)");
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // If pause didn't cancel the transfer, the viewer keeps receiving the rest of the
+    // file. Measure endpoint received bytes over a window; with the fix it stays tiny.
+    let recv0 = viewer.byte_totals().1;
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let delta = viewer.byte_totals().1.saturating_sub(recv0);
+    let threshold = 16 * 1024 * 1024; // 16 MiB — far below what the remaining file would be
+    assert!(
+        delta < threshold,
+        "after pausing at {paused_at}%, the viewer received {delta} more bytes in 5s \
+         — pause did not stop the in-flight download (expected < {threshold} B)"
+    );
+    // Paused mid-download, it must not read complete.
+    assert!(
+        percent_of(&viewer) < 100,
+        "share reads 100% despite being paused mid-download"
+    );
+    println!(
+        "pause OK: paused at {paused_at}%, only {delta} B received in 5s after pause \
+         (transfer stopped)"
+    );
+
+    master.shutdown().await?;
+    viewer.shutdown().await?;
+    Ok(())
+}
+
 /// Drive two engines' reconcile loops until *both* folders equal `want`, or time
 /// out. Models the daemon ticking each node.
 async fn converge_two(
