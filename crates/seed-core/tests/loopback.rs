@@ -383,6 +383,419 @@ async fn referenced_viewer_serves_peers() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Distributed sourcing: once one viewer holds a file, a second viewer that joins
+/// later must source it from that **peer**, not re-download it from the master —
+/// even though both viewers joined bootstrapped to the master (as peers do from a
+/// share key, which carries the master's id). Guards the property that the master
+/// is not the exclusive uploader in the staggered case; see
+/// `docs/distributed-downloads.md`.
+///
+/// NOTE: this exercises the *staggered* path (viewer1 fully synced before viewer2
+/// joins), which both the engine-driven downloader and stock iroh-docs' own
+/// `ContentReady` gossip already distribute. It does **not** cover the concurrent
+/// case (both viewers pulling a brand-new file at once), where the master is the
+/// only holder and necessarily serves both — see the doc's "what doesn't help yet"
+/// section. We assert by byte accounting: the master's sent bytes during viewer2's
+/// sync stay well under one file because viewer1 serves it.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn second_viewer_sources_from_peer_not_master() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let c_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+    let c_folder = tempfile::tempdir()?;
+
+    let mut master = Engine::new(a_data.path()).await?;
+    let mut viewer1 = Engine::new(b_data.path()).await?;
+    let mut viewer2 = Engine::new(c_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(25), async {
+        master.wait_online().await;
+        viewer1.wait_online().await;
+        viewer2.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    // A 4 MiB file: large enough that re-serving it is an unmistakable jump in the
+    // master's sent bytes, dwarfing doc/gossip/presence overhead.
+    let content = gen_bytes(4 * 1024 * 1024);
+    std::fs::write(a_folder.path().join("payload.bin"), &content)?;
+    let created = master.create_share(a_folder.path(), vec![]).await?;
+    let master_addr = master.endpoint_addr();
+
+    // viewer1 joins (bootstrapped to the master) and syncs the file: the master
+    // uploads it once, here.
+    let share_id = viewer1
+        .add_share(
+            &created.viewer_key,
+            b_folder.path(),
+            vec![master_addr.clone()],
+        )
+        .await?;
+    let want = snapshot(a_folder.path());
+    sync_until(&mut viewer1, &share_id, b_folder.path(), &want).await?;
+
+    // Baseline the master's sent bytes *after* viewer1 is fully served, so the
+    // window below captures only what the master uploads on viewer2's behalf.
+    let master_sent_before = master.byte_totals().0;
+
+    // viewer2 joins the same way — bootstrapped to the master, NOT to viewer1. It
+    // learns viewer1 as a peer through the share's presence/doc mesh (rooted at the
+    // master) and pulls the content from viewer1 rather than the master. The master
+    // and viewer1 keep reconciling so they stay live sync peers (and propagate
+    // viewer1's address to viewer2).
+    let share_id2 = viewer2
+        .add_share(&created.viewer_key, c_folder.path(), vec![master_addr])
+        .await?;
+    assert_eq!(share_id2, share_id);
+
+    let res = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let _ = master.reconcile(&share_id).await;
+            let _ = viewer1.apply(&share_id).await;
+            let _ = viewer2.apply(&share_id2).await?;
+            if snapshot(c_folder.path()) == want {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    res.map_err(|_| anyhow::anyhow!("viewer2 did not sync"))??;
+    assert_eq!(std::fs::read(c_folder.path().join("payload.bin"))?, content);
+
+    let master_delta = master.byte_totals().0.saturating_sub(master_sent_before);
+    let file = content.len() as u64;
+
+    // The master must NOT have re-served the whole file to viewer2: viewer1 did.
+    // (Old behavior: master serves viewer2 too → master_delta >= ~one file.)
+    assert!(
+        master_delta < file / 2,
+        "master sent {master_delta} B serving viewer2 (>= half the {file} B file): \
+         it re-uploaded the file instead of letting viewer1 serve it — the master is \
+         still the exclusive uploader"
+    );
+    println!(
+        "load distributed: master sent only {master_delta} B while viewer2 fetched a \
+         {file} B file (sourced from viewer1)"
+    );
+
+    master.shutdown().await?;
+    viewer1.shutdown().await?;
+    viewer2.shutdown().await?;
+    Ok(())
+}
+
+/// Real multi-source swarm for a SINGLE large blob (the ISO case): a file big
+/// enough to swarm, already held by two seeders, must be (a) reassembled correctly
+/// by a fresh viewer from concurrent chunk-range fetches, and (b) sourced from BOTH
+/// seeders rather than pulled whole from one. The master is taken offline so the
+/// only sources are the two seeder peers — isolating the swarm. Without chunking,
+/// one seeder serves the whole file and the other ~nothing; with it, each serves
+/// roughly half. See `docs/distributed-downloads.md`.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn large_blob_swarms_across_two_seeders() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let c_data = tempfile::tempdir()?;
+    let d_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+    let c_folder = tempfile::tempdir()?;
+    let d_folder = tempfile::tempdir()?;
+
+    let mut master = Engine::new(a_data.path()).await?;
+    let mut seeder1 = Engine::new(b_data.path()).await?;
+    let mut seeder2 = Engine::new(c_data.path()).await?;
+    let mut viewer = Engine::new(d_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        master.wait_online().await;
+        seeder1.wait_online().await;
+        seeder2.wait_online().await;
+        viewer.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    // 8 MiB — above the swarm threshold, so it splits across providers.
+    let content = gen_bytes(8 * 1024 * 1024);
+    std::fs::write(a_folder.path().join("disk.iso"), &content)?;
+    let created = master.create_share(a_folder.path(), vec![]).await?;
+    let master_addr = master.endpoint_addr();
+    let want = snapshot(a_folder.path());
+
+    // Both seeders fully sync the file from the master.
+    let share_id = seeder1
+        .add_share(
+            &created.viewer_key,
+            b_folder.path(),
+            vec![master_addr.clone()],
+        )
+        .await?;
+    seeder2
+        .add_share(&created.viewer_key, c_folder.path(), vec![master_addr])
+        .await?;
+    sync_until(&mut seeder1, &share_id, b_folder.path(), &want).await?;
+    sync_until(&mut seeder2, &share_id, c_folder.path(), &want).await?;
+
+    // Master goes offline: the two seeders are now the only sources.
+    master.shutdown().await?;
+    let seeder1_addr = seeder1.endpoint_addr();
+    let seeder2_addr = seeder2.endpoint_addr();
+
+    // Fresh viewer joins, bootstrapped to BOTH seeders so both are roster neighbors.
+    let share_id_v = viewer
+        .add_share(
+            &created.viewer_key,
+            d_folder.path(),
+            vec![seeder1_addr, seeder2_addr],
+        )
+        .await?;
+    assert_eq!(share_id_v, share_id);
+
+    // Let presence converge so both seeders show online in the viewer's roster
+    // *before* the first download tick — otherwise the engine might pick a
+    // single-source path. The doc syncs in the background during this wait; no
+    // content downloads until we start reconciling (iroh-docs auto-download is off).
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let s1_before = seeder1.byte_totals().0;
+    let s2_before = seeder2.byte_totals().0;
+
+    let res = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let _ = seeder1.apply(&share_id).await;
+            let _ = seeder2.apply(&share_id).await;
+            let _ = viewer.apply(&share_id_v).await?;
+            if snapshot(d_folder.path()) == want {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    })
+    .await;
+    res.map_err(|_| anyhow::anyhow!("viewer did not sync the swarmed blob"))??;
+
+    // (a) Correctness: concurrent ranged fetches reassembled the exact bytes.
+    assert_eq!(
+        std::fs::read(d_folder.path().join("disk.iso"))?,
+        content,
+        "swarmed blob did not reassemble to the original content"
+    );
+
+    // (b) Distribution: each seeder served a meaningful share (≈ half). Without
+    // chunking one seeder would serve ~everything and the other ~nothing.
+    let s1 = seeder1.byte_totals().0.saturating_sub(s1_before);
+    let s2 = seeder2.byte_totals().0.saturating_sub(s2_before);
+    let file = content.len() as u64;
+    assert!(
+        s1 >= file / 4 && s2 >= file / 4,
+        "blob was not swarmed: seeder1 sent {s1} B, seeder2 sent {s2} B for a {file} B \
+         file (expected each ≥ {} B — both seeders sharing the load)",
+        file / 4
+    );
+    println!(
+        "swarm OK: seeder1 served {s1} B, seeder2 served {s2} B of a {file} B blob \
+         (each ~half)"
+    );
+
+    seeder1.shutdown().await?;
+    seeder2.shutdown().await?;
+    viewer.shutdown().await?;
+    Ok(())
+}
+
+/// Health must reflect *actual local completeness*, for masters too. A source
+/// master that holds all content reads 100%, but a co-master that has synced the
+/// manifest yet is still fetching the content must NOT read a misleading 100% — it
+/// reads the real (sub-100) percentage. Regression guard for the reported "every
+/// member shows Health 100% while actively downloading" bug.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn health_reflects_incomplete_master() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let mut a = Engine::new(a_data.path()).await?;
+    let mut b = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        a.wait_online().await;
+        b.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    // 8 MiB, so a single reconcile can't complete B's download synchronously.
+    let content = gen_bytes(8 * 1024 * 1024);
+    std::fs::write(a_folder.path().join("big.bin"), &content)?;
+    let created = a.create_share(a_folder.path(), vec![]).await?;
+
+    // Source master holds all content → 100% (computed from completeness, not a
+    // hardcoded master=100).
+    let a_pct = a
+        .list_summaries()
+        .into_iter()
+        .find(|s| s.share_id == created.share_id)
+        .map(|s| s.percent)
+        .expect("share summary");
+    assert_eq!(
+        a_pct, 100,
+        "source master with all content should read 100%"
+    );
+
+    // Co-master B joins with the MASTER key, bootstrapped to A.
+    let share_id = b
+        .add_share(
+            &created.master_key,
+            b_folder.path(),
+            vec![a.endpoint_addr()],
+        )
+        .await?;
+    assert_eq!(share_id, created.share_id);
+
+    // Let the manifest (doc) sync in the background; no content is fetched until we
+    // reconcile (iroh-docs auto-download is off).
+    tokio::time::sleep(Duration::from_secs(7)).await;
+
+    // One reconcile: B sees big.bin is missing and kicks off the (async) download,
+    // but the content cannot arrive within this synchronous pass — so B is a master
+    // that knows the manifest but does not yet hold the content.
+    b.reconcile(&share_id).await?;
+
+    let b_pct = b
+        .list_summaries()
+        .into_iter()
+        .find(|s| s.share_id == share_id)
+        .map(|s| s.percent)
+        .expect("share summary");
+    assert!(
+        b_pct < 100,
+        "co-master still fetching content must not read 100% (read {b_pct}%) — health \
+         is not reflecting completeness"
+    );
+    println!("health OK: source master 100%, fetching co-master {b_pct}%");
+
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}
+
+/// Cold-start relief: three viewers pull a brand-new large file at the same time,
+/// with only the master holding it initially. The master should NOT have to upload
+/// a full copy to each (~3×); randomized per-part master grace desynchronizes the
+/// viewers so they pull different parts off the master first, become partial
+/// seeders, and trade the rest among themselves. We assert the master's total
+/// upload stays well under 3× the file. See `docs/distributed-downloads.md`.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn cold_start_relief_spreads_master_load() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let c_data = tempfile::tempdir()?;
+    let d_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+    let c_folder = tempfile::tempdir()?;
+    let d_folder = tempfile::tempdir()?;
+
+    let mut master = Engine::new(a_data.path()).await?;
+    let mut v1 = Engine::new(b_data.path()).await?;
+    let mut v2 = Engine::new(c_data.path()).await?;
+    let mut v3 = Engine::new(d_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        master.wait_online().await;
+        v1.wait_online().await;
+        v2.wait_online().await;
+        v3.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    let content = gen_bytes(8 * 1024 * 1024);
+    std::fs::write(a_folder.path().join("disk.iso"), &content)?;
+    let created = master.create_share(a_folder.path(), vec![]).await?;
+    let m = master.endpoint_addr();
+    let want = snapshot(a_folder.path());
+
+    // Each viewer is bootstrapped to the master AND the other viewers, so they can
+    // discover and pull from one another (not just the master).
+    let v1a = v1.endpoint_addr();
+    let v2a = v2.endpoint_addr();
+    let v3a = v3.endpoint_addr();
+    let share_id = v1
+        .add_share(
+            &created.viewer_key,
+            b_folder.path(),
+            vec![m.clone(), v2a.clone(), v3a.clone()],
+        )
+        .await?;
+    v2.add_share(
+        &created.viewer_key,
+        c_folder.path(),
+        vec![m.clone(), v1a.clone(), v3a],
+    )
+    .await?;
+    v3.add_share(&created.viewer_key, d_folder.path(), vec![m, v1a, v2a])
+        .await?;
+
+    // Let presence converge so each viewer sees the others online before downloads
+    // start (the doc syncs in the background; no content fetches until we reconcile).
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let master_before = master.byte_totals().0;
+
+    let res = tokio::time::timeout(Duration::from_secs(90), async {
+        loop {
+            let _ = master.reconcile(&share_id).await;
+            let _ = v1.apply(&share_id).await;
+            let _ = v2.apply(&share_id).await;
+            let _ = v3.apply(&share_id).await;
+            if snapshot(b_folder.path()) == want
+                && snapshot(c_folder.path()) == want
+                && snapshot(d_folder.path()) == want
+            {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+    })
+    .await;
+    res.map_err(|_| anyhow::anyhow!("viewers did not all sync"))??;
+
+    // All three reassembled correctly.
+    for f in [b_folder.path(), c_folder.path(), d_folder.path()] {
+        assert_eq!(
+            std::fs::read(f.join("disk.iso"))?,
+            content,
+            "bad reassembly"
+        );
+    }
+
+    let master_delta = master.byte_totals().0.saturating_sub(master_before);
+    let file = content.len() as u64;
+    let ratio = master_delta as f64 / file as f64;
+    println!(
+        "cold-start: master uploaded {master_delta} B = {ratio:.2}x the {file} B file \
+         for 3 concurrent cold viewers (no relief would be ~3x)"
+    );
+    assert!(
+        ratio < 2.5,
+        "master uploaded {ratio:.2}x the file to 3 viewers — cold-start relief is not \
+         spreading load (expected < 2.5x; ~3x means each pulled a full copy from the master)"
+    );
+
+    master.shutdown().await?;
+    v1.shutdown().await?;
+    v2.shutdown().await?;
+    v3.shutdown().await?;
+    Ok(())
+}
+
 /// Drive two engines' reconcile loops until *both* folders equal `want`, or time
 /// out. Models the daemon ticking each node.
 async fn converge_two(

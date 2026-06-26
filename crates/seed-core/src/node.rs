@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use iroh::{protocol::Router, Endpoint, SecretKey};
-use iroh_blobs::{store::fs::FsStore, BlobsProtocol};
+use iroh_blobs::{api::downloader::Downloader, store::fs::FsStore, BlobsProtocol};
 use iroh_docs::{api::DocsApi, protocol::Docs};
 use iroh_gossip::net::Gossip;
 
@@ -17,6 +17,12 @@ use iroh_gossip::net::Gossip;
 pub struct IrohNode {
     pub endpoint: Endpoint,
     pub blobs: FsStore,
+    /// Long-lived content downloader (one actor for the node). Cloned into each
+    /// reconcile job so the engine drives blob fetches itself with a
+    /// load-balanced provider set, rather than leaving it to iroh-docs' built-in
+    /// auto-downloader (which funnels every file through the doc-sync source —
+    /// the master). Cheap to clone (an mpsc handle).
+    pub downloader: Downloader,
     /// The blob store's root dir (`<data_dir>/blobs`). Used to reclaim a blob's
     /// owned `data/<hash>.data` file after a cross-volume reference export leaves
     /// it orphaned (see `engine::reclaim_owned_data`).
@@ -56,6 +62,7 @@ impl IrohNode {
         std::fs::create_dir_all(&docs_dir).context("create docs dir")?;
 
         let blobs = FsStore::load(&blobs_dir).await.context("open blob store")?;
+        let downloader = blobs.downloader(&endpoint);
         let gossip = Gossip::builder().spawn(endpoint.clone());
         // `Docs::persistent` treats its argument as a directory and creates
         // `docs.redb` inside it.
@@ -73,6 +80,7 @@ impl IrohNode {
         Ok(Self {
             endpoint,
             blobs,
+            downloader,
             blobs_dir,
             gossip,
             docs,

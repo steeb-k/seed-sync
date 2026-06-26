@@ -17,20 +17,25 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context};
 use bao_tree::io::BaoContentItem;
+use bao_tree::{ChunkNum, ChunkRanges};
 use futures_lite::StreamExt;
 use iroh::endpoint::Connection;
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use iroh_blobs::api::blobs::{AddPathOptions, ExportMode, ExportOptions, ImportMode};
+use iroh_blobs::api::downloader::{DownloadRequest, Downloader, SplitStrategy};
 use iroh_blobs::get::request::{get_blob, GetBlobItem};
+use iroh_blobs::protocol::GetRequest;
 use iroh_blobs::{store::fs::FsStore, BlobFormat, Hash};
 use iroh_docs::{
     api::Doc, engine::LiveEvent, store::Query, sync::Capability, AuthorId, NamespaceId,
     NamespaceSecret,
 };
+use rand::seq::SliceRandom;
+use rand::Rng;
 
 /// How long since a peer was last heard from before we consider it offline.
 /// How long since the last sign of life (presence heartbeat, doc sync activity,
@@ -100,6 +105,18 @@ impl PeerRoster {
         self.peers.keys().cloned().collect()
     }
 
+    /// Peer-id strings currently considered online (heard-from within the TTL).
+    /// Used to pick live content providers for a download — read at download time
+    /// so it reflects who is actually around now, not a stale job snapshot.
+    fn online_peer_ids(&self) -> Vec<String> {
+        let now = now_secs();
+        self.peers
+            .iter()
+            .filter(|(_, e)| self.is_online(e, now))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
     fn counts(&self) -> (u32, u32) {
         let now = now_secs();
         let online = self
@@ -141,6 +158,31 @@ const IGNORE_KEY: &[u8] = b"\x00ignore";
 /// iroh-docs filters 0-byte entries out of queries as deletion markers, so a real
 /// empty file can't ride a normal entry — it gets its own (non-empty) control key.
 const EMPTY_PREFIX: &[u8] = b"\x00e/";
+
+/// Blobs at or above this size are fetched as a **swarm** — the chunk range is
+/// split across several providers and the parts streamed concurrently — provided
+/// there are at least two online peers to split across. Below it (or with one
+/// source), a blob is fetched whole from a single provider: chunk-splitting
+/// overhead isn't worth it for small files.
+const SWARM_MIN_SIZE: u64 = 4 * 1024 * 1024; // 4 MiB
+/// Upper bound on how many concurrent parts one blob is split into, to cap
+/// connection/range fan-out regardless of how many peers are online. So no single
+/// member serves more than ~1/N of a file when at least this many peers are around.
+const SWARM_MAX_PARTS: usize = 16;
+/// Cold-start relief: a part waits a *random* number of swarm rounds (`0..N`)
+/// before it may fall back to the master, fetching from peers only until then. The
+/// randomization desynchronizes downloaders so they pull different parts off the
+/// master first, become partial seeders, and trade the rest among themselves
+/// instead of every node hammering the master. (If there are no peers at all, the
+/// master is used immediately — no point waiting.)
+const SWARM_MASTER_GRACE_ROUNDS: u32 = 6;
+/// Pause between swarm rounds, giving peers time to seed each other before retry.
+const SWARM_ROUND_BACKOFF_MS: u64 = 400;
+/// Overall wall-clock bound on one swarm attempt. On timeout we return an error so
+/// the reconcile loop re-queues; already-fetched ranges persist, so the next
+/// attempt resumes rather than restarting. Bounds the worst case (a peer that
+/// can't actually be reached) without losing progress.
+const SWARM_DEADLINE_SECS: u64 = 300;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -401,6 +443,130 @@ fn mtime_micros(p: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Online non-master peers (shuffled) and the master id, with `self` removed, read
+/// from the *live* roster — so a download picks who is actually around now, not a
+/// stale snapshot. The master is returned separately so callers can deprioritize
+/// it; its id comes from the share key, so it's a fallback even if presence hasn't
+/// (re)converged on it.
+fn live_providers_from(
+    roster: &Arc<StdMutex<PeerRoster>>,
+    self_id: EndpointId,
+    master_id: Option<EndpointId>,
+) -> (Vec<EndpointId>, Option<EndpointId>) {
+    let mut peers: Vec<EndpointId> = Vec::new();
+    if let Ok(r) = roster.lock() {
+        for s in r.online_peer_ids() {
+            if let Ok(id) = s.parse::<EndpointId>() {
+                if id != self_id && Some(id) != master_id && !peers.contains(&id) {
+                    peers.push(id);
+                }
+            }
+        }
+    }
+    peers.shuffle(&mut rand::thread_rng());
+    let master = master_id.filter(|m| *m != self_id);
+    (peers, master)
+}
+
+/// Fetch one blob as a **swarm**: split its chunk range into one contiguous part
+/// per peer (capped at [`SWARM_MAX_PARTS`]) and pull the parts concurrently, each
+/// part preferring a distinct peer. The store reassembles the bao-verified ranges;
+/// when every part has landed the entry is whole and [`Blobs::has`] reports it.
+///
+/// Runs in **rounds** so it adapts as peers gain content (dynamic discovery):
+/// every round re-reads the live roster, re-issues the still-missing parts (already
+/// complete parts no-op cheaply), and pauses briefly so peers can seed each other.
+///
+/// **Cold-start relief:** each part waits a random `0..SWARM_MASTER_GRACE_ROUNDS`
+/// rounds before it's allowed to fall back to the master — until then it pulls from
+/// peers only. Because the grace is randomized per part *and* per downloader,
+/// different nodes pull different parts off the master first, become partial
+/// seeders, and trade the rest among themselves, instead of every node downloading
+/// the whole file from the master. With no peers at all, the master is used at once.
+async fn swarm_download(
+    downloader: &Downloader,
+    blobs: &FsStore,
+    hash: Hash,
+    size: u64,
+    roster: &Arc<StdMutex<PeerRoster>>,
+    self_id: EndpointId,
+    master_id: Option<EndpointId>,
+) -> anyhow::Result<()> {
+    let total = ChunkNum::chunks(size).0; // number of bao chunks covering the blob
+    let (peers0, _) = live_providers_from(roster, self_id, master_id);
+    let parts = peers0
+        .len()
+        .min(SWARM_MAX_PARTS)
+        .min(total.max(1) as usize)
+        .max(1);
+    let per = total.div_ceil(parts as u64);
+    let ranges: Vec<(u64, u64)> = (0..parts)
+        .map(|i| (i as u64 * per, ((i as u64 + 1) * per).min(total)))
+        .filter(|(lo, hi)| lo < hi)
+        .collect();
+    // Per-part master grace (rounds), randomized so downloaders desynchronize.
+    let grace: Vec<u32> = {
+        let mut rng = rand::thread_rng();
+        ranges
+            .iter()
+            .map(|_| rng.gen_range(0..SWARM_MASTER_GRACE_ROUNDS))
+            .collect()
+    };
+
+    let work = async {
+        let mut round: u32 = 0;
+        loop {
+            if blobs.blobs().has(hash).await.unwrap_or(false) {
+                return Ok(());
+            }
+            let (peers, master) = live_providers_from(roster, self_id, master_id);
+            let mut set = tokio::task::JoinSet::new();
+            for (idx, &(lo, hi)) in ranges.iter().enumerate() {
+                // Peers first (this part's assigned peer at the front), master only
+                // once this part's grace has elapsed (or if there are no peers).
+                let mut plist: Vec<EndpointId> = Vec::new();
+                if !peers.is_empty() {
+                    let primary = peers[idx % peers.len()];
+                    plist.push(primary);
+                    plist.extend(peers.iter().copied().filter(|p| *p != primary));
+                }
+                if peers.is_empty() || round >= grace[idx] {
+                    if let Some(m) = master {
+                        if !plist.contains(&m) {
+                            plist.push(m);
+                        }
+                    }
+                }
+                if plist.is_empty() {
+                    continue;
+                }
+                let req =
+                    GetRequest::blob_ranges(hash, ChunkRanges::from(ChunkNum(lo)..ChunkNum(hi)));
+                let dl = downloader.clone();
+                set.spawn(async move {
+                    dl.download_with_opts(DownloadRequest::new(req, plist, SplitStrategy::None))
+                        .await
+                });
+            }
+            // Drain the round; per-part errors (a peer that didn't have its range
+            // yet) are expected and ignored — the next round retries with fresh
+            // providers, and completed ranges persist.
+            while set.join_next().await.is_some() {}
+
+            if blobs.blobs().has(hash).await.unwrap_or(false) {
+                return Ok(());
+            }
+            round = round.saturating_add(1);
+            tokio::time::sleep(Duration::from_millis(SWARM_ROUND_BACKOFF_MS)).await;
+        }
+    };
+
+    match tokio::time::timeout(Duration::from_secs(SWARM_DEADLINE_SECS), work).await {
+        Ok(r) => r,
+        Err(_) => Err(anyhow!("swarm download of {hash} timed out")),
+    }
+}
+
 /// Convert a 32-byte hash slice into an iroh [`Hash`].
 fn to_hash(bytes: &[u8]) -> anyhow::Result<Hash> {
     let arr: [u8; 32] = bytes.try_into().context("bad hash len")?;
@@ -447,6 +613,22 @@ pub struct ReconcileJob {
     author: AuthorId,
     endpoint: Endpoint,
     providers: Vec<EndpointId>,
+    /// The share master's endpoint id (from the key), if known. Deprioritized to
+    /// last in the download candidate order so peers are tried first and the
+    /// master isn't the exclusive content source.
+    master_id: Option<EndpointId>,
+    /// This node's own endpoint id, filtered out of the candidate set (no point
+    /// dialing ourselves).
+    self_id: EndpointId,
+    /// Content downloader (cloned node handle) and the shared in-flight set, used
+    /// by [`ReconcileJob::ensure_download`] to fetch missing blobs from a
+    /// load-balanced provider set.
+    downloader: Downloader,
+    downloads_inflight: Arc<StdMutex<HashSet<Hash>>>,
+    /// Live peer roster, read at download time to pick current online providers
+    /// (dynamic discovery), rather than relying on the job-creation snapshot in
+    /// `providers`.
+    roster: Arc<StdMutex<PeerRoster>>,
     base: HashMap<String, Vec<u8>>,
     last_quick_sig: u64,
     progress: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
@@ -516,6 +698,70 @@ impl ReconcileJob {
         let _ = self.doc.del(self.author, ek).await;
     }
 
+    /// Live content providers for this job — see [`live_providers_from`].
+    fn live_providers(&self) -> (Vec<EndpointId>, Option<EndpointId>) {
+        live_providers_from(&self.roster, self.self_id, self.master_id)
+    }
+
+    /// Ensure a download of `hash` (of `size` bytes) is in flight. Idempotent: a
+    /// hash already downloading is skipped, so repeated reconcile ticks don't pile
+    /// up duplicate fetches. Runs detached; the next reconcile re-checks `has()` and
+    /// re-queues if it's still missing (free retry — already-fetched ranges resume).
+    ///
+    /// Large blobs with ≥2 online peers are fetched as a **swarm**: the chunk range
+    /// is split into one contiguous part per peer and the parts streamed
+    /// concurrently, each part preferring a distinct peer (master last). This is the
+    /// real multi-source download — a single big file (e.g. an ISO, one blob) is
+    /// pulled from several members at once instead of saturating one. The store
+    /// reassembles the verified ranges into the complete blob. Small blobs (or when
+    /// only one source is available) take the simple whole-blob path.
+    fn ensure_download(&self, hash: Hash, size: u64) {
+        {
+            let mut inflight = match self.downloads_inflight.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            if !inflight.insert(hash) {
+                return; // already downloading this blob
+            }
+        }
+        let (peers, master) = self.live_providers();
+        if peers.is_empty() && master.is_none() {
+            // Nobody to pull from yet (no peers, we are the only/master node).
+            if let Ok(mut g) = self.downloads_inflight.lock() {
+                g.remove(&hash);
+            }
+            return;
+        }
+        // Full fallback set for the simple path: master last so peers are preferred.
+        let fallback: Vec<EndpointId> = peers.iter().copied().chain(master).collect();
+        let swarm = size >= SWARM_MIN_SIZE && peers.len() >= 2;
+
+        let downloader = self.downloader.clone();
+        let blobs = self.blobs.clone();
+        let roster = self.roster.clone();
+        let self_id = self.self_id;
+        let master_id = self.master_id;
+        let inflight = self.downloads_inflight.clone();
+        let share = self.share_id.clone();
+        tokio::spawn(async move {
+            let res = if swarm {
+                swarm_download(&downloader, &blobs, hash, size, &roster, self_id, master_id).await
+            } else {
+                downloader
+                    .download_with_opts(DownloadRequest::new(hash, fallback, SplitStrategy::None))
+                    .await
+                    .map_err(|e| anyhow!("{e}"))
+            };
+            if let Err(e) = res {
+                tracing::debug!("download {hash} for share {share} failed (will retry): {e}");
+            }
+            if let Ok(mut g) = inflight.lock() {
+                g.remove(&hash);
+            }
+        });
+    }
+
     /// Materialize a remote file to disk if its content has arrived. Returns
     /// `Ok(true)` once the file on disk matches `hash_bytes` (or is created empty),
     /// `Ok(false)` if the content is still downloading. Pushes a hash onto
@@ -545,6 +791,11 @@ impl ReconcileJob {
         }
         let hash = to_hash(hash_bytes)?;
         if !self.blobs.blobs().has(hash).await? {
+            // We drive the fetch ourselves (iroh-docs' auto-downloader is disabled
+            // per share): large blobs swarm across peers, small ones pull whole, and
+            // the master is deprioritized so it isn't the exclusive source.
+            // Idempotent across ticks; re-checked next reconcile.
+            self.ensure_download(hash, size);
             return Ok(false); // content still downloading
         }
         if let Some(parent) = target.parent() {
@@ -778,8 +1029,10 @@ impl ReconcileJob {
         // Tidy now-empty directories a viewer/master delete may have left behind.
         prune_empty_dirs(&self.folder);
 
-        // Health: present / total bytes of the merged desired view. A master is the
-        // source, so always 100.
+        // Health = the fraction of the merged desired view we actually hold locally,
+        // for *every* role. A source master that already has all its content computes
+        // 100 naturally; a master or viewer still fetching missing blobs reports the
+        // real percentage instead of a misleading 100. An empty view is 100.
         let mut total_bytes: u64 = 0;
         let mut present_bytes: u64 = 0;
         for re in remote.values() {
@@ -788,12 +1041,10 @@ impl ReconcileJob {
                 present_bytes += re.size;
             }
         }
-        let health = if self.is_master {
+        let health = if total_bytes == 0 {
             100
         } else {
-            (present_bytes.min(total_bytes) * 100)
-                .checked_div(total_bytes)
-                .unwrap_or(100) as u8
+            (present_bytes.min(total_bytes) * 100 / total_bytes) as u8
         };
 
         // Recompute the signature *after* our disk writes so the next tick sees a
@@ -851,6 +1102,13 @@ pub struct Engine {
     /// being published off-lock, keyed by share id. Shared with each in-flight
     /// [`PublishJob`] so [`Engine::list_summaries`] can report a moving percent.
     progress: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
+    /// Content hashes with an engine-driven download currently in flight. Shared
+    /// with each [`ReconcileJob`] so a hash isn't re-queued every reconcile tick
+    /// while its blob streams in. Global (content is addressed by hash, so the
+    /// same blob referenced from two shares is fetched once). Entries are removed
+    /// when the download task settles; a still-missing blob is simply re-queued on
+    /// the next tick (free retry).
+    downloads_inflight: Arc<StdMutex<HashSet<Hash>>>,
     /// Hashes whose orphaned owned blob copy (left by a cross-volume reference
     /// export) still needs deleting. Retried each reconcile until iroh releases
     /// the file handle — see [`try_reclaim_owned_data`].
@@ -897,6 +1155,7 @@ impl Engine {
             shares: HashMap::new(),
             db,
             progress: Arc::new(StdMutex::new(HashMap::new())),
+            downloads_inflight: Arc::new(StdMutex::new(HashSet::new())),
             reclaim_pending: std::collections::HashSet::new(),
             device_name: StdMutex::new(device_name),
             paused_all: StdMutex::new(paused_all),
@@ -1062,6 +1321,18 @@ impl Engine {
             .import_namespace(capability)
             .await
             .context("import namespace")?;
+
+        // Disable iroh-docs' built-in content auto-downloader for this replica. Its
+        // provider discovery favors whichever peer it synced the manifest entry
+        // from — in practice the master — so every file would funnel through the
+        // master. We instead drive blob fetches from the engine
+        // ([`ReconcileJob::ensure_download`]) with a peers-first provider set. This
+        // gates only *content* fetching; doc/metadata sync is untouched. The policy
+        // is local (per-replica, not synced), so every node sets it on open.
+        doc.set_download_policy(iroh_docs::store::DownloadPolicy::NothingExcept(vec![]))
+            .await
+            .context("disable docs content auto-download")?;
+
         std::fs::create_dir_all(folder)?;
 
         // If no explicit bootstrap was given, any node added from a share key can
@@ -1131,12 +1402,10 @@ impl Engine {
             publishing: false,
             roster,
             last_updated: 0,
-            // Master is always 100 (source); a viewer's is recomputed by apply().
-            health: if matches!(key.role, Role::Master) {
-                100
-            } else {
-                0
-            },
+            // Provisional until the first reconcile computes real completeness. Start
+            // at 0 (incomplete) for every role so a freshly-added master that still
+            // has content to fetch never briefly reads a misleading 100.
+            health: 0,
             presence,
         })
     }
@@ -1237,11 +1506,7 @@ impl Engine {
             online: true,
             last_seen: now_secs(),
             have_seqno: state.last_seqno,
-            percent: if matches!(state.key.role, Role::Master) {
-                100
-            } else {
-                state.health
-            },
+            percent: state.health,
         }];
         out.extend(state.roster.lock().map(|r| r.infos()).unwrap_or_default());
         Ok(out)
@@ -1258,10 +1523,11 @@ impl Engine {
             let Some(h) = s.presence.as_ref() else {
                 continue;
             };
-            let (role, percent) = match s.key.role {
-                Role::Master => (seed_ipc::Role::Master, 100),
-                Role::Viewer => (seed_ipc::Role::Viewer, s.health),
+            let role = match s.key.role {
+                Role::Master => seed_ipc::Role::Master,
+                Role::Viewer => seed_ipc::Role::Viewer,
             };
+            let percent = s.health;
             let p = crate::presence::Presence {
                 v: crate::presence::PRESENCE_V,
                 name: name.clone(),
@@ -1307,7 +1573,10 @@ impl Engine {
             if peers.is_empty() {
                 continue;
             }
-            out.push(crate::presence::PresenceRejoin::new(h.sender.clone(), peers));
+            out.push(crate::presence::PresenceRejoin::new(
+                h.sender.clone(),
+                peers,
+            ));
         }
         out
     }
@@ -1411,6 +1680,9 @@ impl Engine {
         }
         let blobs = self.node.blobs.clone();
         let endpoint = self.node.endpoint.clone();
+        let downloader = self.node.downloader.clone();
+        let self_id = self.node.endpoint.id();
+        let downloads_inflight = self.downloads_inflight.clone();
         let author = self.author;
         let progress = self.progress.clone();
         let base = self.db.get_index(share_id).unwrap_or_default();
@@ -1422,6 +1694,10 @@ impl Engine {
         }
         let is_master = matches!(state.key.role, Role::Master);
         let providers = peer_providers(&state.key, &state.roster);
+        let master_id = state
+            .key
+            .endpoint_id()
+            .and_then(|eid| EndpointId::from_bytes(&eid).ok());
         state.publishing = true;
         Ok(Some(ReconcileJob {
             share_id: share_id.to_string(),
@@ -1433,6 +1709,11 @@ impl Engine {
             author,
             endpoint,
             providers,
+            master_id,
+            self_id,
+            downloader,
+            downloads_inflight,
+            roster: state.roster.clone(),
             base,
             last_quick_sig: state.last_quick_sig,
             progress,
