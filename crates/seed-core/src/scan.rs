@@ -192,8 +192,13 @@ pub fn quick_signature(root: &Path, ignore: &IgnoreSet) -> u64 {
 /// Walk `root`, skipping ignored paths, and produce the live (non-deleted)
 /// file set. Symlinks are not followed. Hidden control dirs (e.g. our own
 /// `.seed`) should be passed in `ignore`.
-pub fn scan(root: &Path, ignore: &IgnoreSet) -> std::io::Result<Vec<ScannedFile>> {
+/// Returns `(files, skipped)` where `skipped` is the relative paths present on disk
+/// but unreadable this pass (locked by another process, permission denied). Skipped
+/// files are NOT an error — the caller retries them later — so one bad file never
+/// aborts the whole scan (which would block the entire share from publishing).
+pub fn scan(root: &Path, ignore: &IgnoreSet) -> std::io::Result<(Vec<ScannedFile>, Vec<String>)> {
     let mut out = Vec::new();
+    let mut skipped = Vec::new();
     for dent in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -208,7 +213,21 @@ pub fn scan(root: &Path, ignore: &IgnoreSet) -> std::io::Result<Vec<ScannedFile>
         if ignore.is_ignored(&rel) {
             continue;
         }
-        let (hash, size) = hash_file(dent.path())?;
+        // A file we can't read (locked by another process, permission denied, a
+        // transient/odd entry) must NOT abort the whole scan — that would block the
+        // entire share from publishing over one bad file. Skip it (it stays as-is on
+        // disk and in the manifest) and retry on a later pass.
+        let (hash, size) = match hash_file(dent.path()) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "scan: skipping {} (cannot read; will retry): {e}",
+                    dent.path().display()
+                );
+                skipped.push(rel);
+                continue;
+            }
+        };
         out.push(ScannedFile {
             entry: FileEntry {
                 path: rel,
@@ -220,7 +239,7 @@ pub fn scan(root: &Path, ignore: &IgnoreSet) -> std::io::Result<Vec<ScannedFile>
         });
     }
     out.sort_by(|a, b| a.entry.path.cmp(&b.entry.path));
-    Ok(out)
+    Ok((out, skipped))
 }
 
 #[cfg(test)]
@@ -250,7 +269,8 @@ mod tests {
         fs::write(root.join("skip.tmp"), b"junk").unwrap();
 
         let (ig, _) = IgnoreSet::compile(&["*.tmp".into()]);
-        let files = scan(root, &ig).unwrap();
+        let (files, skipped) = scan(root, &ig).unwrap();
+        assert!(skipped.is_empty());
 
         let paths: Vec<&str> = files.iter().map(|f| f.entry.path.as_str()).collect();
         assert_eq!(paths, vec!["b.txt", "sub/a.bin"]); // sorted, forward slashes, .tmp skipped
@@ -264,7 +284,60 @@ mod tests {
     fn empty_dir_scans_clean() {
         let dir = tempfile::tempdir().unwrap();
         let (ig, _) = IgnoreSet::compile(&[]);
-        let files = scan(dir.path(), &ig).unwrap();
+        let (files, skipped) = scan(dir.path(), &ig).unwrap();
         assert!(files.is_empty());
+        assert!(skipped.is_empty());
+    }
+
+    /// A file that can't be read (locked by another process, permission denied)
+    /// must be SKIPPED, not abort the whole scan — otherwise a single bad file
+    /// blocks the entire share from publishing. Regression for the reported
+    /// "one locked file breaks sync completely" bug.
+    #[test]
+    fn scan_skips_unreadable_file_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("good.txt"), b"hello").unwrap();
+        let bad = root.join("locked.bin");
+        fs::write(&bad, b"some bytes").unwrap();
+
+        // Hold `locked.bin` unreadable for the duration of the scan.
+        #[cfg(windows)]
+        let _guard = {
+            use std::os::windows::fs::OpenOptionsExt;
+            // share_mode(0) = deny all sharing, so hash_file's File::open hits a
+            // sharing violation (os error 32) — exactly a file held by another process.
+            std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(0)
+                .open(&bad)
+                .unwrap()
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+
+        let (ig, _) = IgnoreSet::compile(&[]);
+        let (files, skipped) = scan(root, &ig).expect("scan must not abort on one unreadable file");
+        let paths: Vec<&str> = files.iter().map(|f| f.entry.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["good.txt"],
+            "the unreadable file is skipped but the rest still scan"
+        );
+        assert_eq!(
+            skipped,
+            vec!["locked.bin"],
+            "the unreadable file is reported as skipped"
+        );
+
+        // Restore perms so the unix tempdir can be cleaned up.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&bad, fs::Permissions::from_mode(0o644));
+        }
     }
 }

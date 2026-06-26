@@ -796,6 +796,124 @@ async fn cold_start_relief_spreads_master_load() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// SMOKETEST for the "one locked file must not break the whole share" guarantee.
+///
+/// A master share contains readable files AND files locked by another process. The
+/// locked files must NOT abort the master's reconcile: the readable files publish
+/// and sync to a viewer regardless. Then, once the locks are released, the
+/// previously-locked files must sync on their own — even though releasing a lock
+/// doesn't change the folder's (size,mtime) signature — proving the tracked,
+/// cheap per-file retry works. This is the regression guard for the reported bug
+/// where a single locked file (e.g. an AOMEI `.lock`) silently blocked all syncing.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn locked_files_do_not_block_share_and_sync_after_unlock() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let mut master = Engine::new(a_data.path()).await?;
+    let mut viewer = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        master.wait_online().await;
+        viewer.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    // Readable content (incl. a substantial file) plus two files we'll lock.
+    let payload = gen_bytes(1024 * 1024);
+    std::fs::write(a_folder.path().join("normal.txt"), b"hello")?;
+    std::fs::write(a_folder.path().join("payload.bin"), &payload)?;
+    let locked1 = a_folder.path().join("locked1.bin");
+    let locked2 = a_folder.path().join("locked2.bin");
+    std::fs::write(&locked1, b"first locked payload")?;
+    std::fs::write(&locked2, b"second locked payload")?;
+
+    // Lock both files for the duration of phase 1 (another process holds them).
+    #[cfg(windows)]
+    let guards = {
+        use std::os::windows::fs::OpenOptionsExt;
+        let g1 = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked1)?;
+        let g2 = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&locked2)?;
+        (g1, g2)
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked1, std::fs::Permissions::from_mode(0o000))?;
+        std::fs::set_permissions(&locked2, std::fs::Permissions::from_mode(0o000))?;
+    }
+
+    let created = master.create_share(a_folder.path(), vec![]).await?;
+    let share_id = viewer
+        .add_share(
+            &created.viewer_key,
+            b_folder.path(),
+            vec![master.endpoint_addr()],
+        )
+        .await?;
+
+    // Phase 1: the readable files must sync to the viewer despite the locked ones.
+    let mut want_partial = BTreeMap::new();
+    want_partial.insert("normal.txt".to_string(), b"hello".to_vec());
+    want_partial.insert("payload.bin".to_string(), payload.clone());
+    sync_until(&mut viewer, &share_id, b_folder.path(), &want_partial).await?;
+    assert!(
+        !b_folder.path().join("locked1.bin").exists()
+            && !b_folder.path().join("locked2.bin").exists(),
+        "locked files must not have published while locked"
+    );
+    println!("phase 1 OK: readable files synced; locked files correctly skipped");
+
+    // Phase 2: release the locks. The previously-locked files must now sync — note
+    // releasing a lock does NOT change the folder's (size,mtime) signature, so this
+    // exercises the tracked per-file retry, not a fresh full scan.
+    #[cfg(windows)]
+    drop(guards);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&locked1, std::fs::Permissions::from_mode(0o644))?;
+        std::fs::set_permissions(&locked2, std::fs::Permissions::from_mode(0o644))?;
+    }
+
+    let want_full = snapshot(a_folder.path());
+    let res = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            // Master retries the skipped files (and publishes them); viewer pulls.
+            let _ = master.reconcile(&share_id).await;
+            let _ = viewer.apply(&share_id).await?;
+            if snapshot(b_folder.path()) == want_full {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await;
+    res.map_err(|_| anyhow::anyhow!("previously-locked files did not sync after unlock"))??;
+    assert_eq!(
+        std::fs::read(b_folder.path().join("locked1.bin"))?,
+        b"first locked payload"
+    );
+    assert_eq!(
+        std::fs::read(b_folder.path().join("locked2.bin"))?,
+        b"second locked payload"
+    );
+    println!("phase 2 OK: previously-locked files synced after release (tracked retry)");
+
+    master.shutdown().await?;
+    viewer.shutdown().await?;
+    Ok(())
+}
+
 /// Drive two engines' reconcile loops until *both* folders equal `want`, or time
 /// out. Models the daemon ticking each node.
 async fn converge_two(

@@ -583,6 +583,10 @@ pub struct ReconcileOutcome {
     index_sets: Vec<(String, Vec<u8>)>,
     index_dels: Vec<String>,
     reclaim: Vec<Hash>,
+    /// Relative paths present on disk that couldn't be read this pass (locked by
+    /// another process, permission denied). Carried back into [`ShareState`] and
+    /// retried cheaply every tick — see [`ReconcileJob::prev_skipped`].
+    skipped: Vec<String>,
 }
 
 impl ReconcileOutcome {
@@ -629,6 +633,12 @@ pub struct ReconcileJob {
     /// (dynamic discovery), rather than relying on the job-creation snapshot in
     /// `providers`.
     roster: Arc<StdMutex<PeerRoster>>,
+    /// Paths skipped on the previous pass because they couldn't be read (locked,
+    /// permission denied). Retried cheaply each tick: a still-locked file fails its
+    /// `open` instantly; a now-readable one is hashed once and published. Ensures a
+    /// locked file never permanently blocks the share, even if it's silently
+    /// unlocked later with no other folder change (which wouldn't re-trigger a scan).
+    prev_skipped: Vec<String>,
     base: HashMap<String, Vec<u8>>,
     last_quick_sig: u64,
     progress: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
@@ -860,9 +870,13 @@ impl ReconcileJob {
         //    local drift.
         let quick_sig = scan::quick_signature(&self.folder, &ignore_set);
         let do_scan = quick_sig != self.last_quick_sig;
-        let local: HashMap<String, LocalEntry> = if do_scan {
+        // Build the local view, plus the candidate paths to (re)attempt reading this
+        // pass: when scanning, whatever the scan couldn't read; otherwise the set
+        // skipped on the previous pass.
+        let (mut local, skip_candidates): (HashMap<String, LocalEntry>, Vec<String>) = if do_scan {
             let mut m = HashMap::new();
-            for sf in scan::scan(&self.folder, &ignore_set)? {
+            let (scanned, skipped) = scan::scan(&self.folder, &ignore_set)?;
+            for sf in scanned {
                 m.insert(
                     sf.entry.path.clone(),
                     LocalEntry {
@@ -872,9 +886,12 @@ impl ReconcileJob {
                     },
                 );
             }
-            m
+            (m, skipped)
         } else {
-            self.base
+            // No full scan this tick — the on-disk content equals our recorded base,
+            // except for files we previously couldn't read; retry just those below.
+            let m = self
+                .base
                 .iter()
                 .map(|(p, h)| {
                     (
@@ -886,8 +903,49 @@ impl ReconcileJob {
                         },
                     )
                 })
-                .collect()
+                .collect();
+            (m, self.prev_skipped.clone())
         };
+
+        // Targeted retry of previously-unreadable files: hash ONLY those (cheap — a
+        // still-locked file fails its open instantly; a now-readable one is hashed
+        // once and folded into `local` so it publishes/syncs this pass). A file no
+        // longer on disk is dropped (the normal delete path handles its manifest
+        // entry). This guarantees a locked file is always retried and never blocks the
+        // rest of the share, even after a silent unlock that wouldn't change the
+        // folder signature. (On a full-scan tick the scan already tried these, so we
+        // just carry forward the ones still unreadable.)
+        let mut still_skipped: Vec<String> = Vec::new();
+        for rel in skip_candidates {
+            if local.contains_key(&rel) {
+                continue;
+            }
+            let abs = self.folder.join(rel_to_native(&rel));
+            if do_scan {
+                // Scan already attempted (and failed) to read it this pass.
+                if abs.exists() {
+                    still_skipped.push(rel);
+                }
+                continue;
+            }
+            match scan::hash_file(&abs) {
+                Ok((hash, size)) => {
+                    local.insert(
+                        rel,
+                        LocalEntry {
+                            hash,
+                            size,
+                            abs: Some(abs),
+                        },
+                    );
+                }
+                Err(_) => {
+                    if abs.exists() {
+                        still_skipped.push(rel);
+                    }
+                }
+            }
+        }
 
         // Seed import progress so the GUI shows a moving percent on a big first
         // import (masters only; cleared in finish_reconcile).
@@ -939,29 +997,58 @@ impl ReconcileJob {
                         changed = true;
                     } else if let Some(abs) = le.abs.as_ref() {
                         // Master, brand-new local file (or locally edited after a
-                        // remote delete): publish it.
-                        let h = self.import_one(&path, abs).await?;
-                        imported_bytes += le.size;
-                        self.set_progress(imported_bytes, imported_bytes);
-                        index_sets.push((path, h));
-                        changed = true;
+                        // remote delete): publish it. A per-file import failure (the
+                        // file got locked between scan and import, an odd entry, etc.)
+                        // must NOT abort the whole pass — skip it and retry next tick.
+                        match self.import_one(&path, abs).await {
+                            Ok(h) => {
+                                imported_bytes += le.size;
+                                self.set_progress(imported_bytes, imported_bytes);
+                                index_sets.push((path, h));
+                                changed = true;
+                            }
+                            Err(e) => {
+                                tracing::warn!("skip publishing {path} (will retry): {e:#}");
+                                continue;
+                            }
+                        }
                     }
                 }
 
-                // In the replica, absent from disk.
+                // In the replica, absent from the *scan*.
                 (None, Some(re)) => {
-                    if self.is_master && do_scan && b.map(|bh| bh == &re.hash).unwrap_or(false) {
+                    // "Absent from scan" can mean genuinely deleted OR present-on-disk
+                    // but skipped because it couldn't be read (locked/unreadable). Only
+                    // a file that is truly gone from disk is a deletion; a still-present
+                    // unreadable file must be left alone (don't tombstone, don't
+                    // re-download over it) and retried on a later pass.
+                    let on_disk = self.folder.join(rel_to_native(&path)).exists();
+                    if on_disk {
+                        // Present but unreadable this pass: leave as-is.
+                    } else if self.is_master
+                        && do_scan
+                        && b.map(|bh| bh == &re.hash).unwrap_or(false)
+                    {
                         // Master, full scan saw it genuinely gone while base+replica
                         // agreed → the user deleted it: propagate the tombstone.
                         self.tombstone(&path).await;
                         index_dels.push(path);
                         changed = true;
-                    } else if self
-                        .materialize(&path, &re.hash, re.size, &mut reclaim)
-                        .await?
-                    {
-                        index_sets.push((path, re.hash.clone()));
-                        changed = true;
+                    } else {
+                        match self
+                            .materialize(&path, &re.hash, re.size, &mut reclaim)
+                            .await
+                        {
+                            Ok(true) => {
+                                index_sets.push((path, re.hash.clone()));
+                                changed = true;
+                            }
+                            Ok(false) => {}
+                            Err(e) => {
+                                tracing::warn!("skip syncing {path} (will retry): {e:#}");
+                                continue;
+                            }
+                        }
                     }
                 }
 
@@ -974,34 +1061,56 @@ impl ReconcileJob {
                         continue;
                     }
                     if !self.is_master {
-                        // Viewer: replica wins, always.
-                        if self
+                        // Viewer: replica wins, always. A per-file failure (locked
+                        // target, etc.) is skipped, not fatal to the whole pass.
+                        match self
                             .materialize(&path, &re.hash, re.size, &mut reclaim)
-                            .await?
+                            .await
                         {
-                            index_sets.push((path, re.hash.clone()));
-                            changed = true;
+                            Ok(true) => {
+                                index_sets.push((path, re.hash.clone()));
+                                changed = true;
+                            }
+                            Ok(false) => {}
+                            Err(e) => tracing::warn!("skip syncing {path} (will retry): {e:#}"),
                         }
                         continue;
                     }
-                    // Master three-way merge.
+                    // Master three-way merge. Every per-file op below skips on error
+                    // (logs + moves on) rather than aborting the whole reconcile.
                     match b {
                         Some(bh) if bh == &le.hash => {
                             // Local untouched, remote changed → take remote.
-                            if self
+                            match self
                                 .materialize(&path, &re.hash, re.size, &mut reclaim)
-                                .await?
+                                .await
                             {
-                                index_sets.push((path, re.hash.clone()));
-                                changed = true;
+                                Ok(true) => {
+                                    index_sets.push((path, re.hash.clone()));
+                                    changed = true;
+                                }
+                                Ok(false) => {}
+                                Err(e) => {
+                                    tracing::warn!("skip syncing {path} (will retry): {e:#}");
+                                    continue;
+                                }
                             }
                         }
                         Some(bh) if bh == &re.hash => {
                             // Remote untouched, local changed → publish local.
                             if let Some(abs) = le.abs.as_ref() {
-                                let h = self.import_one(&path, abs).await?;
-                                index_sets.push((path, h));
-                                changed = true;
+                                match self.import_one(&path, abs).await {
+                                    Ok(h) => {
+                                        index_sets.push((path, h));
+                                        changed = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "skip publishing {path} (will retry): {e:#}"
+                                        );
+                                        continue;
+                                    }
+                                }
                             }
                         }
                         _ => {
@@ -1009,16 +1118,34 @@ impl ReconcileJob {
                             let local_ts = le.abs.as_ref().map(|a| mtime_micros(a)).unwrap_or(0);
                             if local_ts >= re.ts {
                                 if let Some(abs) = le.abs.as_ref() {
-                                    let h = self.import_one(&path, abs).await?;
-                                    index_sets.push((path, h));
-                                    changed = true;
+                                    match self.import_one(&path, abs).await {
+                                        Ok(h) => {
+                                            index_sets.push((path, h));
+                                            changed = true;
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "skip publishing {path} (will retry): {e:#}"
+                                            );
+                                            continue;
+                                        }
+                                    }
                                 }
-                            } else if self
-                                .materialize(&path, &re.hash, re.size, &mut reclaim)
-                                .await?
-                            {
-                                index_sets.push((path, re.hash.clone()));
-                                changed = true;
+                            } else {
+                                match self
+                                    .materialize(&path, &re.hash, re.size, &mut reclaim)
+                                    .await
+                                {
+                                    Ok(true) => {
+                                        index_sets.push((path, re.hash.clone()));
+                                        changed = true;
+                                    }
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::warn!("skip syncing {path} (will retry): {e:#}");
+                                        continue;
+                                    }
+                                }
                             }
                         }
                     }
@@ -1058,6 +1185,7 @@ impl ReconcileJob {
             index_sets,
             index_dels,
             reclaim,
+            skipped: still_skipped,
         })
     }
 }
@@ -1090,6 +1218,10 @@ struct ShareState {
     /// Presence gossip for this share (broadcasts our name + health, receives
     /// peers'). `None` if the gossip subscribe failed. Aborted on drop.
     presence: Option<crate::presence::PresenceHandle>,
+    /// Paths skipped last pass because they couldn't be read (locked/unreadable);
+    /// fed into the next [`ReconcileJob`] so they're retried cheaply until readable.
+    /// In-memory only — rediscovered by the first full scan after a restart.
+    skipped: Vec<String>,
 }
 
 /// The engine owns the iroh node and the set of shares.
@@ -1407,6 +1539,7 @@ impl Engine {
             // has content to fetch never briefly reads a misleading 100.
             health: 0,
             presence,
+            skipped: Vec::new(),
         })
     }
 
@@ -1714,6 +1847,7 @@ impl Engine {
             downloader,
             downloads_inflight,
             roster: state.roster.clone(),
+            prev_skipped: state.skipped.clone(),
             base,
             last_quick_sig: state.last_quick_sig,
             progress,
@@ -1749,6 +1883,7 @@ impl Engine {
         };
         state.publishing = false;
         state.health = out.health;
+        state.skipped = out.skipped;
         state.last_quick_sig = out.new_quick_sig;
         let _ = self.db.set_quick_sig(share_id, out.new_quick_sig);
         if out.changed {
