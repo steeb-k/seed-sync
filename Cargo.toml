@@ -26,6 +26,10 @@ iroh-blobs = "0.103"
 iroh-gossip = "0.101"
 iroh-docs = "0.101"
 iroh-tickets = "1.0"
+# mDNS-based local-network address lookup: lets peers on the same LAN discover
+# each other with no internet (n0 DNS / relays). Depends on iroh 1.0.0 — keep in
+# lockstep with the iroh bump above.
+iroh-mdns-address-lookup = "0.4"
 # bao-tree must match the version iroh-blobs pulls in (used for streamed blob repair).
 bao-tree = "0.16"
 

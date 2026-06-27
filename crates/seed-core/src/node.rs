@@ -49,12 +49,23 @@ impl IrohNode {
             .with_context(|| format!("create data dir {}", data_dir.display()))?;
 
         let secret_key = load_or_create_secret_key(&data_dir.join("node.key"))?;
+        // The endpoint id is the public half of the device key; we need it to
+        // build the mDNS service below, before the secret key is moved into the
+        // endpoint builder.
+        let endpoint_id = secret_key.public();
 
-        let endpoint = Endpoint::builder(iroh::endpoint::presets::N0)
-            .secret_key(secret_key)
-            .bind()
-            .await
-            .context("bind iroh endpoint")?;
+        // The N0 preset wires up n0 DNS discovery + relays (internet path). On
+        // top of that we add mDNS-based local-network address lookup so two
+        // members on the same LAN can find and reach each other with no
+        // internet at all. Building the mDNS service can fail on a host with no
+        // usable IPv4/IPv6 (or where multicast is unavailable) — degrade to "no
+        // LAN discovery" with a warning rather than failing endpoint startup.
+        let mut builder = Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key);
+        match iroh_mdns_address_lookup::MdnsAddressLookup::builder().build(endpoint_id) {
+            Ok(mdns) => builder = builder.address_lookup(mdns),
+            Err(e) => tracing::warn!("local-network (mDNS) discovery unavailable: {e}"),
+        }
+        let endpoint = builder.bind().await.context("bind iroh endpoint")?;
 
         let blobs_dir = blobs_dir.to_path_buf();
         let docs_dir = data_dir.join("docs");

@@ -7,7 +7,9 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
@@ -26,6 +28,11 @@ import uniffi.seed_mobile.ShareSummary
 class EngineService : LifecycleService() {
 
     private var started = false
+
+    /** Held while the engine runs so Android delivers inbound mDNS multicast,
+     * which the iroh endpoint's local-network discovery needs to find LAN peers.
+     * Without it the device can advertise but never receives others' responses. */
+    private var multicastLock: WifiManager.MulticastLock? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -59,6 +66,7 @@ class EngineService : LifecycleService() {
         if (started) return
         started = true
         startForegroundCompat(buildNotification("Starting…", paused = false))
+        acquireMulticastLock()
         EngineHolder.start(applicationContext)
         // Apply the Wi-Fi-only / charging-only policy for the engine's lifetime.
         SyncGate.bind(applicationContext)
@@ -82,7 +90,30 @@ class EngineService : LifecycleService() {
 
     override fun onDestroy() {
         SyncGate.unbind()
+        releaseMulticastLock()
         super.onDestroy()
+    }
+
+    /** Acquire the Wi-Fi multicast lock so inbound mDNS reaches the engine.
+     * Best-effort: a device with no Wi-Fi service, or a network that blocks
+     * multicast, just means no LAN discovery — never a fatal error. */
+    private fun acquireMulticastLock() {
+        if (multicastLock != null) return
+        runCatching {
+            val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            wifi.createMulticastLock("seedsync.mdns").apply {
+                setReferenceCounted(false)
+                acquire()
+                multicastLock = this
+            }
+        }.onFailure { Log.w(TAG, "could not acquire multicast lock for LAN discovery", it) }
+    }
+
+    private fun releaseMulticastLock() {
+        multicastLock?.let { lock ->
+            runCatching { if (lock.isHeld) lock.release() }
+        }
+        multicastLock = null
     }
 
     private fun startForegroundCompat(n: Notification) {
@@ -166,6 +197,7 @@ class EngineService : LifecycleService() {
     }
 
     companion object {
+        private const val TAG = "EngineService"
         private const val CHANNEL_ID = "seedsync.sync"
         private const val NOTIF_ID = 1
         private const val ACTION_PAUSE = "io.github.steeb_k.seedsync.action.PAUSE"

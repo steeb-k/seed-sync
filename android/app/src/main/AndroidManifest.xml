@@ -5,6 +5,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Receive mDNS multicast for local-network (LAN) peer discovery. Android
+         drops multicast unless a WifiManager.MulticastLock is held. -->
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
 
     <!-- Camera: scan a key QR from the desktop app to add a share. Optional —
          the key can still be pasted/typed if there's no camera. -->

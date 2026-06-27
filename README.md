@@ -17,7 +17,7 @@ namespace key, so only master-key holders can write.
 
 | Crate | Role |
 |-------|------|
-| `seed-core` | Sync engine: iroh transport, signed-manifest trust root, share keys, folder mirroring. No GUI/IPC. |
+| `seed-core` | Sync engine: iroh transport, signed-manifest trust root, share keys, folder mirroring. No GUI/IPC. Peer discovery uses n0 DNS + relays for the internet path **and** mDNS for the local network, so members on the same LAN sync with no internet at all. |
 | `seed-ipc` | Wire contract (request/response/event types + CBOR framing) between GUI and daemon. Dependency-light. |
 | `seed-daemon` | Background sync daemon. Console process in dev; Windows service in production (same binary). |
 | `seed-gui` | GTK4 + Libadwaita GUI and system tray. IPC client to the daemon. |

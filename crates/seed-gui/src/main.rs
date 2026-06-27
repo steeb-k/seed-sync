@@ -565,9 +565,10 @@ fn build_ui(
 
     // --- header bar ---
     let header = adw::HeaderBar::new();
-    // Title + subtitle: "S.E.E.D." over "Secure Environment Exchange Daemon".
+    // Title + subtitle: "S.E.E.D. v<version>" over "Secure Environment Exchange
+    // Daemon". The version tracks the crate (workspace) version automatically.
     header.set_title_widget(Some(&adw::WindowTitle::new(
-        "S.E.E.D.",
+        &format!("S.E.E.D. v{}", env!("CARGO_PKG_VERSION")),
         "Secure Environment Exchange Daemon",
     )));
 

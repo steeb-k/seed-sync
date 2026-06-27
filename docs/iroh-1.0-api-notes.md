@@ -28,6 +28,28 @@ Presets: `N0` (n0 discovery + relays), `N0DisableRelay`, `Minimal`, `Empty`.
 `SecretKey::from_bytes(&[u8;32])` / `to_bytes()` / `generate(rng)` (byte-method
 names unverified — confirm on docs.rs/iroh-base).
 
+### Local-network (LAN) discovery — mDNS
+On top of `presets::N0` we add mDNS-based local discovery so peers on the same
+LAN find each other with **no internet** (no n0 DNS, no relay). Discovery in 1.0
+is the "Address Lookup" system; mDNS lives in a **separate crate**,
+`iroh-mdns-address-lookup` (0.4, depends on iroh 1.0.0), and is attached via
+`Builder::address_lookup(..)`:
+```rust
+let endpoint_id = secret_key.public();
+let mut builder = Endpoint::builder(presets::N0).secret_key(secret_key);
+// Build defensively: it errors if the host has no usable IPv4/IPv6 — degrade to
+// "no LAN discovery" rather than failing endpoint bind.
+match iroh_mdns_address_lookup::MdnsAddressLookup::builder().build(endpoint_id) {
+    Ok(mdns) => builder = builder.address_lookup(mdns),
+    Err(e) => tracing::warn!("local-network (mDNS) discovery unavailable: {e}"),
+}
+let ep = builder.bind().await?;
+```
+Lives in `crates/seed-core/src/node.rs`. n0 DNS + mDNS run side by side: n0 for
+remote peers, mDNS for same-segment ones. **Android caveat:** inbound multicast
+is dropped unless the app holds a `WifiManager.MulticastLock` (acquired in
+`EngineService`, needs the `CHANGE_WIFI_MULTICAST_STATE` permission).
+
 ## Router
 ```rust
 use iroh::protocol::Router;

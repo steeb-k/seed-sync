@@ -128,6 +128,10 @@ exposes a flat, UniFFI-friendly API. Reuse, do not rewrite, the engine:
 - The full sync engine, crypto/trust model, blob/doc/gossip networking, and
   real-path folder mirroring all carry over unchanged.
 - NAT traversal via iroh relays works on cellular and Wi-Fi.
+- Local-network (mDNS) discovery works on Wi-Fi: `EngineService` holds a
+  `WifiManager.MulticastLock` (permission `CHANGE_WIFI_MULTICAST_STATE`) so the
+  engine receives inbound multicast and can find LAN peers with no internet.
+  Without the lock the device can advertise but never sees others' replies.
 
 **Genuine Android constraints (inherent, not fixable in our code):**
 - **Background reliability.** Android aggressively limits background work (Doze,
