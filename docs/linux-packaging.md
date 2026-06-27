@@ -4,17 +4,23 @@ This is the baseline for shipping S.E.E.D. (SEED Sync) on Linux and keeping inst
 up to date. It's the Linux counterpart to `docs/windows-packaging.md`.
 
 ## TL;DR for cutting a release
-1. Bump the version: edit `[workspace.package].version` in the root `Cargo.toml`.
-2. Commit, then tag and push:
+1. Bump the version: edit `[workspace.package].version` in the root `Cargo.toml`,
+   run `cargo update --workspace`, commit.
+2. Build the tarball locally on a Linux box (or WSL):
    ```sh
-   git tag v0.1.1 && git push origin v0.1.1
+   scripts/package-linux.sh            # -> dist/seed-sync-<ver>-linux-x86_64.tar.gz
    ```
-3. `.github/workflows/release.yml` builds the tarball and publishes it to the **public**
-   `steeb-k/seed-sync-binaries` repo as a GitHub Release named after the tag.
+3. Publish it to the **public** `steeb-k/seed-sync-binaries` repo as a GitHub
+   Release with `gh` (see [`releasing.md`](releasing.md) for the full flow):
+   ```sh
+   gh release create vX.Y.Z --repo steeb-k/seed-sync-binaries --title vX.Y.Z \
+     --notes-file release-notes.md dist/seed-sync-<ver>-linux-x86_64.tar.gz
+   ```
 4. Installed machines pick it up automatically within a day (the `seed-sync-update.timer`),
    or immediately with `seed-sync --update`.
 
-That's it. The rest of this document explains the moving parts.
+That's it — all builds are local; there is no CI. The rest of this document
+explains the moving parts.
 
 ## Architecture (why it's built this way)
 S.E.E.D. is **not a typical sandboxed GUI app** — it's a *per-user background daemon* +
@@ -32,12 +38,13 @@ the keyring, full network (iroh), the session bus (tray), and system GTK 4.10+/l
 
 ### Distribution / update flow
 ```
-  main repo (private)                 seed-sync-binaries (PUBLIC)         user machine
-  ───────────────────                 ──────────────────────────         ────────────
-  git tag vX.Y.Z  ──►  release.yml ──►  Release "vX.Y.Z"          ◄─── seed-sync --update
-   (Cargo version)     builds tarball   ├─ ...linux-x86_64.tar.gz  poll   (timer, daily)
-                       publishes via    └─ ...windows...  (added    +     compares to
-                       SEED_BINARIES_TOKEN   by the Windows side)  fetch  `seed-daemon --version`
+  dev machines (local builds)         seed-sync-binaries (PUBLIC)         user machine
+  ───────────────────────────         ──────────────────────────         ────────────
+  package-linux.sh  ──► gh release ──►  Release "vX.Y.Z"          ◄─── seed-sync --update
+  build-msi.ps1         create/upload   ├─ ...linux-x86_64.tar.gz  poll   (timer, daily)
+  gradlew assembleRel   (per platform,  ├─ ...windows-x86_64.msi    +     compares to
+  package-macos.sh       SEED_BINARIES   └─ ...android...   APK    fetch  `seed-daemon --version`
+                         _TOKEN / gh)
 ```
 - Artifacts live in a **separate public repo** so machines download with **no auth**. Source
   stays private in `seed-sync-gtk`.
@@ -48,10 +55,11 @@ the keyring, full network (iroh), the session bus (tray), and system GTK 4.10+/l
 ## One-time setup (do this once, ever)
 1. **Create the public artifact repo** `steeb-k/seed-sync-binaries` (empty is fine; it just
    holds Releases). Public so the updater needs no credentials.
-2. **Create a token** with `contents: write` on `seed-sync-binaries` (classic PAT with `repo`,
-   or a fine-grained token scoped to that one repo), and add it to the **main repo** as the
-   Actions secret **`SEED_BINARIES_TOKEN`**. The default `GITHUB_TOKEN` can't write to another
-   repo, which is why this is required.
+2. **Get publish access to `seed-sync-binaries`** — either `gh auth login` as an account with
+   `repo` scope (the maintainer's `steeb-k` account has it), or create a token with
+   `contents: write` on `seed-sync-binaries` (classic PAT with `repo`, or a fine-grained token
+   scoped to that one repo) and pass it to `gh` via `GH_TOKEN` / `SEED_BINARIES_TOKEN` when
+   publishing locally.
 3. **Publish the bootstrap** `packaging/linux/web-install.sh` to its two served locations (both
    stable, rarely change). It's mirrored — re-copy to both if you edit `web-install.sh`:
    - **`steeb-k.github.io/seed-install.sh`** — the canonical end-user URL (GitHub Pages, served from
@@ -81,7 +89,7 @@ All packaging inputs live in `packaging/linux/` and are assembled into the tarba
 | File | Purpose |
 |---|---|
 | `scripts/package-linux.sh` | Builds the release: `cargo build --release`, renders hicolor icon sizes from `icon/appIcon.png` (needs ImageMagick), stages the tree, and writes `dist/seed-sync-<ver>-linux-x86_64.tar.gz`. Run with `--skip-build` to repackage existing binaries. |
-| `.github/workflows/release.yml` | On a `v*` tag: runs the package script on **ubuntu-24.04** (GUI needs GTK 4.10+), checks the tag matches the Cargo version, and publishes the tarball to `seed-sync-binaries`. |
+| (release publishing) | Built locally — run `scripts/package-linux.sh` on **Ubuntu 24.04** (GUI needs GTK 4.10+; WSL works) and publish the tarball to `seed-sync-binaries` with `gh`. See [`releasing.md`](releasing.md). There is no CI workflow. |
 | `packaging/linux/seed-sync` | **The one wrapper** — installer, updater, and uninstaller in a single script, installed to `~/.local/bin/seed-sync`. `--install [--no-auto-update] [--no-gui-autostart]` places files (from the tarball it shipped in, or downloads if run standalone), enables the daemon + update timer, adds the tray autostart entry, runs a dep check. `--update [--check]` downloads the latest, version-compares vs `seed-daemon --version`, and applies (stop daemon → swap → restart). `--uninstall [--purge]` removes everything. `--status` shows installed/latest/service state. A shared internal `apply_tree` does the atomic file placement for both install and update. |
 | `packaging/linux/web-install.sh` | **The `curl \| sh` bootstrap.** POSIX sh, no args needed. Detects whether S.E.E.D. is installed and prompts (install / update / remove) via `/dev/tty`; non-interactive via `sh -s -- install\|update\|remove` or `$SEED_ACTION`. First install downloads the latest tarball and runs its `seed-sync --install`; update/remove on an existing install just delegate to the installed `seed-sync`. **Served at `steeb-k.github.io/seed-install.sh`** (canonical) and `seed-sync-binaries/install.sh` (raw fallback), mirrored from this file — re-copy to both if you change it (see One-time setup). |
 | `packaging/linux/seed-daemon.service` | `systemd --user` unit that runs `seed-daemon run`, restarts on failure, and auto-starts at login (`WantedBy=default.target`). |
@@ -135,14 +143,15 @@ Self-replacement of `seed-sync` is safe: `apply_tree` writes the new file to a t
 
 ## Caveats / gotchas for maintainers
 - **ABI portability.** The tarball is dynamically linked against the build host's glibc + GTK.
-  CI builds on **ubuntu-24.04** — not 22.04, because the GUI requires **GTK 4.10+** (the `v4_10`
+  Build on **Ubuntu 24.04** — not 22.04, because the GUI requires **GTK 4.10+** (the `v4_10`
   feature) and 22.04 only ships GTK 4.6, which fails the build. Targets therefore need **GTK 4.10+ /
   libadwaita 1.4+** and a correspondingly modern **glibc (≥ 2.39)** — in practice Ubuntu 24.04+,
   Fedora 39+, Debian 13+, or a rolling distro (Arch/CachyOS). Older distros can't run the app anyway
   (no GTK 4.10+), so this floor isn't an extra restriction. If a fleet consolidates on one distro,
   prefer a real native package then (see Future work).
-- **Version bump is mandatory per release** — the updater is version-driven. CI fails the
-  release if the tag doesn't match the Cargo version (guard in `release.yml`).
+- **Version bump is mandatory per release** — the updater is version-driven. Bump the Cargo
+  version (and `android/app/build.gradle.kts`) before building, or installed machines never
+  see a newer release.
 - **systemd --user requires a user session bus.** On headless/SSH boxes without a logind
   session, `systemctl --user` may be unavailable; `install.sh` warns and still places files.
   The keyring (secret service) likewise needs the session — the engine already falls back to

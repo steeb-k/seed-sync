@@ -4,7 +4,7 @@
 > Silicon (see `docs/cross-os-testing.md` → [MACOS]). The build → bundle → `.app` → install →
 > launchd → update flow works end-to-end, including a `sandbox-exec` "no Homebrew" proof. **Universal2
 > (arm64 + x86_64) is built and verified** (needs a second x86_64 Homebrew at `/usr/local`). Still
-> open: running the CI job on a runner + publishing the macOS asset to `seed-sync-binaries`, the unified
+> open: publishing the macOS asset to `seed-sync-binaries` from the local Mac build, the unified
 > hosted bootstrap, and the live cross-OS sync runs. One design change from the original plan:
 > we ship a **`SEED Sync.app` bundle _inside_ the curl|sh tarball** (installed to `~/Applications`)
 > rather than loose binaries — this keeps the quarantine dodge while giving a real Dock/Applications
@@ -43,11 +43,11 @@ to prefer it:
 ## Distribution / update flow (identical to Linux/Windows)
 
 ```
-  main repo (private)                seed-sync-binaries (PUBLIC)        user machine (macOS)
-  ───────────────────                ──────────────────────────        ────────────────────
-  git tag vX.Y.Z  ──►  release.yml ──►  Release "vX.Y.Z"        ◄─── seed-sync --update
-   (Cargo version)     macOS job adds   ├─ ...linux-x86_64.tar.gz  poll  (launchd timer, daily)
-                       the macOS asset   ├─ ...windows-x86_64.msi    +    compares to
+  dev machines (local builds)        seed-sync-binaries (PUBLIC)        user machine (macOS)
+  ───────────────────────────        ──────────────────────────        ────────────────────
+  package-macos.sh  ──► gh release ──►  Release "vX.Y.Z"        ◄─── seed-sync --update
+  (on a Mac)            create/upload   ├─ ...linux-x86_64.tar.gz  poll  (launchd timer, daily)
+                        the macOS asset  ├─ ...windows-x86_64.msi    +    compares to
                                          └─ ...macos-universal.tar.gz fetch `seed-daemon --version`
 ```
 
@@ -141,50 +141,45 @@ all 57 dylibs, both slices run (native + Rosetta), both self-contained under a n
   `Homebrew/Library/Homebrew/os/mac/pkgconfig/<macOS-major>` (system-lib stubs: zlib/libffi/expat/…),
   plus `PKG_CONFIG_ALLOW_CROSS=1`. Without the per-version stubs dir, gobject/cairo/fontconfig fail to
   resolve their system deps.
-- **CI:** the `macos-14` job sets up the x86_64 Homebrew/Rosetta prefix itself (below) so it ships
-  universal, not arm64-only.
+- **Build host floor:** the bundled GTK dylibs carry the `minos` of whatever Mac you build on, so the
+  build host's macOS version sets the floor (see below). Building locally on an older Mac is exactly how
+  you reach a lower floor than a hosted runner allowed.
 
-## CI (built — not yet run on a runner)
+## Building universal locally on a Mac
 
-The `macos` job in `.github/workflows/release.yml` builds **universal** by bootstrapping a second
-x86_64 Homebrew on the runner: tag↔version guard, `brew install gtk4 libadwaita` (arm64),
-`softwareupdate --install-rosetta`, a NONINTERACTIVE x86_64 Homebrew at `/usr/local` +
-`arch -x86_64 brew install gtk4 libadwaita pkg-config`, `dtolnay/rust-toolchain` with
-`targets: x86_64-apple-darwin`, then `scripts/package-macos.sh` (auto-detects the x86_64 brew →
-universal) and publishes to `seed-sync-binaries` with `SEED_BINARIES_TOKEN`, `fail_on_unmatched_files:
-true`. The runner's Xcode CLT provides `install_name_tool`/`codesign`/`otool`/`lipo`/`iconutil`. **The
-second-Homebrew + Rosetta setup is the heaviest/most novel part — validate it on the first release tag.**
+Releases are built on the maintainer's Mac (there is no CI). `scripts/package-macos.sh` produces the
+**universal** tarball by bundling both arch slices; it auto-detects a second x86_64 Homebrew and `lipo`s
+everything. One-time setup on the build Mac:
 
-### Minimum macOS version is set by the build host — pin `macos-14`
+- `brew install gtk4 libadwaita pkg-config` (arm64, the default Homebrew at `/opt/homebrew`).
+- `softwareupdate --install-rosetta --agree-to-license`, then a **second x86_64 Homebrew** at
+  `/usr/local`: `NONINTERACTIVE=1 arch -x86_64 /bin/bash -c "$(curl -fsSL …/Homebrew/install/HEAD/install.sh)"`
+  followed by `arch -x86_64 /usr/local/bin/brew install gtk4 libadwaita pkg-config`.
+- `rustup target add x86_64-apple-darwin`. Xcode CLT supplies
+  `install_name_tool`/`codesign`/`otool`/`lipo`/`iconutil`.
+
+Then `scripts/package-macos.sh` → `dist/seed-sync-<ver>-macos-universal.tar.gz`; publish it with `gh`
+(see [`releasing.md`](releasing.md)). The second-Homebrew + Rosetta setup is the heaviest part — if the
+x86_64 brew is absent the script falls back to an arm64-only bundle.
+
+### Minimum macOS version is set by the build host
 The bundle's real floor is the `minos` (LC_BUILD_VERSION) of the **bundled GTK dylibs**, which Homebrew
 stamps with the macOS version of the build machine. Our Rust binaries are low (≈11), but GTK dominates:
 
 | Build host | arm64 GTK `minos` | x86_64 GTK `minos` | Effective floor |
 |---|---|---|---|
-| `macos-14` runner (Sonoma) | **14** | 13–14 | **macOS 14** (recommended) |
-| `macos-15` runner (Sequoia) | 15 | 14–15 | macOS 15 |
-| a dev box on macOS 26 | 26 | 14 | macOS 26 on Apple Silicon (too high to ship) |
+| Mac on macOS 14 (Sonoma) | **14** | 13–14 | **macOS 14** |
+| Mac on macOS 15 (Sequoia) | 15 | 14–15 | macOS 15 |
+| Mac on macOS 26 | 26 | 14 | macOS 26 on Apple Silicon (too high to ship) |
 
-So **always cut the release on `macos-14`** (the *oldest* Apple-Silicon GitHub runner) to reach the
-widest install base — Apple Silicon ≥ 14 and Intel ≥ 14. GitHub has no older Apple-Silicon runner, so
-macOS 14 (Sonoma) is the practical arm64 floor for hosted CI; a lower floor needs a self-hosted older
-Mac. (On Apple Silicon dyld always loads the arm64 slice, so the arm64 `minos` is what gates those
-machines — the x86_64 slice's lower floor only helps Intel Macs.)
+So **build on the oldest Mac you have** to reach the widest install base. On Apple Silicon dyld always
+loads the arm64 slice, so the arm64 `minos` is what gates those machines — the x86_64 slice's lower floor
+only helps Intel Macs. **This is the main reason releases are built locally rather than on a hosted
+runner:** GitHub's oldest Apple-Silicon runner was `macos-14`, so CI couldn't go below macOS 14, whereas
+a local older Mac (or building GTK from source with `MACOSX_DEPLOYMENT_TARGET` pinned) can target lower.
 
-**Can we go below macOS 14?** Not cheaply. GitHub's *oldest* Apple-Silicon runner is `macos-14`, and
-Homebrew's arm64 GTK bottles target recent macOS — so 14 is the practical arm64 floor for hosted CI.
-Lower needs either a **self-hosted older Apple-Silicon Mac** (where `brew` builds GTK from source against
-that OS) or **building the whole GTK stack from source with `MACOSX_DEPLOYMENT_TARGET` pinned** (a macOS
-"gvsbuild" — a real project). The Intel angle is also closing: Apple discontinued x86_64, the `macos-13`
-runner image is being retired, and GitHub drops Intel runners after `macos-15` (Fall 2027) — so there's
-no longer a cheap sub-14 Intel runner either. In practice macOS 14 (Sonoma) is the oldest macOS still in
-Apple's support window, and every Apple-Silicon Mac runs 14+, so a 14 floor already covers the entire
-currently-supported install base.
-
-**Caveat for the current release:** the `v1.1.0` macOS asset was published *manually* from a macOS-26
-dev box, so its arm64 slice needs macOS 26. Re-cut via the `macos-14` CI job to drop it to macOS 14.
-
-Until a tag runs this job, the CI-built macOS asset isn't on `seed-sync-binaries`.
+> Older macOS assets that were published manually from a macOS-26 dev box carried a macOS-26 arm64 floor;
+> re-cutting on an older Mac drops the floor accordingly.
 
 ## Caveats / gotchas
 
@@ -210,7 +205,7 @@ Until a tag runs this job, the CI-built macOS asset isn't on `seed-sync-binaries
   Macs won't load Aqua agents — the wrapper warns and still places files.
 - **Quarantine dodge is install-path-specific.** It holds for `curl | sh`. A browser download *will* be
   quarantined; the escape hatch is `xattr -dr com.apple.quarantine "<dir>"`.
-- **Version bump is mandatory per release** (updater is version-driven; CI guard fails otherwise).
+- **Version bump is mandatory per release** (updater is version-driven; bump the Cargo version before building or installs never see it).
 
 ## Future work (not built)
 

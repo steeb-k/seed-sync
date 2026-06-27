@@ -106,8 +106,8 @@ exposes a flat, UniFFI-friendly API. Reuse, do not rewrite, the engine:
   `x86_64` (emulator), bundling the `.so`s into the APK.
 - Reuse `seed-core` from the same workspace — **monorepo, one shared engine**;
   no fork. Desktop and Android stay in lockstep.
-- New CI job alongside `.github/workflows/release.yml` to build a signed APK and
-  publish it to the existing `seed-sync-binaries` repo.
+- Build a signed APK locally (`gradlew :app:assembleRelease`) and publish it to the
+  existing `seed-sync-binaries` repo with `gh` (see `docs/releasing.md`).
 
 ## Critical files
 

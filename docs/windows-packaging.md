@@ -1,8 +1,8 @@
 # Windows: build, bundle, package, service (M4)
 
-This is the Windows-validation milestone. The code is written and CI
-compile-checks the Windows build; the steps below are run/validated on a real
-Windows machine. Primary development moves here per the project plan.
+This is the Windows-validation milestone. The steps below are run/validated on a
+real Windows machine — the MSI is built and signed locally (there is no CI).
+Primary development happens here per the project plan.
 
 ## 0. One-time dev setup
 
@@ -18,7 +18,7 @@ Windows machine. Primary development moves here per the project plan.
    curl.exe -L -o gtk.zip "https://github.com/wingtk/gvsbuild/releases/download/$ver/GTK4_Gvsbuild_${ver}_x64.zip"
    mkdir C:\gtk; tar -xf gtk.zip -C C:\gtk   # gives C:\gtk\{bin,lib,include,share}
    ```
-   The release CI does exactly this (`.github/workflows/release.yml`).
+   (Pin the gvsbuild version; bump it from the wingtk/gvsbuild releases page.)
 4. Point the gtk-rs build at it:
    ```pwsh
    $env:PKG_CONFIG_PATH = "C:\gtk\lib\pkgconfig"
@@ -155,34 +155,36 @@ tag and, when newer, downloads the `*windows-x86_64.msi` asset and applies it wi
 report only, `-RegisterTask` / `-UnregisterTask` = used by the MSI. Logs to
 `%PROGRAMDATA%\SeedSync\update.log`.
 
-To cut a release: bump `[workspace.package].version` in `Cargo.toml`, commit, then
-`git tag vX.Y.Z && git push origin vX.Y.Z`. The `release.yml` **`windows` job** now
-builds + signs + publishes the MSI autonomously alongside Linux + macOS (no manual
-`build-msi.ps1` / `publish-msi.ps1` run needed) once the one-time Azure setup below
-is in place — those two scripts remain for local builds and as a fallback.
+To cut a release: bump `[workspace.package].version` in `Cargo.toml`, run
+`cargo update --workspace`, commit. Then build, sign, and publish the MSI **locally**
+(there is no CI):
 
-### 3.3 Autonomous CI signing (Azure Trusted Signing via OIDC)
-The `windows` job in `release.yml` builds GTK with **gvsbuild** (cached at `C:\gtk`),
-installs WiX 5, then signs via the **same `sign-artifacts.ps1` + committed
-`artifact-signing-metadata.json`** — the cert never touches CI. The runner
-authenticates to Azure as a **service principal over OIDC** (`azure/login@v2`); the
-`Azure.CodeSigning.Dlib` (installed from the `Microsoft.Trusted.Signing.Client` NuGet)
-signs remotely against the account/profile named in the metadata.
+```pwsh
+cargo build --release
+az login                                  # the signer-role account; see below
+pwsh -File scripts\build-msi.ps1 -SkipBuild   # bundle + sign exes + wix + sign MSI
+# -> target\wix\seed-sync-<ver>-windows-x86_64.msi
+pwsh -File scripts\publish-msi.ps1            # or `gh release upload …` (see releasing.md)
+```
 
-**One-time maintainer setup** (without it, `azure/login` fails — but the Linux/macOS
-assets still publish, since the jobs are independent):
-1. Register an **Azure AD app** (service principal).
-2. Grant it the **"Trusted Signing Certificate Profile Signer"** role on the Trusted
-   Signing account (or scoped to the certificate profile).
-3. Add an **OIDC federated credential** on the app for this repo — subject e.g.
-   `repo:steeb-k/seed-sync-gtk:ref:refs/tags/v*`.
-4. Add repo secrets: **`AZURE_CLIENT_ID`**, **`AZURE_TENANT_ID`**, **`AZURE_SUBSCRIPTION_ID`**
-   (`SEED_BINARIES_TOKEN` already exists for publishing).
+### 3.3 Local signing (Azure Artifact Signing)
+`build-msi.ps1` signs via `sign-artifacts.ps1` + the committed
+`artifact-signing-metadata.json` — the cert is never stored locally. Signing
+authenticates to Azure through your **interactive `az login`** session; the
+`Azure.CodeSigning.Dlib` (from the `Microsoft.ArtifactSigning.Client` NuGet) signs
+remotely against the account/profile named in the metadata. The
+`ExcludeCredentials` list in that metadata pins the dlib to `AzureCliCredential`, so
+it uses the `az` session instead of probing IMDS (which would otherwise hang).
 
-Status: **wired but unvalidated on a runner** — the gvsbuild build and the dlib
-install want a first-tag shakeout. If the dlib/auth path misbehaves, the alternative
-is the purpose-built `azure/artifact-signing-action@v2` (would mean splitting
-`build-msi.ps1` so the action signs the exes before `wix build` and the MSI after).
+**Requirements on the build machine:**
+1. An Azure account holding the **"Artifact Signing Certificate Profile Signer"** role
+   (formerly "Trusted Signing …") on the signing account / cert profile.
+2. The `Microsoft.ArtifactSigning.Client` dlib installed and discoverable (point
+   `ARTIFACT_SIGNING_DLIB` at `Azure.CodeSigning.Dlib.dll` if it isn't auto-found).
+3. `az login` as that account before running `build-msi.ps1`.
+
+To produce an **unsigned** MSI for a quick local test, point
+`ARTIFACT_SIGNING_METADATA` at a nonexistent path.
 
 ## 4. Checkpoint #3 (end-to-end)
 

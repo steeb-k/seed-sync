@@ -1,8 +1,9 @@
 # Local cross-platform dev environment (one Windows box)
 
 This documents a single **Windows 11** machine set up to build, run, and package
-SEED Sync for **Windows, Linux, and Android** — without switching machines or
-spending CI minutes. (macOS still needs a Mac; see `docs/macos-packaging.md`.)
+SEED Sync for **Windows, Linux, and Android** — without switching machines. All
+releases are built locally (there is no CI); macOS still needs a Mac, see
+`docs/macos-packaging.md`.
 
 - **Windows** — native MSVC build + GTK4 via gvsbuild + WiX 5 MSI.
 - **Linux** — WSL2 (Ubuntu 24.04) with the GTK GUI rendered through WSLg, plus an
