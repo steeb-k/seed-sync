@@ -1409,3 +1409,152 @@ async fn agreeing_masters_share_fingerprint_and_never_out_of_sync() -> anyhow::R
     b.shutdown().await?;
     Ok(())
 }
+
+/// Deep verify catches drift the cheap change-signature can't: a viewer file
+/// corrupted IN PLACE with the same size and a restored mtime leaves the
+/// `(size, mtime)` signature unchanged, so an ordinary reconcile never re-hashes it
+/// and the corruption survives. A forced deep verify re-hashes the file, detects the
+/// mismatch against the manifest, and re-materializes the correct content. The first
+/// assertion deliberately proves the gap exists (normal reconcile misses it) so the
+/// test can't silently pass if deep verify became a no-op.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn deep_verify_heals_corruption_a_normal_reconcile_misses() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let mut master = Engine::new(a_data.path()).await?;
+    let mut viewer = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        master.wait_online().await;
+        viewer.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    let good = gen_bytes(4096);
+    std::fs::write(a_folder.path().join("x.bin"), &good)?;
+    let created = master.create_share(a_folder.path(), vec![]).await?;
+    let share_id = viewer
+        .add_share(
+            &created.viewer_key,
+            b_folder.path(),
+            vec![master.endpoint_addr()],
+        )
+        .await?;
+
+    let want = snapshot(a_folder.path());
+    sync_until(&mut viewer, &share_id, b_folder.path(), &want).await?;
+
+    // Corrupt the viewer's copy in place: same length, mtime restored, so the
+    // (size, mtime) change-signature is identical and a normal scan is skipped.
+    let path = b_folder.path().join("x.bin");
+    let orig_mtime = std::fs::metadata(&path)?.modified()?;
+    let mut corrupt = good.clone();
+    corrupt[0] ^= 0xff;
+    corrupt[1000] ^= 0xff;
+    assert_eq!(corrupt.len(), good.len());
+    std::fs::write(&path, &corrupt)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)?
+        .set_modified(orig_mtime)?;
+
+    // A normal reconcile does NOT notice (signature unchanged): corruption survives.
+    for _ in 0..6 {
+        let _ = viewer.apply(&share_id).await?;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+    assert_eq!(
+        std::fs::read(&path)?,
+        corrupt,
+        "ordinary reconcile must miss same-size+mtime corruption (proves the gap exists)"
+    );
+    println!("normal reconcile missed in-place corruption (as expected)");
+
+    // Deep verify re-hashes and heals it.
+    viewer.request_deep_verify(&share_id);
+    sync_until(&mut viewer, &share_id, b_folder.path(), &want).await?;
+    assert_eq!(
+        std::fs::read(&path)?,
+        good,
+        "deep verify must restore the correct content from the manifest"
+    );
+    println!("deep verify healed the corruption OK");
+
+    master.shutdown().await?;
+    viewer.shutdown().await?;
+    Ok(())
+}
+
+/// Re-kicking a share's doc live-sync (the self-heal action used on divergence) must
+/// be safe on an already-synced share: after an explicit resync on both members, a
+/// fresh change must still propagate. Guards against `resync_doc` breaking the
+/// replication it's meant to repair.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn doc_resync_does_not_break_replication() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let mut a = Engine::new(a_data.path()).await?;
+    let mut b = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        a.wait_online().await;
+        b.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    std::fs::write(a_folder.path().join("a.txt"), b"from A")?;
+    let created = a.create_share(a_folder.path(), vec![]).await?;
+    let a_addr = a.endpoint_addr();
+    let share_id = b
+        .add_share(&created.master_key, b_folder.path(), vec![a_addr])
+        .await?;
+    std::fs::write(b_folder.path().join("b.txt"), b"from B")?;
+
+    let mut want = BTreeMap::new();
+    want.insert("a.txt".to_string(), b"from A".to_vec());
+    want.insert("b.txt".to_string(), b"from B".to_vec());
+    converge_two(
+        &mut a,
+        &share_id,
+        a_folder.path(),
+        &mut b,
+        &share_id,
+        b_folder.path(),
+        &want,
+    )
+    .await?;
+
+    // Explicitly re-kick doc live-sync on both members (idempotent self-heal action).
+    a.resync_doc(&share_id).await?;
+    b.resync_doc(&share_id).await?;
+
+    // A fresh change must still propagate both ways after the resync.
+    std::fs::write(a_folder.path().join("c.txt"), b"after resync")?;
+    let mut want = BTreeMap::new();
+    want.insert("a.txt".to_string(), b"from A".to_vec());
+    want.insert("b.txt".to_string(), b"from B".to_vec());
+    want.insert("c.txt".to_string(), b"after resync".to_vec());
+    converge_two(
+        &mut a,
+        &share_id,
+        a_folder.path(),
+        &mut b,
+        &share_id,
+        b_folder.path(),
+        &want,
+    )
+    .await?;
+    println!("doc resync safe: replication still converges");
+
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}

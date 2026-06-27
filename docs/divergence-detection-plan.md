@@ -1,8 +1,8 @@
 # Plan: cross-member divergence detection
 
-Status: **detection + surfacing IMPLEMENTED**; self-heal/deep-verify still pending
-(see "Remaining" below). Companion to the reliability work in
-`docs/distributed-downloads.md` and the gate-poisoning fix.
+Status: **detection + surfacing + self-heal + deep-verify all IMPLEMENTED**. Only a
+positive end-to-end partition test remains (see "Remaining"). Companion to the
+reliability work in `docs/distributed-downloads.md` and the gate-poisoning fix.
 
 ## Implemented
 - `manifest_fingerprint` over the merged latest-per-path `(path → content-hash)` view
@@ -13,17 +13,28 @@ Status: **detection + surfacing IMPLEMENTED**; self-heal/deep-verify still pendi
   (`DIVERGENCE_SETTLE_SECS = 45`); a WARN once per episode; clears on agreement.
 - `ShareStatus::OutOfSync` surfaced in `list_summaries`, the GUI ("⚠ Out of sync —
   members disagree"), and the CLI; per-peer fingerprint added to `PeerInfo`.
-- Loopback test: agreeing masters exchange equal fingerprints and never read
-  `OutOfSync` (false-alarm guard).
+- **Self-heal on persistent divergence**: while out of sync, `finish_reconcile` forces
+  a rate-limited deep verify (`DIVERGENCE_RESCAN_MIN_SECS = 60`) to re-assert local
+  truth / re-materialize, and the daemon re-kicks doc live-sync (`resync_diverged_docs`
+  → `doc.start_sync`) for out-of-sync shares.
+- **Deep verify**: `request_deep_verify` forces a full hashing scan (clears the gate);
+  the daemon runs it periodically (`DEEP_VERIFY_INTERVAL_SECS = 4h`) to catch drift the
+  change-signature misses — e.g. in-place corruption with unchanged size+mtime, or a
+  file deleted on disk while still in the manifest.
+- Tests (loopback): agreeing masters exchange equal fingerprints and never read
+  `OutOfSync` (false-alarm guard); deep verify heals same-size+mtime corruption that a
+  normal reconcile provably misses; `resync_doc` doesn't break replication. Plus the
+  `manifest_fingerprint` unit test.
 
-## Remaining (next)
-- **Self-heal on persistent divergence**: re-bootstrap the doc live-sync + presence
-  mesh and force a reconcile when `OutOfSync` trips (currently we alert; recovery
-  still relies on the normal reconcile/rejoin cadence).
-- **Deep verify**: periodic disk-vs-manifest re-hash (not just blob-presence) to
-  catch the "file deleted on disk but still in the manifest" class.
-- A positive end-to-end test for a sustained partition tripping `OutOfSync` (needs a
-  way to hold a partition open in loopback while keeping presence alive).
+## Remaining
+- A positive end-to-end test for a *sustained* partition tripping `OutOfSync` after
+  the settle window (needs a way to hold a partition open in loopback while keeping
+  presence alive — connected members re-converge in seconds, so it can't be staged
+  with the current harness). The detection's two halves are covered by the fingerprint
+  unit test + the comparison logic; the self-heal is covered by the deep-verify and
+  resync tests.
+- Possible future: make the settle window / deep-verify interval configurable, and
+  scale the window with share size / peer count.
 
 ## Problem
 A member's "health" answers a narrow, local question — *"do I hold the blobs for

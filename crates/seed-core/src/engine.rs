@@ -204,6 +204,16 @@ const SWARM_DEADLINE_SECS: u64 = 300;
 /// a change (the doc replicating across members) settles without a false alarm.
 const DIVERGENCE_SETTLE_SECS: i64 = 45;
 
+/// Periodic "deep verify": how often a share is forced to do a full hashing scan
+/// (disk-vs-manifest), independent of the cheap change-signature, to catch drift the
+/// signature can't see (in-place corruption with unchanged size+mtime, a stale index
+/// after a crash). Low frequency — it re-hashes the whole folder.
+const DEEP_VERIFY_INTERVAL_SECS: i64 = 4 * 3600;
+
+/// While a share is out of sync, how often the self-heal re-asserts local truth via a
+/// forced deep verify. Rate-limited so a large folder isn't re-hashed every tick.
+const DIVERGENCE_RESCAN_MIN_SECS: i64 = 60;
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1378,6 +1388,19 @@ struct ShareState {
     /// Whether we've already logged a WARN for the current divergence episode, to
     /// avoid repeating it every tick. Cleared when agreement returns.
     diverged_alerted: bool,
+    /// Unix seconds of the last forced deep verify (full hashing scan). Paces both
+    /// the periodic verify and the divergence-triggered self-heal rescan.
+    last_deep_verify: i64,
+}
+
+impl ShareState {
+    /// Whether this member's manifest has disagreed with a peer's for longer than
+    /// the settle window (the reported "out of sync" condition).
+    fn is_out_of_sync(&self) -> bool {
+        self.diverged_since
+            .map(|t| now_secs() - t >= DIVERGENCE_SETTLE_SECS)
+            .unwrap_or(false)
+    }
 }
 
 /// The engine owns the iroh node and the set of shares.
@@ -1706,6 +1729,9 @@ impl Engine {
             manifest_fp: 0,
             diverged_since: None,
             diverged_alerted: false,
+            // Stagger the first periodic deep verify a full interval out, so a
+            // restart doesn't re-hash every share immediately.
+            last_deep_verify: now_secs(),
         })
     }
 
@@ -1756,10 +1782,7 @@ impl Engine {
                 // this node holds all of the merged view's content: a master is
                 // the source (always 100); a viewer reports its present/total %.
                 let retrying = s.skipped.len() as u32;
-                let out_of_sync = s
-                    .diverged_since
-                    .map(|t| now_secs() - t >= DIVERGENCE_SETTLE_SECS)
-                    .unwrap_or(false);
+                let out_of_sync = s.is_out_of_sync();
                 let (status, percent, indexed_bytes, index_total) = if s.paused || paused_all {
                     (seed_ipc::ShareStatus::Paused, 0, 0, 0)
                 } else if let Some(&(done, tot)) = progress.get(id) {
@@ -1895,6 +1918,80 @@ impl Engine {
             ));
         }
         out
+    }
+
+    /// Force the next reconcile of `share_id` to do a full hashing scan (deep
+    /// verify): re-examine every file on disk against the manifest rather than
+    /// trusting the cheap change-signature. Catches drift the signature can't see
+    /// (in-place corruption with unchanged size+mtime, a stale index) and re-asserts
+    /// / re-materializes to re-converge. Cheap to request — it just clears the gate.
+    pub fn request_deep_verify(&mut self, share_id: &str) {
+        if let Some(s) = self.shares.get_mut(share_id) {
+            s.last_quick_sig = 0;
+            s.last_deep_verify = now_secs();
+        }
+    }
+
+    /// Force a deep verify of every non-paused share whose last one is older than
+    /// [`DEEP_VERIFY_INTERVAL_SECS`]. Called periodically by the daemon; returns the
+    /// ids that were due (for logging). A no-op for shares verified recently.
+    pub fn periodic_deep_verify(&mut self) -> Vec<String> {
+        let now = now_secs();
+        let due: Vec<String> = self
+            .shares
+            .iter()
+            .filter(|(_, s)| !s.paused && now - s.last_deep_verify >= DEEP_VERIFY_INTERVAL_SECS)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &due {
+            if let Some(s) = self.shares.get_mut(id) {
+                s.last_quick_sig = 0;
+                s.last_deep_verify = now;
+            }
+        }
+        due
+    }
+
+    /// Re-kick a share's doc live-sync against its currently-known peers, in case
+    /// replication stalled. Best-effort: a no-op when no peers are known, and errors
+    /// are returned for the caller to log rather than being fatal.
+    pub async fn resync_doc(&self, share_id: &str) -> anyhow::Result<()> {
+        let self_id = self.node.endpoint.id();
+        let (doc, peers) = {
+            let s = self
+                .shares
+                .get(share_id)
+                .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
+            let peers: Vec<iroh::EndpointAddr> = peer_providers(&s.key, &s.roster)
+                .into_iter()
+                .filter(|pid| *pid != self_id)
+                .map(iroh::EndpointAddr::new)
+                .collect();
+            (s.doc.clone(), peers)
+        };
+        if peers.is_empty() {
+            return Ok(());
+        }
+        doc.start_sync(peers).await.context("resync doc")?;
+        Ok(())
+    }
+
+    /// Self-heal step for the daemon: re-kick doc live-sync for every share that is
+    /// currently out of sync with a peer. Pairs with the forced deep verify done in
+    /// [`finish_reconcile`] (re-assert local truth) to drive re-convergence.
+    pub async fn resync_diverged_docs(&self) {
+        let ids: Vec<String> = self
+            .shares
+            .iter()
+            .filter(|(_, s)| !s.paused && s.is_out_of_sync())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in ids {
+            match self.resync_doc(&id).await {
+                Ok(()) => tracing::info!("re-kicked doc sync for out-of-sync share {id}"),
+                Err(e) => tracing::debug!("resync doc for {id}: {e:#}"),
+            }
+        }
     }
 
     /// Reveal the keys for a share. Returns the master key only when this node
@@ -2091,18 +2188,28 @@ impl Engine {
                 state.diverged_since = Some(now_secs());
             }
             let elapsed = now_secs() - state.diverged_since.unwrap_or_else(now_secs);
-            if elapsed >= DIVERGENCE_SETTLE_SECS && !state.diverged_alerted {
-                state.diverged_alerted = true;
-                tracing::warn!(
-                    "share {share_id}: manifest OUT OF SYNC with peer(s) for {elapsed}s \
-                     (our fp={:016x}; {} online peer(s) disagree) — members hold different \
-                     filesets",
-                    state.manifest_fp,
-                    peer_fps
-                        .iter()
-                        .filter(|fp| **fp != state.manifest_fp)
-                        .count(),
-                );
+            if elapsed >= DIVERGENCE_SETTLE_SECS {
+                if !state.diverged_alerted {
+                    state.diverged_alerted = true;
+                    tracing::warn!(
+                        "share {share_id}: manifest OUT OF SYNC with peer(s) for {elapsed}s \
+                         (our fp={:016x}; {} online peer(s) disagree) — members hold different \
+                         filesets",
+                        state.manifest_fp,
+                        peer_fps
+                            .iter()
+                            .filter(|fp| **fp != state.manifest_fp)
+                            .count(),
+                    );
+                }
+                // Self-heal: force a deep verify (rate-limited) so we re-assert local
+                // truth into the manifest and re-materialize anything missing, instead
+                // of just alerting. The daemon separately re-kicks doc live-sync.
+                if now_secs() - state.last_deep_verify >= DIVERGENCE_RESCAN_MIN_SECS {
+                    state.last_quick_sig = 0;
+                    state.last_deep_verify = now_secs();
+                    tracing::info!("share {share_id}: self-heal — forcing deep verify");
+                }
             }
         } else {
             // Back in agreement (or no comparable peers): clear the episode.

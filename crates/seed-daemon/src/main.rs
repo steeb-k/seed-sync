@@ -285,6 +285,18 @@ async fn reconcile_loop(daemon: Daemon) {
             for rejoin in rejoins {
                 rejoin.join().await;
             }
+            // Self-heal: re-kick doc live-sync for any share that's out of sync with a
+            // peer (pairs with the forced deep verify done inside finish_reconcile),
+            // and run the periodic deep verify for shares due a full disk-vs-manifest
+            // re-check. Both are cheap unless something actually needs healing.
+            daemon.engine.lock().await.resync_diverged_docs().await;
+            let verified = { daemon.engine.lock().await.periodic_deep_verify() };
+            if !verified.is_empty() {
+                tracing::info!(
+                    "periodic deep verify scheduled for {} share(s)",
+                    verified.len()
+                );
+            }
         }
 
         // Fingerprint the visible per-share state (membership counts + status)
