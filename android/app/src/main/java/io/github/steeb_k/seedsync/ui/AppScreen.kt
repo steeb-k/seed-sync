@@ -250,6 +250,7 @@ private fun StatusDot(share: ShareSummary) {
     val color = when {
         share.paused -> Color(0xFF9E9E9E)
         share.status == ShareStatus.ERROR -> Color(0xFFD32F2F)
+        share.status == ShareStatus.OUT_OF_SYNC -> Color(0xFFD32F2F)
         share.status == ShareStatus.HEALTHY -> Color(0xFF2E7D32)
         else -> Color(0xFFF9A825) // syncing / indexing
     }
@@ -264,6 +265,7 @@ private fun statusLabel(share: ShareSummary): String = when {
         ShareStatus.INDEXING -> "Indexing ${share.percent}%"
         ShareStatus.PAUSED -> "Paused"
         ShareStatus.ERROR -> "Error"
+        ShareStatus.OUT_OF_SYNC -> "⚠ Out of sync"
     } + roleSuffix(share.role)
 }
 
