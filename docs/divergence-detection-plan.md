@@ -1,7 +1,29 @@
-# Plan: cross-member divergence detection (next patch)
+# Plan: cross-member divergence detection
 
-Status: **design only** — not implemented. Companion to the reliability work in
+Status: **detection + surfacing IMPLEMENTED**; self-heal/deep-verify still pending
+(see "Remaining" below). Companion to the reliability work in
 `docs/distributed-downloads.md` and the gate-poisoning fix.
+
+## Implemented
+- `manifest_fingerprint` over the merged latest-per-path `(path → content-hash)` view
+  (`engine.rs`); unit-tested (equal iff filesets match; order/ts-insensitive; never 0).
+- Fingerprint broadcast in presence (`Presence.manifest_fp`, serde-default for
+  back-compat) and stored per peer in the roster.
+- Divergence tracking in `finish_reconcile`: `diverged_since` + a settle window
+  (`DIVERGENCE_SETTLE_SECS = 45`); a WARN once per episode; clears on agreement.
+- `ShareStatus::OutOfSync` surfaced in `list_summaries`, the GUI ("⚠ Out of sync —
+  members disagree"), and the CLI; per-peer fingerprint added to `PeerInfo`.
+- Loopback test: agreeing masters exchange equal fingerprints and never read
+  `OutOfSync` (false-alarm guard).
+
+## Remaining (next)
+- **Self-heal on persistent divergence**: re-bootstrap the doc live-sync + presence
+  mesh and force a reconcile when `OutOfSync` trips (currently we alert; recovery
+  still relies on the normal reconcile/rejoin cadence).
+- **Deep verify**: periodic disk-vs-manifest re-hash (not just blob-presence) to
+  catch the "file deleted on disk but still in the manifest" class.
+- A positive end-to-end test for a sustained partition tripping `OutOfSync` (needs a
+  way to hold a partition open in loopback while keeping presence alive).
 
 ## Problem
 A member's "health" answers a narrow, local question — *"do I hold the blobs for

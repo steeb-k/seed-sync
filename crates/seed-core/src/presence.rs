@@ -58,6 +58,12 @@ pub struct Presence {
     /// relay hops / members. `None` only for legacy v1 senders (serde default).
     #[serde(default)]
     pub from: Option<[u8; 32]>,
+    /// Fingerprint of the sender's manifest (latest-per-path → content-hash view).
+    /// Two fully-synced members report the same value; a persistent mismatch means
+    /// they disagree about which files exist. `0` = unknown (older sender that omits
+    /// it, or not yet computed); excluded from divergence comparison.
+    #[serde(default)]
+    pub manifest_fp: u64,
 }
 
 /// Resolve which member a presence message is *from*. Gossip relays rewrite
@@ -235,6 +241,7 @@ mod tests {
             percent: 73,
             ts: 1700,
             from: Some([9u8; 32]),
+            manifest_fp: 0xdead_beef,
         };
         let back = decode(&encode(&p)).unwrap();
         assert_eq!(back.name, "Desktop");
@@ -296,6 +303,7 @@ mod tests {
             percent: 100,
             ts: 0,
             from: Some(*origin.as_bytes()),
+            manifest_fp: 0,
         };
         // delivered_from is the forwarding hop; attribution must ignore it.
         assert_eq!(presence_origin(&p, relay), origin);

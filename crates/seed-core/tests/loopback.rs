@@ -1286,3 +1286,126 @@ async fn two_masters_converge_bidirectionally() -> anyhow::Result<()> {
     b.shutdown().await?;
     Ok(())
 }
+
+/// Cross-member divergence detection must NOT false-alarm on a healthy share: two
+/// masters that agree on the fileset compute the SAME manifest fingerprint, exchange
+/// it via presence, and never enter the "out of sync" state. (The fingerprint's
+/// correctness — different filesets → different fingerprints — is unit-tested in
+/// `engine.rs`. A sustained real partition tripping `OutOfSync` after the settle
+/// window can't be held open in loopback — connected members re-converge in
+/// seconds — so that positive end-to-end path isn't auto-tested here; the
+/// fingerprint unit test plus the comparison logic cover its two halves.)
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn agreeing_masters_share_fingerprint_and_never_out_of_sync() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let mut a = Engine::new(a_data.path()).await?;
+    let mut b = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        a.wait_online().await;
+        b.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    std::fs::write(a_folder.path().join("a.txt"), b"from A")?;
+    let created = a.create_share(a_folder.path(), vec![]).await?;
+    let a_addr = a.endpoint_addr();
+    let share_id = b
+        .add_share(&created.master_key, b_folder.path(), vec![a_addr])
+        .await?;
+    std::fs::write(b_folder.path().join("b.txt"), b"from B")?;
+
+    let mut want = BTreeMap::new();
+    want.insert("a.txt".to_string(), b"from A".to_vec());
+    want.insert("b.txt".to_string(), b"from B".to_vec());
+    converge_two(
+        &mut a,
+        &share_id,
+        a_folder.path(),
+        &mut b,
+        &share_id,
+        b_folder.path(),
+        &want,
+    )
+    .await?;
+
+    // Helper: the fingerprint this engine has received from its (single) peer, and
+    // this engine's own fingerprint, as exposed in the peers list.
+    let peer_fp = |e: &Engine, sid: &str| -> Option<u64> {
+        e.peers(sid)
+            .ok()?
+            .into_iter()
+            .find(|p| p.node_id != "This device")
+            .map(|p| p.manifest_fp)
+    };
+    let self_fp = |e: &Engine, sid: &str| -> Option<u64> {
+        e.peers(sid)
+            .ok()?
+            .into_iter()
+            .find(|p| p.node_id == "This device")
+            .map(|p| p.manifest_fp)
+    };
+
+    // Drive presence both ways (and keep reconciling so the divergence comparison
+    // runs) until each side has received the other's non-zero fingerprint.
+    let res = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            for pb in a.presence_broadcasts() {
+                pb.send().await;
+            }
+            for pb in b.presence_broadcasts() {
+                pb.send().await;
+            }
+            let _ = a.reconcile(&share_id).await;
+            let _ = b.reconcile(&share_id).await;
+            if peer_fp(&a, &share_id).unwrap_or(0) != 0 && peer_fp(&b, &share_id).unwrap_or(0) != 0
+            {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    })
+    .await;
+    res.map_err(|_| anyhow::anyhow!("peers never exchanged manifest fingerprints"))??;
+
+    let a_self = self_fp(&a, &share_id).unwrap();
+    let b_self = self_fp(&b, &share_id).unwrap();
+    assert_ne!(a_self, 0, "fingerprint must be computed");
+    assert_eq!(
+        a_self, b_self,
+        "agreeing masters must compute the same manifest fingerprint"
+    );
+    assert_eq!(
+        peer_fp(&a, &share_id).unwrap(),
+        a_self,
+        "A must see B's fingerprint equal to its own"
+    );
+    assert_eq!(
+        peer_fp(&b, &share_id).unwrap(),
+        b_self,
+        "B must see A's fingerprint equal to its own"
+    );
+
+    for (label, e) in [("A", &a), ("B", &b)] {
+        let s = e
+            .list_summaries()
+            .into_iter()
+            .find(|s| s.share_id == share_id)
+            .expect("share summary");
+        assert!(
+            !format!("{:?}", s.status).contains("OutOfSync"),
+            "{label} must not read OutOfSync when members agree (status {:?})",
+            s.status
+        );
+    }
+    println!("divergence false-alarm guard OK: matching fingerprints exchanged, no OutOfSync");
+
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}

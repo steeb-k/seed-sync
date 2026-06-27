@@ -170,6 +170,10 @@ pub enum ShareStatus {
     Indexing,
     Paused,
     Error,
+    /// This member's manifest has disagreed with an online peer's for longer than
+    /// the settle window: members hold different filesets. Surfaced distinctly so a
+    /// silent multi-member divergence can't hide behind "Healthy".
+    OutOfSync,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +216,9 @@ pub struct PeerInfo {
     /// Sync health 0..=100 (100 = fully caught up; lower while downloading or
     /// behind on an older version).
     pub percent: u8,
+    /// This member's manifest fingerprint (0 = unknown). Members that agree on the
+    /// fileset share the same value; a different value means this member disagrees.
+    pub manifest_fp: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1187,6 +1187,7 @@ fn status_text(s: &ShareSummary) -> String {
         }
         ShareStatus::Paused => "Paused".into(),
         ShareStatus::Error => "Error".into(),
+        ShareStatus::OutOfSync => "⚠ Out of sync — members disagree".into(),
     }
 }
 

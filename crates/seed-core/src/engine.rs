@@ -67,6 +67,8 @@ struct PeerEntry {
     role: Option<seed_ipc::Role>,
     seqno: u64,
     percent: u8,
+    /// Peer's manifest fingerprint from its last presence (0 = unknown/not reported).
+    manifest_fp: u64,
 }
 
 impl PeerRoster {
@@ -93,6 +95,7 @@ impl PeerRoster {
         e.role = Some(p.role);
         e.seqno = p.seqno;
         e.percent = p.percent;
+        e.manifest_fp = p.manifest_fp;
     }
 
     fn is_online(&self, e: &PeerEntry, now: i64) -> bool {
@@ -114,6 +117,17 @@ impl PeerRoster {
             .iter()
             .filter(|(_, e)| self.is_online(e, now))
             .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    /// Known manifest fingerprints of currently-online peers, excluding `0`
+    /// (unknown / not yet reported). Used to detect cross-member divergence.
+    fn online_manifest_fps(&self) -> Vec<u64> {
+        let now = now_secs();
+        self.peers
+            .values()
+            .filter(|e| self.is_online(e, now) && e.manifest_fp != 0)
+            .map(|e| e.manifest_fp)
             .collect()
     }
 
@@ -139,6 +153,7 @@ impl PeerRoster {
                 last_seen: e.last_seen,
                 have_seqno: e.seqno,
                 percent: e.percent,
+                manifest_fp: e.manifest_fp,
             })
             .collect()
     }
@@ -183,6 +198,11 @@ const SWARM_ROUND_BACKOFF_MS: u64 = 400;
 /// attempt resumes rather than restarting. Bounds the worst case (a peer that
 /// can't actually be reached) without losing progress.
 const SWARM_DEADLINE_SECS: u64 = 300;
+
+/// How long a manifest disagreement with an online peer must persist before the
+/// share is reported "out of sync". Long enough that normal propagation lag after
+/// a change (the doc replicating across members) settles without a false alarm.
+const DIVERGENCE_SETTLE_SECS: i64 = 45;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -575,6 +595,35 @@ async fn swarm_download(
     }
 }
 
+/// Deterministic fingerprint of the merged "desired files" view — the latest-per-
+/// path `(path → content-hash)` set. Two members whose manifests fully agree compute
+/// the SAME value; any disagreement about which files exist (or their hashes) yields
+/// a different value. It's over the manifest only (not download progress), so a file
+/// still transferring doesn't change it. Returns a non-zero u64 (even for an empty
+/// view), reserving `0` as the "unknown / not reported" sentinel on the wire.
+fn manifest_fingerprint(remote: &HashMap<String, RemoteEntry>) -> u64 {
+    let mut entries: Vec<(&str, &[u8])> = remote
+        .iter()
+        .map(|(p, re)| (p.as_str(), re.hash.as_slice()))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    let mut h = blake3::Hasher::new();
+    h.update(b"seed-sync/manifest-fp/v1");
+    for (path, hash) in entries {
+        h.update(path.as_bytes());
+        h.update(&[0u8]);
+        h.update(hash);
+        h.update(&[0u8]);
+    }
+    let fp = u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap());
+    // Never return the 0 sentinel (vanishingly unlikely, but keep it impossible).
+    if fp == 0 {
+        1
+    } else {
+        fp
+    }
+}
+
 /// Convert a 32-byte hash slice into an iroh [`Hash`].
 fn to_hash(bytes: &[u8]) -> anyhow::Result<Hash> {
     let arr: [u8; 32] = bytes.try_into().context("bad hash len")?;
@@ -608,6 +657,9 @@ pub struct ReconcileOutcome {
     /// another process, permission denied). Carried back into [`ShareState`] and
     /// retried cheaply every tick — see [`ReconcileJob::prev_skipped`].
     skipped: Vec<String>,
+    /// Fingerprint of the merged manifest this pass, broadcast in presence and
+    /// compared across members to detect divergence. See [`manifest_fingerprint`].
+    manifest_fp: u64,
 }
 
 impl ReconcileOutcome {
@@ -1278,6 +1330,7 @@ impl ReconcileJob {
             index_dels,
             reclaim,
             skipped: still_skipped,
+            manifest_fp: manifest_fingerprint(&remote),
         })
     }
 }
@@ -1314,6 +1367,17 @@ struct ShareState {
     /// fed into the next [`ReconcileJob`] so they're retried cheaply until readable.
     /// In-memory only — rediscovered by the first full scan after a restart.
     skipped: Vec<String>,
+    /// This member's manifest fingerprint (latest reconcile). Broadcast in presence
+    /// and compared with peers' to detect cross-member divergence.
+    manifest_fp: u64,
+    /// Unix seconds since which this member's fingerprint has disagreed with an
+    /// online peer's, or `None` while in agreement. Only a disagreement that
+    /// persists past [`DIVERGENCE_SETTLE_SECS`] is reported (so normal propagation
+    /// lag doesn't false-alarm).
+    diverged_since: Option<i64>,
+    /// Whether we've already logged a WARN for the current divergence episode, to
+    /// avoid repeating it every tick. Cleared when agreement returns.
+    diverged_alerted: bool,
 }
 
 /// The engine owns the iroh node and the set of shares.
@@ -1639,6 +1703,9 @@ impl Engine {
             health: 0,
             presence,
             skipped: Vec::new(),
+            manifest_fp: 0,
+            diverged_since: None,
+            diverged_alerted: false,
         })
     }
 
@@ -1689,11 +1756,19 @@ impl Engine {
                 // this node holds all of the merged view's content: a master is
                 // the source (always 100); a viewer reports its present/total %.
                 let retrying = s.skipped.len() as u32;
+                let out_of_sync = s
+                    .diverged_since
+                    .map(|t| now_secs() - t >= DIVERGENCE_SETTLE_SECS)
+                    .unwrap_or(false);
                 let (status, percent, indexed_bytes, index_total) = if s.paused || paused_all {
                     (seed_ipc::ShareStatus::Paused, 0, 0, 0)
                 } else if let Some(&(done, tot)) = progress.get(id) {
                     let pct = (done.min(tot) * 100).checked_div(tot).unwrap_or(0) as u8;
                     (seed_ipc::ShareStatus::Indexing, pct, done, tot)
+                } else if out_of_sync {
+                    // Members disagree on the fileset past the settle window — the most
+                    // serious steady-state condition; never read "Healthy".
+                    (seed_ipc::ShareStatus::OutOfSync, s.health, 0, 0)
                 } else if retrying > 0 {
                     // Files we can't read/publish yet (locked/unreadable) are being
                     // retried — the share is NOT settled even if content % looks full.
@@ -1746,6 +1821,7 @@ impl Engine {
             last_seen: now_secs(),
             have_seqno: state.last_seqno,
             percent: state.health,
+            manifest_fp: state.manifest_fp,
         }];
         out.extend(state.roster.lock().map(|r| r.infos()).unwrap_or_default());
         Ok(out)
@@ -1777,6 +1853,7 @@ impl Engine {
                 // Stamp our own endpoint id so receivers attribute this presence to
                 // us directly, not to whichever member relayed it through the swarm.
                 from: Some(self.node.endpoint_id_bytes()),
+                manifest_fp: s.manifest_fp,
             };
             out.push(crate::presence::PresenceBroadcast::new(
                 h.sender.clone(),
@@ -1990,12 +2067,50 @@ impl Engine {
         state.publishing = false;
         state.health = out.health;
         state.skipped = out.skipped;
+        state.manifest_fp = out.manifest_fp;
         state.last_quick_sig = out.new_quick_sig;
         let _ = self.db.set_quick_sig(share_id, out.new_quick_sig);
         if out.changed {
             state.last_seqno = state.last_seqno.saturating_add(1);
             state.last_updated = now_secs();
             let _ = self.db.set_seqno(share_id, state.last_seqno);
+        }
+
+        // Cross-member divergence: compare our manifest fingerprint with online
+        // peers'. Persistent disagreement (past the settle window) is reported as
+        // "out of sync"; transient disagreement during normal propagation clears
+        // before the window and never alarms.
+        let peer_fps = state
+            .roster
+            .lock()
+            .map(|r| r.online_manifest_fps())
+            .unwrap_or_default();
+        let disagrees = peer_fps.iter().any(|fp| *fp != state.manifest_fp);
+        if disagrees {
+            if state.diverged_since.is_none() {
+                state.diverged_since = Some(now_secs());
+            }
+            let elapsed = now_secs() - state.diverged_since.unwrap_or_else(now_secs);
+            if elapsed >= DIVERGENCE_SETTLE_SECS && !state.diverged_alerted {
+                state.diverged_alerted = true;
+                tracing::warn!(
+                    "share {share_id}: manifest OUT OF SYNC with peer(s) for {elapsed}s \
+                     (our fp={:016x}; {} online peer(s) disagree) — members hold different \
+                     filesets",
+                    state.manifest_fp,
+                    peer_fps
+                        .iter()
+                        .filter(|fp| **fp != state.manifest_fp)
+                        .count(),
+                );
+            }
+        } else {
+            // Back in agreement (or no comparable peers): clear the episode.
+            if state.diverged_alerted {
+                tracing::info!("share {share_id}: manifest back in sync with peers");
+            }
+            state.diverged_since = None;
+            state.diverged_alerted = false;
         }
     }
 
@@ -2255,4 +2370,65 @@ fn prune_empty_dirs(root: &Path) {
         }
     }
     visit(root, root);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn re(hash: &[u8], size: u64) -> RemoteEntry {
+        RemoteEntry {
+            hash: hash.to_vec(),
+            size,
+            ts: 0,
+        }
+    }
+
+    /// The fingerprint is the whole basis of divergence detection: it must be equal
+    /// exactly when two members agree on the fileset (path → content-hash), and it
+    /// must be insensitive to map order and to LWW timestamps. A wrong fingerprint
+    /// here would mean either silent missed divergence or constant false alarms.
+    #[test]
+    fn manifest_fingerprint_matches_iff_filesets_match() {
+        let mut a = HashMap::new();
+        a.insert("docs/x.txt".to_string(), re(&[1u8; 32], 10));
+        a.insert("y.bin".to_string(), re(&[2u8; 32], 20));
+
+        // Same entries, different insertion order, different ts → same fingerprint.
+        let mut b = HashMap::new();
+        b.insert("y.bin".to_string(), {
+            let mut e = re(&[2u8; 32], 20);
+            e.ts = 9999;
+            e
+        });
+        b.insert("docs/x.txt".to_string(), re(&[1u8; 32], 10));
+        assert_eq!(
+            manifest_fingerprint(&a),
+            manifest_fingerprint(&b),
+            "agreeing manifests must fingerprint equal (order/ts-insensitive)"
+        );
+
+        // Different content hash for a path → different fingerprint.
+        let mut c = HashMap::new();
+        c.insert("docs/x.txt".to_string(), re(&[9u8; 32], 10));
+        c.insert("y.bin".to_string(), re(&[2u8; 32], 20));
+        assert_ne!(
+            manifest_fingerprint(&a),
+            manifest_fingerprint(&c),
+            "a changed content hash must change the fingerprint"
+        );
+
+        // Different fileset (a missing file) → different fingerprint.
+        let mut d = HashMap::new();
+        d.insert("docs/x.txt".to_string(), re(&[1u8; 32], 10));
+        assert_ne!(
+            manifest_fingerprint(&a),
+            manifest_fingerprint(&d),
+            "a different fileset must change the fingerprint"
+        );
+
+        // Never the 0 (= "unknown") sentinel, even for an empty view.
+        let empty: HashMap<String, RemoteEntry> = HashMap::new();
+        assert_ne!(manifest_fingerprint(&empty), 0);
+    }
 }

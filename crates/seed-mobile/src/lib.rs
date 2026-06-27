@@ -76,6 +76,7 @@ pub enum ShareStatus {
     Indexing,
     Paused,
     Error,
+    OutOfSync,
 }
 
 impl From<seed_ipc::ShareStatus> for ShareStatus {
@@ -86,6 +87,7 @@ impl From<seed_ipc::ShareStatus> for ShareStatus {
             seed_ipc::ShareStatus::Indexing => ShareStatus::Indexing,
             seed_ipc::ShareStatus::Paused => ShareStatus::Paused,
             seed_ipc::ShareStatus::Error => ShareStatus::Error,
+            seed_ipc::ShareStatus::OutOfSync => ShareStatus::OutOfSync,
         }
     }
 }
@@ -335,8 +337,7 @@ impl MobileEngine {
     /// `RevealKeys`.
     pub fn reveal_keys(&self, share_id: String) -> Result<ShareKeys> {
         self.rt.block_on(async {
-            let (master_key, viewer_key) =
-                self.inner.engine.lock().await.reveal_keys(&share_id)?;
+            let (master_key, viewer_key) = self.inner.engine.lock().await.reveal_keys(&share_id)?;
             Ok(ShareKeys {
                 master_key,
                 viewer_key,
@@ -346,11 +347,7 @@ impl MobileEngine {
 
     pub fn pause(&self, share_id: String) -> Result<()> {
         self.rt.block_on(async {
-            self.inner
-                .engine
-                .lock()
-                .await
-                .set_paused(&share_id, true)?;
+            self.inner.engine.lock().await.set_paused(&share_id, true)?;
             self.inner.listener.on_share_list_changed();
             Ok(())
         })
