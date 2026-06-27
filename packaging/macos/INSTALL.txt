@@ -35,7 +35,7 @@ Install options:
     ./seed-sync --install --no-auto-update    don't enable the daily update agent
     ./seed-sync --install --no-gui-autostart  don't auto-launch the tray GUI at login
 
-Requirements: macOS 14+ (Sonoma); universal build runs on Apple Silicon and
+Requirements: macOS 11+ (Big Sur); universal build runs on Apple Silicon and
 Intel. No Homebrew or other runtime needed — everything is bundled. Ensure
 ~/.local/bin is on your PATH (add
 `export PATH="$HOME/.local/bin:$PATH"` to your shell profile if it isn't).

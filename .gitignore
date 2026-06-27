@@ -10,6 +10,9 @@
 **/iroh-data/
 /scratch/
 
+# macOS packaging: conda-forge GTK envs (created by scripts/setup-conda-macos.sh)
+/.conda-gtk/
+
 # Windows packaging artifacts
 /dist/
 /gtk-runtime/

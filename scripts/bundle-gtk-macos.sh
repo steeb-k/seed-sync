@@ -24,8 +24,9 @@
 #   6. Compile the GSettings schemas (gtk4/glib/libadwaita) into share/.
 #   7. Bundle the fontconfig config.
 #
-# Homebrew GTK references its C siblings by absolute /opt/homebrew/opt/<f>/lib/<n>
-# paths; its Rust-built dylibs (librsvg) use @rpath/<name>. Both are handled.
+# Source-agnostic: a conda-forge env (what we ship from — minos 11) references
+# siblings via @rpath/@loader_path; a Homebrew prefix uses absolute
+# /opt/homebrew/opt/<f>/lib/<n> plus @rpath (librsvg). All are handled.
 # bash 3.2 compatible (macOS system bash) — no associative arrays.
 set -euo pipefail
 
@@ -35,10 +36,17 @@ STAGE="$(cd "$STAGE" && pwd)"
 # tarball tree; "MacOS" when STAGE is a .app's Contents/ (set BUNDLE_BINDIR=MacOS).
 BINDIR="${BUNDLE_BINDIR:-bin}"
 BIN="$STAGE/$BINDIR"
-# Homebrew prefix to source dylibs from. Defaults to the active brew (arm64
-# /opt/homebrew); BUNDLE_BREW=/usr/local points it at the x86_64 brew for the
-# universal2 x86_64 pass.
-BREW="${BUNDLE_BREW:-$(brew --prefix)}"
+# Prefix to source the GTK closure from. Despite the legacy name `BREW`, this is
+# any prefix with the usual lib/ share/ etc/ layout: a Homebrew prefix, or a
+# conda-forge env (which is what we ship from — its dylibs carry a macOS-11 minos
+# regardless of the build host's OS). Resolution order:
+#   BUNDLE_PREFIX  (conda env or any prefix; preferred)
+#   BUNDLE_BREW    (legacy alias; the x86_64 brew at /usr/local for old universal)
+#   `brew --prefix` (active Homebrew, if present)
+# conda's flat lib/ is a subset of Homebrew's keg-only tree, so one resolver covers
+# both — the Homebrew-only $BREW/opt/* fallbacks simply no-op on a conda env.
+BREW="${BUNDLE_PREFIX:-${BUNDLE_BREW:-$(brew --prefix 2>/dev/null || true)}}"
+[ -n "$BREW" ] || die "no source prefix (set BUNDLE_PREFIX=<conda env or brew prefix>)"
 LIBDIR="$STAGE/lib"
 LOADER_REL="lib/gdk-pixbuf-2.0/2.10.0/loaders"
 LOADERDIR="$STAGE/$LOADER_REL"
@@ -56,21 +64,24 @@ mkdir -p "$LIBDIR" "$LOADERDIR" "$SCHEMA_DST"
 # Resolve a (possibly symlinked) path to its real file, dependency-free.
 realof() { perl -MCwd -e 'print Cwd::abs_path($ARGV[0]), "\n"' "$1"; }
 
-# Each non-system dependency load string of a Mach-O: absolute /opt/homebrew ones
-# and @rpath/ ones (Homebrew's Rust dylibs, e.g. librsvg, use @rpath). System libs
-# (/usr/lib, /System) and already-relative @loader_path/@executable_path refs are
-# skipped.
+# Each non-system dependency load string of a Mach-O: absolute prefix paths
+# (/opt/homebrew or the conda env), @rpath/ ones (Homebrew's & conda's relocatable
+# dylibs), and @loader_path/ ones (conda uses these for some intra-prefix deps).
+# System libs (/usr/lib, /System) and already-bundled @executable_path refs are
+# skipped (resolve_dep maps the rest to real files by basename).
 nonsys_deps() {
   otool -L "$1" | tail -n +2 | awk '{print $1}' | while IFS= read -r d; do
     case "$d" in
-      "$BREW"/*) printf '%s\n' "$d" ;;
-      @rpath/*)  printf '%s\n' "$d" ;;
+      "$BREW"/*)      printf '%s\n' "$d" ;;
+      @rpath/*)       printf '%s\n' "$d" ;;
+      @loader_path/*) printf '%s\n' "$d" ;;
     esac
   done
 }
 
-# Resolve a dependency load string to a real file on disk. Absolute brew paths
-# resolve directly; @rpath/<name> is searched in Homebrew's lib dirs by basename.
+# Resolve a dependency load string to a real file on disk. Absolute prefix paths
+# resolve directly; @rpath/<name> and @loader_path/<name> are searched by basename
+# under the prefix's lib/ (conda: flat lib/; Homebrew: lib/ then keg-only opt/*/lib).
 # Echoes nothing if unresolved.
 resolve_dep() {
   local d="$1" base hit
@@ -171,14 +182,33 @@ for b in seed-gui seed-daemon seed-cli; do
   [ -f "$BIN/$b" ] && codesign --force --sign - --timestamp=none "$BIN/$b" >/dev/null 2>&1
 done
 
+# Steps 5–7 (loaders.cache, schemas, fontconfig) produce arch-independent files.
+# In the universal x86_64 pass they'd be redundant (the arm64 pass already wrote
+# them into the base tree) AND would force running x86_64 query-loaders under
+# Rosetta — so package-macos.sh sets BUNDLE_SKIP_AUX=1 there. Only the x86_64 dylib
+# closure (steps 1–4 above) is needed from that pass for the lipo merge.
+if [ "${BUNDLE_SKIP_AUX:-0}" = 1 ]; then
+  log "BUNDLE_SKIP_AUX=1 — skipping loaders.cache/schemas/fontconfig (reusing base tree's)"
+  log "OK — dylib closure only ($(du -sh "$LIBDIR" | awk '{print $1}') in lib/)"
+  exit 0
+fi
+
+# Tool discovery: prefer the prefix's own bin/ (correct version & arch for this
+# closure) over whatever happens to be first on PATH (e.g. an unrelated Homebrew).
+find_tool() { # <name> [legacy keg-only relpath]
+  local name="$1" keg="${2:-}"
+  [ -x "$BREW/bin/$name" ] && { printf '%s\n' "$BREW/bin/$name"; return; }
+  [ -n "$keg" ] && [ -x "$BREW/$keg" ] && { printf '%s\n' "$BREW/$keg"; return; }
+  command -v "$name" 2>/dev/null || true
+}
+
 # --- 5. gdk-pixbuf loaders.cache. query-loaders dlopens each (now relocated +
 # signed) module to read its format info, so @executable_path must resolve to the
 # bundle: run a *temporary* copy of query-loaders from the stage's bindir (where
 # @executable_path/../lib == our lib/). Relative module names (loaders/<name>) are
 # resolved at runtime via GDK_PIXBUF_MODULEDIR (set by setup_runtime_env). ---
-QUERY="$(command -v gdk-pixbuf-query-loaders || true)"
-[ -n "$QUERY" ] || QUERY="$BREW/opt/gdk-pixbuf/bin/gdk-pixbuf-query-loaders"
-if [ -x "$QUERY" ]; then
+QUERY="$(find_tool gdk-pixbuf-query-loaders opt/gdk-pixbuf/bin/gdk-pixbuf-query-loaders)"
+if [ -n "$QUERY" ] && [ -x "$QUERY" ]; then
   cp -f "$QUERY" "$BIN/.query-loaders"
   ( cd "$LOADERDIR" && GDK_PIXBUF_MODULEDIR=. "$BIN/.query-loaders" ./*.so ) > "$CACHE"
   rm -f "$BIN/.query-loaders"
@@ -187,24 +217,28 @@ else
   log "WARNING: gdk-pixbuf-query-loaders not found; loaders.cache not generated"
 fi
 
-# --- 6. GSettings schemas: collect the XML from gtk4/glib/libadwaita, compile. ---
+# --- 6. GSettings schemas: collect the XML, compile. conda keeps all schemas in
+# one share/glib-2.0/schemas; Homebrew splits them per keg-only formula. Cover both. ---
+SCHEMA_SRCS=("$BREW/share/glib-2.0/schemas")
 for pkg in gtk4 glib libadwaita; do
-  src="$BREW/opt/$pkg/share/glib-2.0/schemas"
+  SCHEMA_SRCS+=("$BREW/opt/$pkg/share/glib-2.0/schemas")
+done
+for src in "${SCHEMA_SRCS[@]}"; do
   [ -d "$src" ] || continue
   for x in "$src"/*.gschema.xml "$src"/*.enums.xml; do
     [ -e "$x" ] && cp -f "$(realof "$x")" "$SCHEMA_DST/$(basename "$x")"
   done
 done
-COMPILE="$(command -v glib-compile-schemas || true)"
-[ -n "$COMPILE" ] || COMPILE="$BREW/opt/glib/bin/glib-compile-schemas"
+COMPILE="$(find_tool glib-compile-schemas opt/glib/bin/glib-compile-schemas)"
+[ -n "$COMPILE" ] || die "glib-compile-schemas not found"
 "$COMPILE" "$SCHEMA_DST" || die "glib-compile-schemas failed"
 log "compiled $(ls "$SCHEMA_DST"/*.xml 2>/dev/null | wc -l | tr -d ' ') schemas"
 
 # --- 7. fontconfig config: the bundled libfontconfig's compiled-in config dir is
-# under the Homebrew prefix (absent on a user's Mac). Ship the Homebrew fonts.conf
+# under the build prefix (absent on a user's Mac). Ship the prefix's fonts.conf
 # (it points at the system macOS font dirs, present everywhere); setup_runtime_env
 # sets FONTCONFIG_PATH to find it. conf.d includes are ignore_missing, and the
-# stale Homebrew cachedir falls through to the xdg ~/.cache/fontconfig entry. ---
+# stale build-prefix cachedir falls through to the xdg ~/.cache/fontconfig entry. ---
 if [ -f "$BREW/etc/fonts/fonts.conf" ]; then
   mkdir -p "$STAGE/etc/fonts"
   cp -f "$BREW/etc/fonts/fonts.conf" "$STAGE/etc/fonts/fonts.conf"

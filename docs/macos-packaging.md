@@ -1,14 +1,16 @@
 # macOS packaging, distribution & auto-update — maintainer guide
 
-> **Status: BUILT (universal2), 2026-06-20.** Bring-up checklist 0–4 are done and verified on Apple
+> **Status: BUILT, floor macOS 11, 2026-06-27.** Bring-up checklist 0–4 are done and verified on Apple
 > Silicon (see `docs/cross-os-testing.md` → [MACOS]). The build → bundle → `.app` → install →
-> launchd → update flow works end-to-end, including a `sandbox-exec` "no Homebrew" proof. **Universal2
-> (arm64 + x86_64) is built and verified** (needs a second x86_64 Homebrew at `/usr/local`). Still
-> open: publishing the macOS asset to `seed-sync-binaries` from the local Mac build, the unified
-> hosted bootstrap, and the live cross-OS sync runs. One design change from the original plan:
-> we ship a **`SEED Sync.app` bundle _inside_ the curl|sh tarball** (installed to `~/Applications`)
-> rather than loose binaries — this keeps the quarantine dodge while giving a real Dock/Applications
-> icon. Details below; `_(planned)_` markers remain only on what's genuinely not built.
+> launchd → update flow works end-to-end, including a `sandbox-exec` "no build-time libs" proof.
+> **GTK is now sourced from conda-forge, not Homebrew** — its dylibs carry a `minos` of macOS 11
+> regardless of the build host, so releases are cut **manually on any Mac** (no `macos-14` CI runner,
+> no second x86_64 Homebrew/Rosetta). Build with `scripts/setup-conda-macos.sh [--universal]` then
+> `scripts/package-macos.sh`. The minimum-version section below has the full rationale. One design
+> change from the original plan: we ship a **`SEED Sync.app` bundle _inside_ the curl|sh tarball**
+> (installed to `~/Applications`) rather than loose binaries — this keeps the quarantine dodge while
+> giving a real Dock/Applications icon. Details below; `_(planned)_` markers remain only on what's
+> genuinely not built.
 
 ## Why the Linux model, not a `.dmg`/`.pkg`
 
@@ -59,8 +61,9 @@ version bump per release**. Asset name convention: **`seed-sync-<ver>-macos-univ
 
 | File | Purpose |
 |---|---|
-| `scripts/package-macos.sh` ✅ | The macOS analog of `scripts/package-linux.sh`: `cargo build --release`, build the **`SEED Sync.app`** (binaries → `Contents/MacOS`), run the bundler over `Contents/`, write `Info.plist` + `Resources/AppIcon.icns` (sips + iconutil from `icon/appIcon.png`), seal the bundle, tar `dist/seed-sync-<ver>-macos-<arch>.tar.gz`. `--skip-build` to repackage. Builds universal2 when an x86_64 brew at `/usr/local` is present, else arm64. |
-| `scripts/bundle-gtk-macos.sh` ✅ | The hard part: walk the `seed-gui` otool closure + the gdk-pixbuf/librsvg loader modules, copy every non-system dylib into `lib/`, rewrite install names to `@executable_path/../lib` (handles absolute `/opt/homebrew/*` **and** `@rpath/*` — librsvg uses `@rpath`), regenerate `loaders.cache`, compile GSettings schemas, bundle the fontconfig config, **ad-hoc re-sign** inside-out. `BUNDLE_BINDIR=MacOS` targets a `.app`'s `Contents/`. No icon theme needed (GTK4 embeds its icons). |
+| `scripts/setup-conda-macos.sh` ✅ | Creates the conda-forge GTK env(s) the packager bundles from — `osx-arm64` (and `osx-64` with `--universal`) at `.conda-gtk/`. conda-forge's macOS-11-SDK builds are what set the floor at macOS 11 regardless of the build host. Needs conda/mamba/micromamba (miniforge). |
+| `scripts/package-macos.sh` ✅ | The macOS analog of `scripts/package-linux.sh`: `cargo build --release` (pkg-config → conda env, `MACOSX_DEPLOYMENT_TARGET=11.0`), build the **`SEED Sync.app`** (binaries → `Contents/MacOS`), run the bundler over `Contents/`, write `Info.plist` + `Resources/AppIcon.icns` (sips + iconutil from `icon/appIcon.png`), seal the bundle, tar `dist/seed-sync-<ver>-macos-<arch>.tar.gz`. `--skip-build` to repackage. Builds universal when the `osx-64` conda env is present, else arm64. |
+| `scripts/bundle-gtk-macos.sh` ✅ | The hard part: walk the `seed-gui` otool closure + the gdk-pixbuf/librsvg loader modules, copy every non-system dylib into `lib/`, rewrite install names to `@executable_path/../lib` (handles `@rpath/*`, `@loader_path/*`, and absolute-prefix refs), regenerate `loaders.cache`, compile GSettings schemas, bundle the fontconfig config, **ad-hoc re-sign** inside-out. Source-agnostic via `BUNDLE_PREFIX` (a conda env; or `BUNDLE_BREW`/`brew --prefix` for Homebrew). `BUNDLE_BINDIR=MacOS` targets a `.app`'s `Contents/`; `BUNDLE_SKIP_AUX=1` does the dylib closure only (universal x86_64 pass). No icon theme needed (GTK4 embeds its icons). |
 | `packaging/macos/seed-sync` ✅ | The wrapper — install/update/uninstall/status, per-user, via `launchctl bootstrap/bootout`. Installs the `.app` to `~/Applications`, symlinks the CLI into `~/.local/bin`. |
 | `packaging/macos/Info.plist` ✅ | App bundle metadata (`CFBundleExecutable=seed-gui`, `CFBundleIconFile=AppIcon`, identifier, `__VERSION__` rewritten from Cargo). What makes NSBundle resolve → the Dock/Applications icon. |
 | `packaging/macos/web-install.sh` ✅ | `curl \| sh` bootstrap; selects the macOS asset, unpacks, runs `SEED Sync.app`'s sibling `seed-sync --install`. **Dodges quarantine.** (Superseded for hosting by the unified cross-OS `packaging/web-install.sh` — _planned_.) |
@@ -107,9 +110,11 @@ resolve through a symlink — `setup_runtime_env` calls `fs::canonicalize` so th
 
 ## The bundling process (the hard part) _(planned)_
 
-1. **Build** for `aarch64-apple-darwin` (and later `x86_64-apple-darwin`) against Homebrew GTK.
+1. **Build** for `aarch64-apple-darwin` (and later `x86_64-apple-darwin`) against the conda-forge GTK
+   env (pkg-config → `$ENV/lib/pkgconfig`; `MACOSX_DEPLOYMENT_TARGET=11.0`).
 2. **Walk the dylib closure** of `seed-gui` (`otool -L`, recursively) and copy every non-system
-   dylib (everything under the Homebrew prefix; skip `/usr/lib`, `/System/...`) into `lib/`.
+   dylib (everything under the env prefix / `@rpath` / `@loader_path`; skip `/usr/lib`, `/System/...`)
+   into `lib/`.
 3. **Relocate**: for each copied dylib and each binary, `install_name_tool -change <old> \
    @executable_path/../lib/<name>` for every Homebrew reference, and `-id @executable_path/../lib/<name>`
    on the dylib itself. Add an `@executable_path/../lib` rpath.
@@ -127,59 +132,109 @@ resolve through a symlink — `setup_runtime_env` calls `fs::canonicalize` so th
 
 ## Universal2 (built)
 
-`package-macos.sh` builds universal when an x86_64 Homebrew (`/usr/local`) + the x86_64 Rust target are
-present (else it falls back to arm64-only). It builds both Rust slices, bundles each arch's GTK closure
+`package-macos.sh` builds universal when the `osx-64` conda env + the x86_64 Rust target are present
+(else it falls back to arm64-only). It builds both Rust slices, bundles each arch's GTK closure
 separately, then `lipo`s every Mach-O (binaries + dylibs + pixbuf loaders) into the arm64 `.app` and
-re-signs inside-out (lipo invalidates the ad-hoc signature). Verified: fat (arm64+x86_64) binaries +
-all 57 dylibs, both slices run (native + Rosetta), both self-contained under a no-Homebrew sandbox.
+re-signs inside-out (lipo invalidates the ad-hoc signature).
 
-- **Two Homebrew prefixes** — arm64 (`/opt/homebrew`) auto, x86_64 under Rosetta at `/usr/local`
-  (bootstrap needs sudo; `arch -x86_64 brew install gtk4 libadwaita pkg-config`). Use the **same GTK
-  version** in both (here 4.22.4 / libadwaita 1.9.1) so the dylib sets match for `lipo`.
-- **x86_64 cross-build pkg-config:** set `PKG_CONFIG_LIBDIR` (replaces the default search → no arm64
-  leak) to the x86_64 brew's per-formula `opt/*/lib/pkgconfig` (keg-only) + `lib`/`share/pkgconfig` +
-  `Homebrew/Library/Homebrew/os/mac/pkgconfig/<macOS-major>` (system-lib stubs: zlib/libffi/expat/…),
-  plus `PKG_CONFIG_ALLOW_CROSS=1`. Without the per-version stubs dir, gobject/cairo/fontconfig fail to
-  resolve their system deps.
-- **Build host floor:** the bundled GTK dylibs carry the `minos` of whatever Mac you build on, so the
-  build host's macOS version sets the floor (see below). Building locally on an older Mac is exactly how
-  you reach a lower floor than a hosted runner allowed.
+- **Two conda envs** — `osx-arm64` and `osx-64`, both from conda-forge (`scripts/setup-conda-macos.sh
+  --universal`). Use the **same GTK version** in both so the dylib sets match for `lipo` (conda-forge
+  resolves the same latest build for each subdir). No Rosetta or sudo needed to *create* the envs.
+- **x86_64 cross-build pkg-config:** `PKG_CONFIG_LIBDIR=$X86_ENV/lib/pkgconfig` (replaces the default
+  search → no arm64 leak) + `PKG_CONFIG_ALLOW_CROSS=1`. conda keeps every `.pc` in one
+  `lib/pkgconfig`, so there's no keg-only fan-out or system-stub dir to assemble (unlike Homebrew).
+- **x86_64 bundle pass** runs with `BUNDLE_SKIP_AUX=1`: `loaders.cache`, compiled schemas, and
+  fontconfig are arch-independent and already written by the arm64 pass, so the x86_64 pass only walks
+  + relocates the dylib closure for the `lipo` — and never needs to run x86_64 tools under Rosetta.
 
-## Building universal locally on a Mac
+## Building a release (manual, current method)
 
-Releases are built on the maintainer's Mac (there is no CI). `scripts/package-macos.sh` produces the
-**universal** tarball by bundling both arch slices; it auto-detects a second x86_64 Homebrew and `lipo`s
-everything. One-time setup on the build Mac:
+Releases are cut manually with the conda-forge pipeline. One-time per machine: install miniforge
+(or any conda/mamba/micromamba) — https://github.com/conda-forge/miniforge.
 
-- `brew install gtk4 libadwaita pkg-config` (arm64, the default Homebrew at `/opt/homebrew`).
-- `softwareupdate --install-rosetta --agree-to-license`, then a **second x86_64 Homebrew** at
-  `/usr/local`: `NONINTERACTIVE=1 arch -x86_64 /bin/bash -c "$(curl -fsSL …/Homebrew/install/HEAD/install.sh)"`
-  followed by `arch -x86_64 /usr/local/bin/brew install gtk4 libadwaita pkg-config`.
-- `rustup target add x86_64-apple-darwin`. Xcode CLT supplies
-  `install_name_tool`/`codesign`/`otool`/`lipo`/`iconutil`.
+```sh
+# 1. Create the GTK env(s). arm64-only:
+scripts/setup-conda-macos.sh
+#    …or universal (arm64 + Intel) — also needs: rustup target add x86_64-apple-darwin
+scripts/setup-conda-macos.sh --universal
 
-Then `scripts/package-macos.sh` → `dist/seed-sync-<ver>-macos-universal.tar.gz`; publish it with `gh`
-(see [`releasing.md`](releasing.md)). The second-Homebrew + Rosetta setup is the heaviest part — if the
-x86_64 brew is absent the script falls back to an arm64-only bundle.
+# 2. Build + bundle + tarball → dist/seed-sync-<ver>-macos-{arm64,universal}.tar.gz
+scripts/package-macos.sh
 
-### Minimum macOS version is set by the build host
-The bundle's real floor is the `minos` (LC_BUILD_VERSION) of the **bundled GTK dylibs**, which Homebrew
-stamps with the macOS version of the build machine. Our Rust binaries are low (≈11), but GTK dominates:
+# 3. Confirm the floor really dropped (expect: minos 11.0)
+otool -l "dist/seed-sync-"*"-macos-"*/"SEED Sync.app/Contents/lib/libgtk-4."*.dylib \
+  | grep -A3 LC_BUILD_VERSION
+```
 
-| Build host | arm64 GTK `minos` | x86_64 GTK `minos` | Effective floor |
+Env locations default to `.conda-gtk/{arm64,x86}` (gitignored); override with `SEED_CONDA_ARM` /
+`SEED_CONDA_X86`. The build works on any macOS the dev box happens to run — the floor comes from
+conda-forge's SDK, not this machine. **Verified end-to-end** on a macOS 26 box: arm64 bundle, all
+GTK/libadwaita/glib + `seed-gui` at `minos 11.0`, leak-free, and launches under a `sandbox-exec` that
+denies both `/opt/homebrew` and the conda env.
+
+### conda env composition — why `setup-conda-macos.sh` installs more than gtk4
+conda-forge splits "runtime" from "dev" more aggressively than Homebrew, so a bare `gtk4 libadwaita`
+env can't *build* against it. The setup script adds what the Rust `*-sys` crates' `pkg-config` step and
+the linker need (all discovered the hard way — keep them):
+- **`zlib`, `freetype`, `expat`** — gtk4 pulls only the runtime libs (`libzlib`/`libfreetype`/…); the
+  `.pc` files (referenced via `Requires.private` of gio/harfbuzz/fontconfig) live in these dev packages.
+- **`libintl-devel`** — provides the unversioned `libintl.dylib` symlink the linker needs for the
+  `-lintl` glib's `.pc` emits (the env otherwise has only `libintl.8.dylib`).
+- **synthesized `libxml-2.0.pc`** — conda-forge's `libxml2` ≥ 2.14 ships *no* `.pc` (and no headers);
+  `appstream` (pulled by libadwaita) lists `libxml-2.0` in `Requires.private`, so `pkg-config` errors on
+  the libadwaita probe. libxml-2.0 is never linked directly, so the script writes a minimal stub rather
+  than pinning the whole stack back to libxml2 2.13 (which drags gtk4 down to 4.14 + icu/zlib conflicts).
+
+And in `package-macos.sh`: **`RUSTFLAGS=-C link-arg=-Wl,-headerpad_max_install_names`** — conda dylibs
+use short `@rpath/<name>` install names, so rewriting `seed-gui`'s load commands to the longer
+`@executable_path/../lib/<name>` overflows a stock Mach-O header (`install_name_tool: load commands do
+not fit`). Homebrew's long absolute paths happened to shrink on rewrite, hiding this.
+
+## No CI — releases are built locally
+
+There is no GitHub Actions release job (the `.github/workflows/*.yml` were removed). Every macOS
+release is cut **manually** on a Mac with the conda-forge pipeline (above) and published with `gh`
+(see [`releasing.md`](releasing.md)). conda-forge sourcing is what makes this practical: the floor is
+macOS 11 regardless of the build host, so any Mac — including the maintainer's current dev box — can
+cut a shippable universal build with no hosted runner.
+
+**If CI is ever reintroduced**, the same pipeline runs on any `macos-*` runner with no runner-version
+pin and no Rosetta/second-Homebrew dance: install miniforge, `scripts/setup-conda-macos.sh
+--universal`, add the `x86_64-apple-darwin` Rust target, then `scripts/package-macos.sh`.
+
+### Minimum macOS version is set by where the GTK dylibs come from — we use conda-forge (floor = macOS 11)
+The bundle's real floor is the `minos` (LC_BUILD_VERSION) of the **bundled GTK dylibs**. Our Rust
+binaries are low (we pin `MACOSX_DEPLOYMENT_TARGET=11.0`), so GTK dominates — and *who built the GTK
+dylibs* decides the floor:
+
+| GTK source | arm64 GTK `minos` | x86_64 GTK `minos` | Effective floor |
 |---|---|---|---|
-| Mac on macOS 14 (Sonoma) | **14** | 13–14 | **macOS 14** |
-| Mac on macOS 15 (Sequoia) | 15 | 14–15 | macOS 15 |
-| Mac on macOS 26 | 26 | 14 | macOS 26 on Apple Silicon (too high to ship) |
+| **conda-forge** (what we ship) | **11** | ~10.13 | **macOS 11** (Big Sur) |
+| Homebrew on a `macos-14` runner | 14 | 13–14 | macOS 14 |
+| Homebrew on a `macos-15` runner | 15 | 14–15 | macOS 15 |
+| Homebrew on a macOS 26 dev box | 26 | 14 | macOS 26 (unshippable) |
 
-So **build on the oldest Mac you have** to reach the widest install base. On Apple Silicon dyld always
-loads the arm64 slice, so the arm64 `minos` is what gates those machines — the x86_64 slice's lower floor
-only helps Intel Macs. **This is the main reason releases are built locally rather than on a hosted
-runner:** GitHub's oldest Apple-Silicon runner was `macos-14`, so CI couldn't go below macOS 14, whereas
-a local older Mac (or building GTK from source with `MACOSX_DEPLOYMENT_TARGET` pinned) can target lower.
+**Why this matters:** Homebrew stamps each bottle with the *build host's* OS and won't ship
+lower-targeted bottles, so a Homebrew build is hostage to the build machine — cutting on a modern dev
+box would force a floor of that machine's OS (the v1.1.0 macOS-26 incident). The old plan worked around
+this by always building on `macos-14`, GitHub's *oldest* Apple-Silicon runner.
 
-> Older macOS assets that were published manually from a macOS-26 dev box carried a macOS-26 arm64 floor;
-> re-cutting on an older Mac drops the floor accordingly.
+**conda-forge breaks that coupling.** It builds `osx-arm64` packages against the macOS 11.0 SDK (Big
+Sur — the floor for *all* Apple Silicon) and `osx-64` against ~10.13, independent of the build host.
+So sourcing the GTK closure from conda-forge envs lets us cut a **macOS 11 floor on any Mac, including
+the macOS 26 dev box** — no old hardware, no hosted CI runner. macOS 11 is the absolute floor on Apple
+Silicon anyway (no Apple Silicon Mac runs anything older), and covers Intel back to High Sierra. (On
+Apple Silicon dyld always loads the arm64 slice, so the arm64 `minos` gates those machines; the x86_64
+floor only affects Intel Macs.)
+
+**How:** `scripts/setup-conda-macos.sh` creates the env(s) from conda-forge; `scripts/package-macos.sh`
+sources the closure from them (via `BUNDLE_PREFIX`). See "Building the release" below. The bundler
+(`scripts/bundle-gtk-macos.sh`) is source-agnostic — it still accepts a Homebrew prefix
+(`BUNDLE_BREW`/`brew --prefix`) if you ever want a Homebrew-sourced bundle.
+
+**Verify the floor after building:**
+`otool -l "<app>/Contents/lib/libgtk-4."*.dylib | grep -A3 LC_BUILD_VERSION` → expect `minos 11.0`
+on the arm64 slice (use `lipo -thin x86_64` first to check the Intel slice).
 
 ## Caveats / gotchas
 

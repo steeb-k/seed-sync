@@ -6,32 +6,45 @@
 #   scripts/package-macos.sh --skip-build   package the existing per-arch release bins
 #
 # Output: dist/seed-sync-<version>-macos-<arch>.tar.gz
-#   arch = "universal" when an x86_64 Homebrew (/usr/local) + the x86_64 Rust target
-#   are present (each Mach-O is lipo'd arm64+x86_64); otherwise "arm64".
+#   arch = "universal" when the osx-64 conda env + the x86_64 Rust target are
+#   present (each Mach-O is lipo'd arm64+x86_64); otherwise "arm64".
 #
-# Universal2 needs a SECOND, x86_64 Homebrew at /usr/local (under Rosetta) with
-# gtk4 + libadwaita installed — Homebrew GTK is single-arch, so the x86_64 dylib
-# closure comes from there and is lipo'd against the arm64 closure from /opt/homebrew.
+# GTK is sourced from conda-forge envs, NOT Homebrew: conda-forge builds osx-arm64
+# against the macOS 11 SDK and osx-64 against ~10.13, so the bundled dylibs carry a
+# macOS-11 `minos` regardless of THIS machine's OS. (Homebrew stamps the build
+# host's OS, which on a modern dev box would force a far higher floor.) Create the
+# envs with scripts/setup-conda-macos.sh; see docs/macos-packaging.md.
 #
 # Requires: cargo, Xcode CLT (install_name_tool/codesign/otool/lipo/iconutil/sips),
-# Homebrew gtk4 + libadwaita (arm64; plus x86_64 at /usr/local for universal).
+# conda-forge envs with gtk4 + libadwaita (osx-arm64; plus osx-64 for universal).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PKG_SRC="$ROOT/packaging/macos"
 APP_ID="io.github.steeb_k.SeedSync"
 ICON_SRC="$ROOT/icon/appIcon.png"
-ARM_BREW="$(brew --prefix)"          # arm64 Homebrew (/opt/homebrew)
-X86_BREW="/usr/local"                # x86_64 Homebrew (Rosetta), if present
+# conda-forge GTK envs (built vs the macOS 11 SDK). Override via SEED_CONDA_ARM/_X86.
+ARM_ENV="${SEED_CONDA_ARM:-$ROOT/.conda-gtk/arm64}"   # osx-arm64 env
+X86_ENV="${SEED_CONDA_X86:-$ROOT/.conda-gtk/x86}"     # osx-64 env (universal only)
+# Match the conda-forge floor so our own Rust binaries don't raise it.
+export MACOSX_DEPLOYMENT_TARGET=11.0
+# Reserve Mach-O header space so the bundler can rewrite seed-gui's load commands
+# to @executable_path/../lib/<name>. conda dylibs are referenced via short
+# @rpath/<name> install names, so the relocated paths are LONGER and won't fit a
+# stock binary's header (Homebrew's long absolute paths happened to shrink, hiding
+# this). Without it, install_name_tool fails "load commands do not fit".
+export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-headerpad_max_install_names"
 SKIP_BUILD=0; [ "${1:-}" = "--skip-build" ] && SKIP_BUILD=1
 
 cd "$ROOT"
 VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
 [ -n "$VERSION" ] || { echo "package-macos: could not read version from Cargo.toml" >&2; exit 1; }
 
-# Universal iff the x86_64 brew has GTK AND the x86_64 Rust target is installed.
+[ -d "$ARM_ENV/lib" ] || { echo "package-macos: osx-arm64 conda env not found at $ARM_ENV — run scripts/setup-conda-macos.sh" >&2; exit 1; }
+
+# Universal iff the osx-64 conda env has GTK AND the x86_64 Rust target is installed.
 UNIVERSAL=0
-if [ -x "$X86_BREW/bin/brew" ] && [ -d "$X86_BREW/opt/gtk4" ] \
+if ls "$X86_ENV"/lib/libgtk-4*.dylib >/dev/null 2>&1 \
    && rustup target list --installed 2>/dev/null | grep -q '^x86_64-apple-darwin$'; then
   UNIVERSAL=1
 fi
@@ -45,17 +58,17 @@ ARM_BIN="$ROOT/target/$ARM_TGT/release"
 X86_BIN="$ROOT/target/$X86_TGT/release"
 
 if [ "$SKIP_BUILD" != 1 ]; then
-  cargo build --release --target "$ARM_TGT" -p seed-daemon -p seed-gui -p seed-cli
+  # pkg-config resolves the GTK closure from the conda env only (LIBDIR replaces
+  # the default search path, so no system/Homebrew leakage). conda keeps every
+  # .pc in one lib/pkgconfig, so there's no keg-only fan-out to enumerate.
+  PKG_CONFIG_PATH="$ARM_ENV/lib/pkgconfig" \
+  PKG_CONFIG_LIBDIR="$ARM_ENV/lib/pkgconfig" \
+    cargo build --release --target "$ARM_TGT" -p seed-daemon -p seed-gui -p seed-cli
   if [ "$UNIVERSAL" = 1 ]; then
-    echo "package-macos: building x86_64 slice against $X86_BREW GTK"
-    # pkg-config must resolve the x86_64 GTK closure with NO arm64 leakage, so set
-    # PKG_CONFIG_LIBDIR (replaces the default search path) to the x86_64 brew's
-    # per-formula pkgconfig dirs (covers keg-only) + linked lib/share + Homebrew's
-    # per-macOS-version stubs for system libs (zlib/libffi/expat/…). ALLOW_CROSS
-    # because the host (arm64) != target (x86_64).
-    macos_maj="$(sw_vers -productVersion | cut -d. -f1)"
-    x86_pc="$(ls -d "$X86_BREW"/opt/*/lib/pkgconfig 2>/dev/null | tr '\n' ':')$X86_BREW/lib/pkgconfig:$X86_BREW/share/pkgconfig:$X86_BREW/Homebrew/Library/Homebrew/os/mac/pkgconfig/$macos_maj"
-    PKG_CONFIG_LIBDIR="$x86_pc" \
+    echo "package-macos: building x86_64 slice against $X86_ENV GTK"
+    # ALLOW_CROSS because the host (arm64) != target (x86_64).
+    PKG_CONFIG_PATH="$X86_ENV/lib/pkgconfig" \
+    PKG_CONFIG_LIBDIR="$X86_ENV/lib/pkgconfig" \
     PKG_CONFIG_ALLOW_CROSS=1 \
       cargo build --release --target "$X86_TGT" -p seed-daemon -p seed-gui -p seed-cli
   fi
@@ -71,7 +84,7 @@ mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Resources" "$STAGE/LaunchAgents"
 for b in seed-daemon seed-gui seed-cli; do
   install -m 0755 "$ARM_BIN/$b" "$CONTENTS/MacOS/$b"
 done
-BUNDLE_BREW="$ARM_BREW" BUNDLE_BINDIR=MacOS "$ROOT/scripts/bundle-gtk-macos.sh" "$CONTENTS"
+BUNDLE_PREFIX="$ARM_ENV" BUNDLE_BINDIR=MacOS "$ROOT/scripts/bundle-gtk-macos.sh" "$CONTENTS"
 
 # --- universal: build a parallel x86_64 .app, then lipo each Mach-O into the base.
 if [ "$UNIVERSAL" = 1 ]; then
@@ -82,7 +95,9 @@ if [ "$UNIVERSAL" = 1 ]; then
   for b in seed-daemon seed-gui seed-cli; do
     install -m 0755 "$X86_BIN/$b" "$X86_CONTENTS/MacOS/$b"
   done
-  BUNDLE_BREW="$X86_BREW" BUNDLE_BINDIR=MacOS "$ROOT/scripts/bundle-gtk-macos.sh" "$X86_CONTENTS"
+  # SKIP_AUX: loaders.cache/schemas/fontconfig are arch-independent and already in
+  # the base arm64 tree — only the x86_64 dylib closure is needed for the lipo.
+  BUNDLE_PREFIX="$X86_ENV" BUNDLE_BINDIR=MacOS BUNDLE_SKIP_AUX=1 "$ROOT/scripts/bundle-gtk-macos.sh" "$X86_CONTENTS"
 
   # lipo every Mach-O present in both trees (binaries, dylibs, pixbuf loaders).
   lipo_merge() {
