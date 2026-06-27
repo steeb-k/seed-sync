@@ -152,9 +152,14 @@ fn print_response(resp: &IpcResponse) {
                 println!("(no shares)");
             }
             for s in shares {
+                let retrying = if s.retrying > 0 {
+                    format!("  [{} retrying]", s.retrying)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{}  {:?}  {:?} {}%  {}  {}",
-                    s.share_id, s.role, s.status, s.percent, s.name, s.folder
+                    "{}  {:?}  {:?} {}%{}  {}  {}",
+                    s.share_id, s.role, s.status, s.percent, retrying, s.name, s.folder
                 );
             }
         }

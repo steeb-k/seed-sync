@@ -9,6 +9,7 @@
 //! between the local filesystem and the [`crate::manifest`] trust model, and is
 //! unit-tested on its own.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -146,7 +147,13 @@ pub fn hash_file(path: &Path) -> std::io::Result<(Vec<u8>, u64)> {
 /// `(relative path, size, mtime)` tuples, without reading file contents. The
 /// master's reconcile loop compares this between ticks and only does a full
 /// scan + republish when it changes.
-pub fn quick_signature(root: &Path, ignore: &IgnoreSet) -> u64 {
+///
+/// `exclude` holds relative POSIX paths to leave OUT of the signature — the files
+/// that couldn't be read/imported this round. Excluding them is what keeps the
+/// gate honest: a skipped file is handled by the targeted retry instead, so it
+/// must not make the signature look "settled" (which would suppress full scans and
+/// hide later adds/deletes — the poisoning bug). Pass an empty set for "everything".
+pub fn quick_signature(root: &Path, ignore: &IgnoreSet, exclude: &HashSet<String>) -> u64 {
     use std::time::UNIX_EPOCH;
     let mut entries: Vec<(String, u64, u128)> = Vec::new();
     for dent in WalkDir::new(root)
@@ -160,7 +167,7 @@ pub fn quick_signature(root: &Path, ignore: &IgnoreSet) -> u64 {
         let Some(rel) = rel_posix(root, dent.path()) else {
             continue;
         };
-        if ignore.is_ignored(&rel) {
+        if ignore.is_ignored(&rel) || exclude.contains(&rel) {
             continue;
         }
         let (size, mtime) = dent
@@ -287,6 +294,34 @@ mod tests {
         let (files, skipped) = scan(dir.path(), &ig).unwrap();
         assert!(files.is_empty());
         assert!(skipped.is_empty());
+    }
+
+    /// `quick_signature` must NOT count excluded paths — that's what stops a
+    /// skipped/unpublished file from making the folder look "settled" and
+    /// suppressing future scans (the gate-poisoning bug). An excluded new file
+    /// leaves the signature unchanged; a non-excluded new file changes it.
+    #[test]
+    fn quick_signature_excludes_listed_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), b"a").unwrap();
+        let (ig, _) = IgnoreSet::compile(&[]);
+        let empty = HashSet::new();
+        let base = quick_signature(root, &ig, &empty);
+
+        fs::write(root.join("b.txt"), b"b").unwrap();
+        let with_b = quick_signature(root, &ig, &empty);
+        assert_ne!(
+            base, with_b,
+            "a new (non-excluded) file must change the signature"
+        );
+
+        let excl: HashSet<String> = std::iter::once("b.txt".to_string()).collect();
+        let with_b_excluded = quick_signature(root, &ig, &excl);
+        assert_eq!(
+            base, with_b_excluded,
+            "an excluded file must not affect the signature (no gate poisoning)"
+        );
     }
 
     /// A file that can't be read (locked by another process, permission denied)

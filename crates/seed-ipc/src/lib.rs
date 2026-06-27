@@ -189,6 +189,11 @@ pub struct ShareSummary {
     pub index_total: u64,
     /// Unix seconds of the last successful sync/publish for this share (0 if never).
     pub last_updated: i64,
+    /// Files this node currently can't read or publish (locked/unreadable) and is
+    /// retrying. Non-zero means the share is NOT fully settled even if `percent`
+    /// looks high — surfaced so a stuck/locked file is never silently hidden behind
+    /// "Healthy 100%".
+    pub retrying: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

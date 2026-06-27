@@ -1165,6 +1165,9 @@ fn role_str(role: Role) -> &'static str {
 fn status_text(s: &ShareSummary) -> String {
     match s.status {
         ShareStatus::Healthy => format!("Healthy {}%", s.percent),
+        ShareStatus::Syncing if s.retrying > 0 => {
+            format!("Syncing {}% — {} file(s) retrying", s.percent, s.retrying)
+        }
         ShareStatus::Syncing => format!("Syncing {}%", s.percent),
         ShareStatus::Indexing => {
             // Show "Indexing 13.4/29.0 GB (46%)", picking GB vs MB off the total.
@@ -1793,7 +1796,12 @@ fn show_keys_panel(
             m,
         ));
     }
-    vbox.append(&key_field_qr(nav, "Viewer key (read-only)", "Viewer key", viewer));
+    vbox.append(&key_field_qr(
+        nav,
+        "Viewer key (read-only)",
+        "Viewer key",
+        viewer,
+    ));
     if let Some(b) = bootstrap {
         if !b.is_empty() {
             vbox.append(&key_field("Bootstrap address (this device)", b));

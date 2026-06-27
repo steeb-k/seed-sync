@@ -873,6 +873,29 @@ async fn locked_files_do_not_block_share_and_sync_after_unlock() -> anyhow::Resu
     );
     println!("phase 1 OK: readable files synced; locked files correctly skipped");
 
+    // Honest status: while files are locked the master must NOT read "Healthy" — it
+    // reports them as retrying, so a stuck/locked file is never hidden.
+    let m = master
+        .list_summaries()
+        .into_iter()
+        .find(|s| s.share_id == share_id)
+        .expect("master share summary");
+    assert!(
+        m.retrying >= 2,
+        "master should report >=2 files retrying while locked, got {}",
+        m.retrying
+    );
+    assert!(
+        !format!("{:?}", m.status).contains("Healthy"),
+        "share must not read Healthy while files are locked/retrying (status {:?}, retrying {})",
+        m.status,
+        m.retrying
+    );
+    println!(
+        "honest status OK: master reports {} file(s) retrying, status {:?}",
+        m.retrying, m.status
+    );
+
     // Phase 2: release the locks. The previously-locked files must now sync — note
     // releasing a lock does NOT change the folder's (size,mtime) signature, so this
     // exercises the tracked per-file retry, not a fresh full scan.
@@ -908,6 +931,19 @@ async fn locked_files_do_not_block_share_and_sync_after_unlock() -> anyhow::Resu
         b"second locked payload"
     );
     println!("phase 2 OK: previously-locked files synced after release (tracked retry)");
+
+    // Once everything is published, the master is settled again: nothing retrying.
+    let m = master
+        .list_summaries()
+        .into_iter()
+        .find(|s| s.share_id == share_id)
+        .expect("master share summary");
+    assert_eq!(
+        m.retrying, 0,
+        "no files should be retrying after unlock + converge (status {:?})",
+        m.status
+    );
+    println!("honest status OK: master settled, 0 retrying");
 
     master.shutdown().await?;
     viewer.shutdown().await?;

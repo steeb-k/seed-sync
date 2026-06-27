@@ -285,13 +285,21 @@ async fn self_heal_file(
     }
     let mut last_err = None;
     for &pid in providers {
-        let conn = match endpoint
-            .connect(EndpointAddr::new(pid), iroh_blobs::ALPN)
-            .await
+        // Bound the dial so a self-heal can't hang the whole reconcile pass if a
+        // provider is unreachable/stalled (e.g. during a multi-master churn storm).
+        let conn = match tokio::time::timeout(
+            Duration::from_secs(15),
+            endpoint.connect(EndpointAddr::new(pid), iroh_blobs::ALPN),
+        )
+        .await
         {
-            Ok(c) => c,
-            Err(e) => {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
                 last_err = Some(anyhow!("connect {pid}: {e}"));
+                continue;
+            }
+            Err(_) => {
+                last_err = Some(anyhow!("connect {pid}: timed out"));
                 continue;
             }
         };
@@ -914,7 +922,12 @@ impl ReconcileJob {
         //    otherwise the on-disk content equals our recorded base. Both roles
         //    scan: a master to publish local edits, a viewer to detect (and revert)
         //    local drift.
-        let quick_sig = scan::quick_signature(&self.folder, &ignore_set);
+        // Exclude the files we couldn't process last pass from the change-signature:
+        // they're chased by the targeted retry below, and counting them here would let
+        // a skipped file mask the folder as "settled" and suppress full scans (the
+        // gate-poisoning bug). The end-of-pass signature excludes the same way.
+        let prev_skipped_set: HashSet<String> = self.prev_skipped.iter().cloned().collect();
+        let quick_sig = scan::quick_signature(&self.folder, &ignore_set, &prev_skipped_set);
         let do_scan = quick_sig != self.last_quick_sig;
         // Build the local view, plus the candidate paths to (re)attempt reading this
         // pass: when scanning, whatever the scan couldn't read; otherwise the set
@@ -1055,6 +1068,9 @@ impl ReconcileJob {
                             }
                             Err(e) => {
                                 tracing::warn!("skip publishing {path} (will retry): {e:#}");
+                                // On disk but not published: exclude from the gate so it
+                                // can't mark the folder "clean", and retry it next pass.
+                                still_skipped.push(path.clone());
                                 continue;
                             }
                         }
@@ -1154,6 +1170,7 @@ impl ReconcileJob {
                                         tracing::warn!(
                                             "skip publishing {path} (will retry): {e:#}"
                                         );
+                                        still_skipped.push(path.clone());
                                         continue;
                                     }
                                 }
@@ -1173,6 +1190,7 @@ impl ReconcileJob {
                                             tracing::warn!(
                                                 "skip publishing {path} (will retry): {e:#}"
                                             );
+                                            still_skipped.push(path.clone());
                                             continue;
                                         }
                                     }
@@ -1232,9 +1250,25 @@ impl ReconcileJob {
             (present_bytes.min(total_bytes) * 100 / total_bytes) as u8
         };
 
+        still_skipped.sort();
+        still_skipped.dedup();
+        if !still_skipped.is_empty() {
+            tracing::warn!(
+                "reconcile {}: {} file(s) unreadable/unpublished this pass, will retry (do_scan={})",
+                self.share_id,
+                still_skipped.len(),
+                do_scan
+            );
+        }
+
         // Recompute the signature *after* our disk writes so the next tick sees a
-        // settled folder rather than re-scanning our own changes.
-        let new_quick_sig = scan::quick_signature(&self.folder, &ignore_set);
+        // settled folder rather than re-scanning our own changes. Exclude the files
+        // we couldn't read or publish this pass — counting them would let the gate
+        // read "clean" while the manifest is actually behind (the poisoning bug); the
+        // targeted retry chases them instead, and any genuinely new add/delete still
+        // flips the signature and triggers a full scan.
+        let skipped_set: HashSet<String> = still_skipped.iter().cloned().collect();
+        let new_quick_sig = scan::quick_signature(&self.folder, &ignore_set, &skipped_set);
 
         Ok(ReconcileOutcome {
             changed,
@@ -1654,11 +1688,17 @@ impl Engine {
                 // report a moving percent. Otherwise derive health from whether
                 // this node holds all of the merged view's content: a master is
                 // the source (always 100); a viewer reports its present/total %.
+                let retrying = s.skipped.len() as u32;
                 let (status, percent, indexed_bytes, index_total) = if s.paused || paused_all {
                     (seed_ipc::ShareStatus::Paused, 0, 0, 0)
                 } else if let Some(&(done, tot)) = progress.get(id) {
                     let pct = (done.min(tot) * 100).checked_div(tot).unwrap_or(0) as u8;
                     (seed_ipc::ShareStatus::Indexing, pct, done, tot)
+                } else if retrying > 0 {
+                    // Files we can't read/publish yet (locked/unreadable) are being
+                    // retried — the share is NOT settled even if content % looks full.
+                    // Never read "Healthy" in this state.
+                    (seed_ipc::ShareStatus::Syncing, s.health, 0, 0)
                 } else if s.health >= 100 {
                     (seed_ipc::ShareStatus::Healthy, 100, 0, 0)
                 } else {
@@ -1681,6 +1721,7 @@ impl Engine {
                     indexed_bytes,
                     index_total,
                     last_updated: s.last_updated,
+                    retrying,
                 }
             })
             .collect()
