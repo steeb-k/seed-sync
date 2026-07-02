@@ -92,8 +92,8 @@ pkg-config imagemagick`. A separate Linux `rustup` toolchain.
 `/mnt/c` — `/mnt/c` is slow for cargo and trips git's dubious-ownership guard. The
 clone was made from the Windows working tree:
 ```bash
-git config --global --add safe.directory /mnt/c/Users/steeb-ai/seed-sync-gtk
-git clone /mnt/c/Users/steeb-ai/seed-sync-gtk ~/seed-sync-gtk
+git config --global --add safe.directory /mnt/c/Users/<you>/seed-sync-gtk
+git clone /mnt/c/Users/<you>/seed-sync-gtk ~/seed-sync-gtk
 ```
 
 ### Build + run the GTK GUI
