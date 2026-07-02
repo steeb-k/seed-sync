@@ -22,8 +22,11 @@
 # generated from LICENSE by build-msi.ps1
 /wix/license.rtf
 
-# Code-signing material (Azure Trusted Signing account/profile names; local only)
+# Code-signing material (Azure Trusted Signing account/profile names; local only).
+# The real metadata is machine-local; commit only artifact-signing-metadata.example.json.
+# sign-artifacts.ps1 reads $env:ARTIFACT_SIGNING_METADATA, else this repo-root file.
 /signing-example/
+/artifact-signing-metadata.json
 
 # Editor / OS
 .idea/
