@@ -10,8 +10,8 @@ copy stays byte-identical. Built on the [iroh](https://iroh.computer) 1.0 stack
 multi-writer doc replica is the trust root — every entry is signed by the master
 namespace key, so only master-key holders can write.
 
-> Status: early development. See `project-plan-human.md` for the product brief
-> and the implementation plan for the build sequence.
+> Status: early development. See the **Architecture** section below for the crate
+> layout, and `CLAUDE.md` for a map of the design/packaging docs under `docs/`.
 
 ## Architecture
 

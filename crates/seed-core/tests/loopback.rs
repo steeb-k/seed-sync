@@ -1161,8 +1161,8 @@ async fn converge_two(
 /// converge bidirectionally: a file added on either side reaches the other, a
 /// delete propagates, a concurrent same-path edit resolves last-writer-wins, and a
 /// restarted node reconnects and re-converges. This is the multi-master feature the
-/// original design called for (`project-plan-human.md`: "only master key holders
-/// can modify the share" — plural).
+/// original design called for: only master key holders can modify the share
+/// (plural).
 #[tokio::test]
 #[ignore = "opens real iroh endpoints; run with --ignored"]
 async fn two_masters_converge_bidirectionally() -> anyhow::Result<()> {
