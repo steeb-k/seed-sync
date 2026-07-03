@@ -1085,6 +1085,11 @@ impl ReconcileJob {
         let mut reclaim: Vec<Hash> = Vec::new();
         let mut changed = false;
         let mut imported_bytes: u64 = 0;
+        // Parent directories of files we actually delete this tick. Only these are
+        // considered for empty-dir cleanup afterwards — an empty folder the user
+        // created (and no synced file was ever removed from) is left alone, so it
+        // no longer vanishes on the next reconcile.
+        let mut emptied_parents: HashSet<PathBuf> = HashSet::new();
 
         for path in keys {
             let l = local.get(&path);
@@ -1105,6 +1110,9 @@ impl ReconcileJob {
                         // Viewer: not in the merged view → revert (delete) it.
                         let target = self.folder.join(rel_to_native(&path));
                         let _ = std::fs::remove_file(&target);
+                        if let Some(p) = target.parent() {
+                            emptied_parents.insert(p.to_path_buf());
+                        }
                         if b.is_some() {
                             index_dels.push(path);
                         }
@@ -1114,6 +1122,9 @@ impl ReconcileJob {
                         // a remote delete: remove it locally.
                         let target = self.folder.join(rel_to_native(&path));
                         let _ = std::fs::remove_file(&target);
+                        if let Some(p) = target.parent() {
+                            emptied_parents.insert(p.to_path_buf());
+                        }
                         index_dels.push(path);
                         changed = true;
                     } else if let Some(abs) = le.abs.as_ref() {
@@ -1279,8 +1290,11 @@ impl ReconcileJob {
             }
         }
 
-        // Tidy now-empty directories a viewer/master delete may have left behind.
-        prune_empty_dirs(&self.folder);
+        // Tidy directories that a delete this tick actually emptied — NOT every
+        // empty directory under the root. A folder the user just created (no synced
+        // file ever removed from it) is left in place instead of being nuked on the
+        // next reconcile, which is what made new folders "vanish".
+        prune_emptied_ancestors(&emptied_parents, &self.folder);
 
         // Health = the fraction of the merged desired view we actually hold locally,
         // for *every* role. A source master that already has all its content computes
@@ -2460,23 +2474,29 @@ fn file_matches(path: &Path, want: &[u8]) -> bool {
     }
 }
 
-/// Remove now-empty directories under `root` (best effort), leaving `root`.
-fn prune_empty_dirs(root: &Path) {
-    fn visit(dir: &Path, root: &Path) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                visit(&p, root);
+/// Remove directories that a delete just emptied, walking upward from each toward
+/// (but never including or past) `root`. `remove_dir` only succeeds on a truly
+/// empty directory, so a folder that still holds other files — or an empty folder
+/// the user created that isn't in `dirs` — is left untouched. This is deliberately
+/// scoped to the parents of files removed this tick: a blanket sweep of every empty
+/// directory under `root` would delete user-created empty folders (they have no
+/// manifest representation), which is exactly the "new folders vanish" bug.
+fn prune_emptied_ancestors(dirs: &HashSet<PathBuf>, root: &Path) {
+    for start in dirs {
+        let mut dir = start.as_path();
+        // Only touch paths strictly under the share root.
+        while dir != root && dir.starts_with(root) {
+            // Stop as soon as a directory isn't empty (or is gone / unreadable):
+            // remove_dir fails harmlessly and there's nothing above worth trying.
+            if std::fs::remove_dir(dir).is_err() {
+                break;
+            }
+            match dir.parent() {
+                Some(parent) => dir = parent,
+                None => break,
             }
         }
-        if dir != root {
-            let _ = std::fs::remove_dir(dir); // fails (ignored) if non-empty
-        }
     }
-    visit(root, root);
 }
 
 #[cfg(test)]
@@ -2537,5 +2557,45 @@ mod tests {
         // Never the 0 (= "unknown") sentinel, even for an empty view.
         let empty: HashMap<String, RemoteEntry> = HashMap::new();
         assert_ne!(manifest_fingerprint(&empty), 0);
+    }
+
+    /// Regression for "new folders vanish": empty-dir cleanup after a delete must
+    /// remove ONLY the directories that a deleted file actually emptied, and must
+    /// leave a user-created empty folder (never in `emptied_parents`) untouched.
+    #[test]
+    fn prune_emptied_ancestors_scoped_to_deleted_parents() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // A folder the user just created, still empty. Must survive.
+        let user_dir = root.join("keep-me");
+        fs::create_dir_all(&user_dir).unwrap();
+
+        // A nested dir a delete just emptied: keep/ still holds a file, gone/ does not.
+        let keep = root.join("a/keep");
+        let gone = root.join("a/gone");
+        fs::create_dir_all(&keep).unwrap();
+        fs::create_dir_all(&gone).unwrap();
+        fs::write(keep.join("f.txt"), b"x").unwrap();
+
+        let mut emptied: HashSet<PathBuf> = HashSet::new();
+        emptied.insert(gone.clone()); // the deleted file lived under a/gone
+
+        prune_emptied_ancestors(&emptied, root);
+
+        assert!(!gone.exists(), "a/gone was emptied by a delete → removed");
+        assert!(
+            keep.exists(),
+            "a/keep still holds a file → left alone (walk-up stops at non-empty)"
+        );
+        assert!(
+            root.join("a").exists(),
+            "a/ still contains keep/ → not removed"
+        );
+        assert!(
+            user_dir.exists(),
+            "a user-created empty folder isn't in emptied_parents → must NOT vanish"
+        );
     }
 }
