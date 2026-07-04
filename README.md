@@ -1,5 +1,9 @@
 # SEED Sync
 
+## Notice
+This is a code-only repo. Prebuilt binaries can be found at 
+[seed-sync-binaries](https://github.com/steeb-k/seed-sync-binaries).
+
 A Resilio Sync–style **P2P mirrored folder sync** app in Rust + GTK4/Libadwaita.
 
 Any *master* key holder can modify a shared folder — multiple masters across
