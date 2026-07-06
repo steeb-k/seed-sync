@@ -18,9 +18,18 @@ divergence + periodic deep verify"). Cross-OS test-bench issues live separately 
 
 ---
 
-## 1. Engine lock held across a network `await` in the divergence self-heal
-**Tier:** confirmed · **Severity:** medium (responsiveness)
+## 1. Engine lock held across a network `await` in the divergence self-heal — **FIXED**
+**Tier:** confirmed · **Severity:** medium (responsiveness) · **Status:** fixed
 **Where:** `crates/seed-daemon/src/main.rs:292`, `crates/seed-core/src/engine.rs:1975`
+
+> **Fixed.** `resync_diverged_docs` was split into `Engine::diverged_doc_resyncs()`
+> (builds `(share_id, doc, peers)` jobs under a brief lock, no await) + `DocResync`
+> (runs `start_sync` **off-lock**), mirroring `presence_rejoins`. The daemon loop now
+> collects then runs off-lock. `AddShare` got the same treatment (`add_share_open` +
+> `DocResync::start`), and `open_share` no longer dials under the lock. This was the
+> root cause of the macOS "a freshly-added share never syncs and reads Healthy 100%"
+> report: a hung `start_sync` froze the whole reconcile loop until the daemon was
+> restarted. Original write-up kept below for context.
 
 ```rust
 // reconcile_loop, every ~6s (tick % 8)

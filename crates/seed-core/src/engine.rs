@@ -1415,6 +1415,27 @@ impl ShareState {
             .map(|t| now_secs() - t >= DIVERGENCE_SETTLE_SECS)
             .unwrap_or(false)
     }
+
+    /// Whether every online peer that advertises a manifest fingerprint agrees with
+    /// ours. Gates "Healthy": a share whose online peers report a *different* fileset
+    /// (e.g. our doc replica hasn't finished syncing theirs yet) must not read
+    /// Healthy 100% just because we locally hold everything *we currently know about* —
+    /// that's the "reports Healthy 100% with 0 of the agreed files" failure. Peers that
+    /// haven't broadcast a fingerprint yet (fp == 0) are ignored, and with no
+    /// comparable peers this is `true` (solo/offline — nothing to disagree with).
+    /// Mirrors the disagreement test in [`Engine::finish_reconcile`], but without the
+    /// settle window: it only downgrades Healthy→Syncing (benign), never raises the
+    /// OutOfSync alarm.
+    fn converged_with_online_peers(&self) -> bool {
+        self.roster
+            .lock()
+            .map(|r| {
+                r.online_manifest_fps()
+                    .iter()
+                    .all(|fp| *fp == self.manifest_fp)
+            })
+            .unwrap_or(true)
+    }
 }
 
 /// The engine owns the iroh node and the set of shares.
@@ -1453,6 +1474,43 @@ pub struct Engine {
     /// reconcile without touching the user's pause state. Deliberately *not*
     /// persisted: the host recomputes it from live conditions on every start.
     sync_suspended: StdMutex<bool>,
+}
+
+/// A deferred kick of one share's doc live-sync, built under the engine lock (cheap:
+/// clones the `Doc` handle + snapshots the peer set) and run **off** the lock.
+///
+/// Starting live-sync calls `Doc::start_sync`, which dials the peers over the network.
+/// Holding the engine mutex across that dial would freeze the reconcile loop and every
+/// IPC request whenever a peer is slow or unreachable, so the network work is split out
+/// exactly like [`crate::presence::PresenceRejoin`]. Built by
+/// [`Engine::diverged_doc_resyncs`] (periodic self-heal) and [`Engine::add_share_open`]
+/// (adding a share).
+pub struct DocResync {
+    share_id: String,
+    doc: Doc,
+    peers: Vec<iroh::EndpointAddr>,
+}
+
+impl DocResync {
+    /// Kick doc live-sync, propagating any error to the caller. No-op when there are
+    /// no peers to dial.
+    pub async fn start(self) -> anyhow::Result<()> {
+        if self.peers.is_empty() {
+            return Ok(());
+        }
+        self.doc.start_sync(self.peers).await.context("start sync")?;
+        Ok(())
+    }
+
+    /// Best-effort variant for the periodic self-heal loop: logs instead of returning
+    /// the error (a re-kick that fails this tick is retried on the next).
+    pub async fn run(self) {
+        let id = self.share_id.clone();
+        match self.start().await {
+            Ok(()) => tracing::info!("re-kicked doc sync for out-of-sync share {id}"),
+            Err(e) => tracing::debug!("resync doc for {id}: {e:#}"),
+        }
+    }
 }
 
 impl Engine {
@@ -1600,7 +1658,7 @@ impl Engine {
                 }
             }
             let quick_sig = rec.quick_sig;
-            let mut state = self
+            let (mut state, boot) = self
                 .open_share(
                     &key,
                     &PathBuf::from(&rec.folder),
@@ -1610,6 +1668,13 @@ impl Engine {
                     rec.paused,
                 )
                 .await?;
+            // Startup path: the reconcile loop and IPC accept loop only start after
+            // reload finishes, so there's no lock contention yet — kick live-sync
+            // inline. Best-effort: a share whose peer can't be dialed now is retried
+            // by the periodic self-heal (see `diverged_doc_resyncs`).
+            if let Err(e) = state.doc.start_sync(boot).await {
+                tracing::warn!("start sync for reloaded share {} failed: {e:#}", rec.share_id);
+            }
             // Restore the persisted change-signature so an unchanged folder isn't
             // re-imported on every restart.
             state.last_quick_sig = quick_sig;
@@ -1631,7 +1696,7 @@ impl Engine {
         ignore: Vec<String>,
         last_seqno: u64,
         paused: bool,
-    ) -> anyhow::Result<ShareState> {
+    ) -> anyhow::Result<(ShareState, Vec<iroh::EndpointAddr>)> {
         let capability = match key.role {
             Role::Master => {
                 let seed = key
@@ -1722,31 +1787,40 @@ impl Engine {
             }
         };
 
-        doc.start_sync(bootstrap).await.context("start sync")?;
-        Ok(ShareState {
-            key: key.clone(),
-            folder: folder.to_path_buf(),
-            doc,
-            ignore,
-            last_seqno,
-            last_quick_sig: 0,
-            paused,
-            publishing: false,
-            roster,
-            last_updated: 0,
-            // Provisional until the first reconcile computes real completeness. Start
-            // at 0 (incomplete) for every role so a freshly-added master that still
-            // has content to fetch never briefly reads a misleading 100.
-            health: 0,
-            presence,
-            skipped: Vec::new(),
-            manifest_fp: 0,
-            diverged_since: None,
-            diverged_alerted: false,
-            // Stagger the first periodic deep verify a full interval out, so a
-            // restart doesn't re-hash every share immediately.
-            last_deep_verify: now_secs(),
-        })
+        // NOTE: we deliberately do NOT `doc.start_sync(bootstrap)` here. Starting
+        // live-sync dials the bootstrap peers over the network; doing that while the
+        // caller holds the engine lock would freeze the reconcile loop and all IPC if
+        // a peer is slow or unreachable. Callers start sync themselves — inline where
+        // there's no lock contention (create/reload), off-lock in the daemon's
+        // AddShare handler via [`DocResync`]. The resolved bootstrap set (which may
+        // include the endpoint-id discovery hint added above) is returned for that.
+        Ok((
+            ShareState {
+                key: key.clone(),
+                folder: folder.to_path_buf(),
+                doc,
+                ignore,
+                last_seqno,
+                last_quick_sig: 0,
+                paused,
+                publishing: false,
+                roster,
+                last_updated: 0,
+                // Provisional until the first reconcile computes real completeness. Start
+                // at 0 (incomplete) for every role so a freshly-added master that still
+                // has content to fetch never briefly reads a misleading 100.
+                health: 0,
+                presence,
+                skipped: Vec::new(),
+                manifest_fp: 0,
+                diverged_since: None,
+                diverged_alerted: false,
+                // Stagger the first periodic deep verify a full interval out, so a
+                // restart doesn't re-hash every share immediately.
+                last_deep_verify: now_secs(),
+            },
+            bootstrap,
+        ))
     }
 
     pub fn endpoint_addr(&self) -> iroh::EndpointAddr {
@@ -1811,8 +1885,17 @@ impl Engine {
                     // retried — the share is NOT settled even if content % looks full.
                     // Never read "Healthy" in this state.
                     (seed_ipc::ShareStatus::Syncing, s.health, 0, 0)
-                } else if s.health >= 100 {
+                } else if s.health >= 100 && s.converged_with_online_peers() {
                     (seed_ipc::ShareStatus::Healthy, 100, 0, 0)
+                } else if s.health >= 100 {
+                    // Content-complete against the manifest we currently hold, but an
+                    // online peer advertises a different fingerprint — we haven't
+                    // converged toward the agreed fileset yet (our doc replica is still
+                    // catching up). Show Syncing rather than a premature Healthy 100%,
+                    // and cap the bar below 100 so it doesn't read "done". Persistent
+                    // disagreement escalates to OutOfSync above once past the settle
+                    // window.
+                    (seed_ipc::ShareStatus::Syncing, 99, 0, 0)
                 } else {
                     (seed_ipc::ShareStatus::Syncing, s.health, 0, 0)
                 };
@@ -1993,19 +2076,39 @@ impl Engine {
     /// Self-heal step for the daemon: re-kick doc live-sync for every share that is
     /// currently out of sync with a peer. Pairs with the forced deep verify done in
     /// [`finish_reconcile`] (re-assert local truth) to drive re-convergence.
-    pub async fn resync_diverged_docs(&self) {
-        let ids: Vec<String> = self
-            .shares
-            .iter()
-            .filter(|(_, s)| !s.paused && s.is_out_of_sync())
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in ids {
-            match self.resync_doc(&id).await {
-                Ok(()) => tracing::info!("re-kicked doc sync for out-of-sync share {id}"),
-                Err(e) => tracing::debug!("resync doc for {id}: {e:#}"),
+    /// Build off-lock re-sync jobs for every out-of-sync share, WITHOUT awaiting.
+    /// Call under a brief engine lock and run the results off-lock via
+    /// [`DocResync::run`].
+    ///
+    /// Replaces the old `resync_diverged_docs`, which held the engine mutex across
+    /// every `start_sync` dial: a slow or unreachable peer would freeze the whole
+    /// reconcile loop (and every IPC request) until the dial returned — the one place
+    /// the loop broke its otherwise-consistent "build under the lock, await off-lock"
+    /// discipline. This mirrors [`presence_rejoins`].
+    ///
+    /// [`presence_rejoins`]: Engine::presence_rejoins
+    pub fn diverged_doc_resyncs(&self) -> Vec<DocResync> {
+        let self_id = self.node.endpoint.id();
+        let mut out = Vec::new();
+        for (id, s) in self.shares.iter() {
+            if s.paused || !s.is_out_of_sync() {
+                continue;
             }
+            let peers: Vec<iroh::EndpointAddr> = peer_providers(&s.key, &s.roster)
+                .into_iter()
+                .filter(|pid| *pid != self_id)
+                .map(iroh::EndpointAddr::new)
+                .collect();
+            if peers.is_empty() {
+                continue;
+            }
+            out.push(DocResync {
+                share_id: id.clone(),
+                doc: s.doc.clone(),
+                peers,
+            });
         }
+        out
     }
 
     /// Reveal the keys for a share. Returns the master key only when this node
@@ -2077,9 +2180,13 @@ impl Engine {
     ) -> anyhow::Result<(CreatedShare, ReconcileJob)> {
         let key = ShareKey::generate_master().with_endpoint_id(self.node.endpoint_id_bytes());
         let share_id = key.share_id_hex();
-        let state = self
+        let (state, boot) = self
             .open_share(&key, folder, vec![], ignore.clone(), 0, false)
             .await?;
+        // A fresh master's bootstrap is empty (its key carries only its own id, which
+        // is filtered out), so this dials nothing and returns immediately even under
+        // the lock.
+        state.doc.start_sync(boot).await.context("start sync")?;
         self.shares.insert(share_id.clone(), state);
         self.persist_share(&key, folder, ignore, 0, false).await?;
         let job = self
@@ -2322,20 +2429,53 @@ impl Engine {
     /// Add an existing share from a key string, syncing into `folder`. Optional
     /// `bootstrap` addresses kick off the connection without DNS discovery
     /// (used by the loopback harness; production resolves via the endpoint id).
+    /// Add an existing share from its key, opening the replica and starting live-sync
+    /// inline. Convenience wrapper used by tests and the mobile facade. The daemon
+    /// instead drives [`add_share_open`] → [`DocResync::start`] so the network dial
+    /// runs off the engine lock (see [`DocResync`]).
+    ///
+    /// [`add_share_open`]: Engine::add_share_open
     pub async fn add_share(
         &mut self,
         key_str: &str,
         folder: &Path,
         bootstrap: Vec<iroh::EndpointAddr>,
     ) -> anyhow::Result<String> {
+        let (share_id, sync) = self.add_share_open(key_str, folder, bootstrap).await?;
+        sync.start().await?;
+        Ok(share_id)
+    }
+
+    /// Phase 1 of add: decode the key, open the replica, and persist the share —
+    /// WITHOUT starting live-sync. Returns the share id and a [`DocResync`] the caller
+    /// runs **off-lock** to kick the network dial. Mirrors [`create_open`]'s two-phase
+    /// shape so the daemon never holds the engine mutex across a `start_sync` (which
+    /// would stall the reconcile loop and every IPC request on a slow/unreachable
+    /// peer — the bug that made a freshly-added share look permanently stuck).
+    ///
+    /// [`create_open`]: Engine::create_open
+    pub async fn add_share_open(
+        &mut self,
+        key_str: &str,
+        folder: &Path,
+        bootstrap: Vec<iroh::EndpointAddr>,
+    ) -> anyhow::Result<(String, DocResync)> {
         let key = ShareKey::decode(key_str).context("decode share key")?;
         let share_id = key.share_id_hex();
-        let state = self
+        let (state, boot) = self
             .open_share(&key, folder, bootstrap, vec![], 0, false)
             .await?;
+        let doc = state.doc.clone();
         self.shares.insert(share_id.clone(), state);
         self.persist_share(&key, folder, vec![], 0, false).await?;
-        Ok(share_id)
+        Ok((
+            share_id.clone(),
+            DocResync {
+                share_id,
+                doc,
+                peers: boot,
+            },
+        ))
     }
 
     /// Ids of every share the engine currently holds (for the daemon loop to
