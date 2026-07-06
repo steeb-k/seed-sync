@@ -70,6 +70,19 @@ impl IgnoreSet {
     }
 }
 
+/// Fail if the share root itself can't be opened for enumeration, instead of letting
+/// `WalkDir(...).filter_map(|e| e.ok())` silently swallow the error and return an empty
+/// set. A silent empty result from an *unreadable* root is dangerous: it looks exactly
+/// like "the folder is empty", which reports a false 100%-healthy and, on a master,
+/// would tombstone every file (propagating the deletion to peers). A genuinely empty
+/// but *readable* directory still returns `Ok(())`.
+fn ensure_root_readable(root: &Path) -> std::io::Result<()> {
+    // Opening the directory for reading is exactly what the walk needs; if that fails
+    // (permission denied, not a directory, gone), surface it rather than hide it. An
+    // empty readable directory yields an empty iterator and still succeeds here.
+    std::fs::read_dir(root).map(|_| ())
+}
+
 /// Convert an absolute path under `root` into a relative POSIX path string.
 fn rel_posix(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
@@ -109,6 +122,7 @@ pub struct ListedFile {
 /// (so the manifest's file order is deterministic). Used by publish, which reads
 /// each file exactly once by importing it into the blob store.
 pub fn list_files(root: &Path, ignore: &IgnoreSet) -> std::io::Result<Vec<ListedFile>> {
+    ensure_root_readable(root)?;
     let mut out = Vec::new();
     for dent in WalkDir::new(root)
         .follow_links(false)
@@ -204,6 +218,7 @@ pub fn quick_signature(root: &Path, ignore: &IgnoreSet, exclude: &HashSet<String
 /// files are NOT an error — the caller retries them later — so one bad file never
 /// aborts the whole scan (which would block the entire share from publishing).
 pub fn scan(root: &Path, ignore: &IgnoreSet) -> std::io::Result<(Vec<ScannedFile>, Vec<String>)> {
+    ensure_root_readable(root)?;
     let mut out = Vec::new();
     let mut skipped = Vec::new();
     for dent in WalkDir::new(root)
@@ -294,6 +309,40 @@ mod tests {
         let (files, skipped) = scan(dir.path(), &ig).unwrap();
         assert!(files.is_empty());
         assert!(skipped.is_empty());
+    }
+
+    /// A share root that can't be read must make the scan ERROR, not return an empty
+    /// set — a silent "empty folder" from an unreadable root reports a false
+    /// 100%-healthy and, on a master, would tombstone every file. Regression for the
+    /// macOS "reports Healthy 100% with 0 files" investigation.
+    #[test]
+    fn scan_errors_on_missing_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let (ig, _) = IgnoreSet::compile(&[]);
+        assert!(scan(&missing, &ig).is_err(), "missing root must error");
+        assert!(list_files(&missing, &ig).is_err(), "missing root must error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_errors_on_unreadable_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("locked-dir");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("a.txt"), b"hi").unwrap();
+        // 0o000: the directory itself can't be opened for reading/enumeration.
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (ig, _) = IgnoreSet::compile(&[]);
+        let scanned = scan(&root, &ig);
+        let listed = list_files(&root, &ig);
+
+        // Restore perms before asserting so the tempdir cleans up regardless.
+        let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o755));
+        assert!(scanned.is_err(), "unreadable root must error, not scan empty");
+        assert!(listed.is_err(), "unreadable root must error, not list empty");
     }
 
     /// `quick_signature` must NOT count excluded paths — that's what stops a

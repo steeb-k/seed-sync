@@ -289,7 +289,10 @@ async fn reconcile_loop(daemon: Daemon) {
             // peer (pairs with the forced deep verify done inside finish_reconcile),
             // and run the periodic deep verify for shares due a full disk-vs-manifest
             // re-check. Both are cheap unless something actually needs healing.
-            daemon.engine.lock().await.resync_diverged_docs().await;
+            let resyncs = { daemon.engine.lock().await.diverged_doc_resyncs() };
+            for resync in resyncs {
+                resync.run().await;
+            }
             let verified = { daemon.engine.lock().await.periodic_deep_verify() };
             if !verified.is_empty() {
                 tracing::info!(
@@ -491,11 +494,20 @@ async fn handle_request(daemon: &Daemon, req: IpcRequest) -> anyhow::Result<IpcR
                 Some(s) => vec![Engine::parse_bootstrap(&s)?],
                 None => vec![],
             };
-            let share_id = {
+            // Open + persist under a brief lock, then start live-sync *off* the lock:
+            // `start_sync` dials the bootstrap peer over the network, and holding the
+            // engine mutex across that dial would freeze the reconcile loop and every
+            // other IPC request if the peer is slow/unreachable (mirrors CreateShare).
+            let (share_id, sync) = {
                 let mut engine = daemon.engine.lock().await;
-                engine.add_share(&key, &PathBuf::from(folder), boot).await?
+                engine
+                    .add_share_open(&key, &PathBuf::from(folder), boot)
+                    .await?
             };
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
+            if let Err(e) = sync.start().await {
+                tracing::warn!("start sync for added share {share_id} failed: {e:#}");
+            }
             IpcResponse::ShareAdded { share_id }
         }
         IpcRequest::Publish { share_id } => {
