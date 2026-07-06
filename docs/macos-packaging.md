@@ -260,6 +260,11 @@ on the arm64 slice (use `lipo -thin x86_64` first to check the Intel slice).
   Macs won't load Aqua agents — the wrapper warns and still places files.
 - **Quarantine dodge is install-path-specific.** It holds for `curl | sh`. A browser download *will* be
   quarantined; the escape hatch is `xattr -dr com.apple.quarantine "<dir>"`.
+- **Register with LaunchServices after copying the `.app`.** A `cp`/`tar` install (unlike a Finder
+  drag) never notifies LaunchServices, so the bundle won't appear in Spotlight / Launchpad / "Open
+  With" until it's registered. `apply_tree` runs `lsregister -f "<app>"`
+  (`…/LaunchServices.framework/…/Support/lsregister`) after the swap. Existing installs pick it up on
+  the next `seed-sync --update`; to fix one in place, run that `lsregister -f` on the app by hand.
 - **Version bump is mandatory per release** (updater is version-driven; bump the Cargo version before building or installs never see it).
 
 ## Future work (not built)
