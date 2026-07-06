@@ -107,6 +107,12 @@ apply_tree() {
   rm -rf "$APP_DST"
   mv "$APP_DST.new" "$APP_DST"
 
+  # Register the bundle with LaunchServices. A cp/tar install (unlike a Finder
+  # drag) never notifies LaunchServices, so without this the app never appears in
+  # Spotlight / Launchpad / "Open With". -f forces a re-scan of the (new) bundle.
+  local lsr="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
+  [ -x "$lsr" ] && "$lsr" -f "$APP_DST" >/dev/null 2>&1 || true
+
   local b
   for b in seed-gui seed-daemon seed-cli; do
     ln -sfn "$MACOS/$b" "$BIN_DIR/$b"
