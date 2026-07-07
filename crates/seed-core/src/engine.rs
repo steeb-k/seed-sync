@@ -253,6 +253,17 @@ const DIVERGENCE_DEEP_VERIFY_SECS: i64 = 600;
 /// this bounds the task *around* the retries, catching hangs the deadline can't.
 const DOWNLOAD_STALL_ABORT_SECS: u64 = 900;
 
+/// Back-pressure on content fetches: at most this many downloads in flight at
+/// once (globally — content is hash-addressed and the map is shared). Without a
+/// cap, a share with thousands of missing files queues a task per blob into the
+/// iroh downloader simultaneously; the multi-GB blobs head-of-line-block the
+/// rest, nothing settles, and the fleet reads 0% for hours (full-size soak #3:
+/// the stall watchdog recycled 5000+ downloads that were queued, not moving).
+/// The reconcile tick re-offers still-missing blobs constantly, so free slots
+/// refill within a tick — this needs no queue of its own, and it restores the
+/// watchdog's meaning (a capped slot idle 15 min really is wedged).
+const MAX_INFLIGHT_DOWNLOADS: usize = 12;
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -909,13 +920,15 @@ impl ReconcileJob {
     /// reassembles the verified ranges into the complete blob. Small blobs (or when
     /// only one source is available) take the simple whole-blob path.
     fn ensure_download(&self, hash: Hash, size: u64) {
-        // Already downloading this blob? (cheap pre-check)
+        // Already downloading this blob, or all download slots busy? The next
+        // reconcile tick re-offers every still-missing blob, so a full window
+        // is back-pressure, not a drop.
         {
             let inflight = match self.downloads_inflight.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
-            if inflight.contains_key(&hash) {
+            if inflight.contains_key(&hash) || inflight.len() >= MAX_INFLIGHT_DOWNLOADS {
                 return;
             }
         }
@@ -953,11 +966,12 @@ impl ReconcileJob {
         });
 
         // Register the abort handle so a pause can cancel this transfer. If another
-        // tick registered the same hash while we were spawning, cancel this duplicate.
+        // tick registered the same hash (or filled the last slot) while we were
+        // spawning, cancel this duplicate.
         let abort = handle.abort_handle();
         match self.downloads_inflight.lock() {
             Ok(mut inflight) => {
-                if inflight.contains_key(&hash) {
+                if inflight.contains_key(&hash) || inflight.len() >= MAX_INFLIGHT_DOWNLOADS {
                     abort.abort();
                 } else {
                     inflight.insert(
