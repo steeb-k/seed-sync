@@ -98,6 +98,15 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+/// A `request` that can't stall the sample loop: a daemon that is slow to answer
+/// (observed during heavy materialization) costs one skipped sample, not minutes
+/// of blind time between samples.
+async fn request_bounded(sock: &std::path::Path, req: IpcRequest) -> anyhow::Result<IpcResponse> {
+    tokio::time::timeout(Duration::from_secs(15), request(sock, req))
+        .await
+        .map_err(|_| anyhow::anyhow!("IPC request timed out (15s)"))?
+}
+
 fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -419,7 +428,7 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
                 .map(|p| (p.cpu_usage(), p.memory() / (1 << 20)))
                 .unwrap_or((0.0, 0));
             let role = if n.is_master { "master" } else { "viewer" };
-            match request(&n.sock, IpcRequest::ListShares).await {
+            match request_bounded(&n.sock, IpcRequest::ListShares).await {
                 Ok(IpcResponse::Shares(shares)) => {
                     for s in shares.iter().filter(|s| s.share_id == share_id) {
                         let status = format!("{:?}", s.status);
@@ -493,7 +502,8 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
     while Instant::now() < deadline && !interrupted {
         let mut healthy = 0;
         for n in &nodes {
-            if let Ok(IpcResponse::Shares(shares)) = request(&n.sock, IpcRequest::ListShares).await
+            if let Ok(IpcResponse::Shares(shares)) =
+                request_bounded(&n.sock, IpcRequest::ListShares).await
             {
                 if shares
                     .iter()

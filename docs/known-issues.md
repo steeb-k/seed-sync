@@ -209,6 +209,33 @@ peers) or empty-store resync.
 
 ---
 
+## 8. Content downloads can wedge silently at multi-GB / multi-peer scale — **MITIGATED**
+**Tier:** observed in soak · **Severity:** high (sync stalls indefinitely) · **Status:** watchdog mitigation landed; root cause open
+**Where:** `ensure_download` / the in-flight map (`crates/seed-core/src/engine.rs`)
+
+**Symptoms (fullsize soak #2, 3M+3V × 42 GB, 2026-07-07,
+`docs/soak-reports/2026-07-07-fullsize-2-download-stall.md`):** of five
+receiving nodes, four sat at 0–5 % for 2.5 h with **zero transport errors
+logged**; only the viewer that was paused and resumed mid-run (which aborts and
+re-queues its downloads) went on to reach 100 %. The in-flight map dedupes by
+hash and entries are only removed when the download task settles, so a wedged
+future blocks its blob's re-queue forever. The health feature correctly
+alerted on every stuck member throughout.
+
+**Mitigation (landed):** `Engine::abort_stalled_downloads` — the daemon aborts
+any download in flight longer than `DOWNLOAD_STALL_ABORT_SECS` (15 min); the
+next reconcile re-queues it and verified chunks resume from disk. Converts a
+permanent stall into a bounded hiccup.
+
+**Root cause (open):** why the download futures hang in the first place —
+suspected iroh connection/stream starvation when several nodes swarm the same
+few multi-GB blobs from one provider set. Needs a focused investigation with
+downloader-level tracing; also re-examine `SWARM_DEADLINE_SECS` interplay (the
+soak's deadline-retry grep found 0 hits, so the per-attempt deadline may not be
+firing on the wedged path).
+
+---
+
 ## 5. LWW compares local file mtime against the doc *record* timestamp
 **Tier:** note · **Severity:** low (semantic; skew-sensitive)
 **Where:** `crates/seed-core/src/engine.rs:1243-1244`

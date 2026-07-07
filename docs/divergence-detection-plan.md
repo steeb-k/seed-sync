@@ -35,6 +35,11 @@ reliability work in `docs/distributed-downloads.md` and the gate-poisoning fix.
   resync tests.
 - Possible future: make the settle window / deep-verify interval configurable, and
   scale the window with share size / peer count.
+- **Open self-heal/deep-verify caveats** (audit, not yet fixed): the detection is
+  solid, but the self-heal plumbing has open issues — lock-held-across-await in the
+  daemon resync, a deep-verify that can be raced away, and a 60 s full-rehash thrash on
+  large `OutOfSync` shares. See `known-issues.md` (#1–#3) before treating "all
+  IMPLEMENTED" as "all solid."
 
 ## Problem
 A member's "health" answers a narrow, local question — *"do I hold the blobs for
