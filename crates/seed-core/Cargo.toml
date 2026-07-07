@@ -57,3 +57,4 @@ keyring.workspace = true
 [dev-dependencies]
 tokio = { workspace = true }
 tempfile = "3"
+seed-harness = { path = "../seed-harness" }
