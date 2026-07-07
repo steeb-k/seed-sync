@@ -47,9 +47,11 @@ async fn concurrent_distinct_files() -> anyhow::Result<()> {
         want.insert(rel, bytes);
     }
 
-    c.drive_until(Duration::from_secs(180), "3-master union convergence", |c| {
-        c.converged(&want)
-    })
+    c.drive_until(
+        Duration::from_secs(180),
+        "3-master union convergence",
+        |c| c.converged(&want),
+    )
     .await?;
     println!(
         "3 masters converged on {} files ({} each) with agreeing fingerprints",
@@ -82,16 +84,20 @@ async fn concurrent_same_file_ordered() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     std::fs::write(c.nodes[1].folder().join("c.txt"), b"v2 from m1 (newer)")?;
     want.insert("c.txt".to_string(), b"v2 from m1 (newer)".to_vec());
-    c.drive_until(Duration::from_secs(90), "m1 LWW win", |c| c.converged(&want))
-        .await?;
+    c.drive_until(Duration::from_secs(90), "m1 LWW win", |c| {
+        c.converged(&want)
+    })
+    .await?;
     println!("LWW m1-newer OK");
 
     // And the reverse direction: m0 edits strictly later → m0 wins.
     tokio::time::sleep(Duration::from_millis(1100)).await;
     std::fs::write(c.nodes[0].folder().join("c.txt"), b"v3 from m0 (newest)")?;
     want.insert("c.txt".to_string(), b"v3 from m0 (newest)".to_vec());
-    c.drive_until(Duration::from_secs(90), "m0 LWW win", |c| c.converged(&want))
-        .await?;
+    c.drive_until(Duration::from_secs(90), "m0 LWW win", |c| {
+        c.converged(&want)
+    })
+    .await?;
     println!("LWW m0-newer OK");
 
     c.shutdown().await?;
@@ -113,18 +119,48 @@ async fn thousands_small_files() -> anyhow::Result<()> {
     let spec_a = CorpusSpec {
         seed: 0xA0,
         buckets: vec![
-            SizeBucket { count: 700, min: 1 << 10, max: 32 << 10, label: "a-small" },
-            SizeBucket { count: 60, min: 64 << 10, max: 512 << 10, label: "a-mid" },
-            SizeBucket { count: 4, min: 5 << 20, max: 8 << 20, label: "a-swarm" },
+            SizeBucket {
+                count: 700,
+                min: 1 << 10,
+                max: 32 << 10,
+                label: "a-small",
+            },
+            SizeBucket {
+                count: 60,
+                min: 64 << 10,
+                max: 512 << 10,
+                label: "a-mid",
+            },
+            SizeBucket {
+                count: 4,
+                min: 5 << 20,
+                max: 8 << 20,
+                label: "a-swarm",
+            },
         ],
         max_dir_depth: 3,
     };
     let spec_b = CorpusSpec {
         seed: 0xB1,
         buckets: vec![
-            SizeBucket { count: 300, min: 1 << 10, max: 32 << 10, label: "b-small" },
-            SizeBucket { count: 30, min: 64 << 10, max: 512 << 10, label: "b-mid" },
-            SizeBucket { count: 2, min: 5 << 20, max: 8 << 20, label: "b-swarm" },
+            SizeBucket {
+                count: 300,
+                min: 1 << 10,
+                max: 32 << 10,
+                label: "b-small",
+            },
+            SizeBucket {
+                count: 30,
+                min: 64 << 10,
+                max: 512 << 10,
+                label: "b-mid",
+            },
+            SizeBucket {
+                count: 2,
+                min: 5 << 20,
+                max: 8 << 20,
+                label: "b-swarm",
+            },
         ],
         max_dir_depth: 3,
     };
@@ -197,8 +233,10 @@ async fn empty_nonempty_cross_master() -> anyhow::Result<()> {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     std::fs::write(c.nodes[1].folder().join("p.txt"), b"refilled by B")?;
     want.insert("p.txt".to_string(), b"refilled by B".to_vec());
-    c.drive_until(Duration::from_secs(90), "refill wins", |c| c.converged(&want))
-        .await?;
+    c.drive_until(Duration::from_secs(90), "refill wins", |c| {
+        c.converged(&want)
+    })
+    .await?;
     println!("content entry (newer) beat empty marker on both members OK");
 
     c.shutdown().await?;
@@ -255,11 +293,15 @@ async fn deep_verify_survives_inflight_reconcile() -> anyhow::Result<()> {
         .open(&path)?
         .set_modified(orig_mtime)?;
 
-    c.drive_until(Duration::from_secs(90), "forced verify heals corruption", |c| {
-        std::fs::read(c.nodes[1].folder().join("x.bin"))
-            .map(|b| b == good)
-            .unwrap_or(false)
-    })
+    c.drive_until(
+        Duration::from_secs(90),
+        "forced verify heals corruption",
+        |c| {
+            std::fs::read(c.nodes[1].folder().join("x.bin"))
+                .map(|b| b == good)
+                .unwrap_or(false)
+        },
+    )
     .await?;
     assert!(
         !c.nodes[1].engine.debug_deep_verify_pending(&share_id),
@@ -293,9 +335,11 @@ async fn no_rescan_thrash_while_out_of_sync() -> anyhow::Result<()> {
     // fingerprint) and change master 0 → persistent disagreement.
     c.nodes[1].engine.set_paused(&share_id, true)?;
     std::fs::write(c.nodes[0].folder().join("newer.txt"), b"m1 never sees this")?;
-    c.drive_until(Duration::from_secs(120), "divergence trips OutOfSync", |c| {
-        c.status(0) == "OutOfSync"
-    })
+    c.drive_until(
+        Duration::from_secs(120),
+        "divergence trips OutOfSync",
+        |c| c.status(0) == "OutOfSync",
+    )
     .await?;
     println!("OutOfSync reached; observing rescan behavior for 90s…");
 
@@ -323,9 +367,11 @@ async fn no_rescan_thrash_while_out_of_sync() -> anyhow::Result<()> {
     // Recovery: unpause master 1 → episode clears, both converge on the union.
     c.nodes[1].engine.set_paused(&share_id, false)?;
     want.insert("newer.txt".to_string(), b"m1 never sees this".to_vec());
-    c.drive_until(Duration::from_secs(120), "episode clears after resume", |c| {
-        c.converged(&want)
-    })
+    c.drive_until(
+        Duration::from_secs(120),
+        "episode clears after resume",
+        |c| c.converged(&want),
+    )
     .await?;
     println!("resumed and re-converged OK");
     c.shutdown().await?;

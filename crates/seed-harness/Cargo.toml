@@ -11,8 +11,16 @@ blake3.workspace = true
 tokio.workspace = true
 walkdir.workspace = true
 
+# seed-soak bin only (this crate is dev-only, so these never ship).
+clap.workspace = true
+sysinfo = "0.33"
+
 # IPC client plumbing for driving real daemon processes (tests + the soak bin).
 seed-ipc = { path = "../seed-ipc", features = ["transport"] }
+
+[[bin]]
+name = "seed-soak"
+path = "src/bin/seed-soak.rs"
 
 [dev-dependencies]
 tempfile = "3"
