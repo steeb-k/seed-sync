@@ -120,6 +120,17 @@ impl PeerRoster {
             .collect()
     }
 
+    /// Online peers with their self-reported sync percent, for provider ordering
+    /// (fully-synced members can serve any blob; partial ones only some).
+    fn online_peer_percents(&self) -> Vec<(String, u8)> {
+        let now = now_secs();
+        self.peers
+            .iter()
+            .filter(|(_, e)| self.is_online(e, now))
+            .map(|(id, e)| (id.clone(), e.percent))
+            .collect()
+    }
+
     /// Known manifest fingerprints of currently-online peers, excluding `0`
     /// (unknown / not yet reported). Used to detect cross-member divergence.
     fn online_manifest_fps(&self) -> Vec<u64> {
@@ -568,20 +579,32 @@ fn live_providers_from(
     roster: &Arc<StdMutex<PeerRoster>>,
     self_id: EndpointId,
     master_id: Option<EndpointId>,
-) -> (Vec<EndpointId>, Option<EndpointId>) {
-    let mut peers: Vec<EndpointId> = Vec::new();
+) -> (Vec<EndpointId>, usize, Option<EndpointId>) {
+    // (peer, self-reported percent). Percent is the peer's own health claim from
+    // presence — a serving-capability heuristic, not a guarantee (it's measured
+    // against the manifest the peer *knows*), so it orders candidates and gates
+    // master participation but never removes anyone from the fallback chain.
+    let mut peers: Vec<(EndpointId, u8)> = Vec::new();
     if let Ok(r) = roster.lock() {
-        for s in r.online_peer_ids() {
+        for (s, percent) in r.online_peer_percents() {
             if let Ok(id) = s.parse::<EndpointId>() {
-                if id != self_id && Some(id) != master_id && !peers.contains(&id) {
-                    peers.push(id);
+                if id != self_id && Some(id) != master_id && !peers.iter().any(|(p, _)| *p == id) {
+                    peers.push((id, percent));
                 }
             }
         }
     }
     peers.shuffle(&mut rand::thread_rng());
+    // Fully-synced peers first (they can serve anything); stable sort keeps the
+    // shuffle within each group so load still spreads.
+    peers.sort_by_key(|(_, pct)| std::cmp::Reverse(*pct >= 100));
+    let full_peers = peers.iter().filter(|(_, pct)| *pct >= 100).count();
     let master = master_id.filter(|m| *m != self_id);
-    (peers, master)
+    (
+        peers.into_iter().map(|(id, _)| id).collect(),
+        full_peers,
+        master,
+    )
 }
 
 /// Fetch one blob as a **swarm**: split its chunk range into one contiguous part
@@ -609,7 +632,7 @@ async fn swarm_download(
     master_id: Option<EndpointId>,
 ) -> anyhow::Result<()> {
     let total = ChunkNum::chunks(size).0; // number of bao chunks covering the blob
-    let (peers0, _) = live_providers_from(roster, self_id, master_id);
+    let (peers0, _, _) = live_providers_from(roster, self_id, master_id);
     let parts = peers0
         .len()
         .min(SWARM_MAX_PARTS)
@@ -635,26 +658,45 @@ async fn swarm_download(
             if blobs.blobs().has(hash).await.unwrap_or(false) {
                 return Ok(());
             }
-            let (peers, master) = live_providers_from(roster, self_id, master_id);
+            let (peers, full_peers, master) = live_providers_from(roster, self_id, master_id);
             let mut set = tokio::task::JoinSet::new();
             for (idx, &(lo, hi)) in ranges.iter().enumerate() {
-                // Peers first (this part's assigned peer at the front), master only
-                // once this part's grace has elapsed (or if there are no peers).
-                let mut plist: Vec<EndpointId> = Vec::new();
-                if !peers.is_empty() {
-                    let primary = peers[idx % peers.len()];
-                    plist.push(primary);
-                    plist.extend(peers.iter().copied().filter(|p| *p != primary));
+                // Master participation policy (the original seeder must neither
+                // be hammered nor become a single point of slowness):
+                //  - before this part's grace elapses: peers only (cold-start
+                //    relief), unless there are no peers at all;
+                //  - after grace, while FEWER than 3 fully-synced peers exist:
+                //    the master joins the rotation as an EQUAL candidate —
+                //    appended-last meant the first finisher became the fleet's
+                //    sole seeder while the master sat idle (soak finding);
+                //  - once ≥3 fully-synced peers can do the same job: the master
+                //    drops out entirely and the peer swarm carries it;
+                //  - desperation valve: a part still incomplete several rounds
+                //    past its grace re-admits the master as a last-resort tail.
+                //    "Fully synced" is self-reported against the manifest a peer
+                //    KNOWS, so a fresh master-authored blob may exist nowhere
+                //    else — without this valve that blob could never propagate.
+                let mut candidates: Vec<EndpointId> = peers.clone();
+                let rotate_master_in = peers.is_empty() || (round >= grace[idx] && full_peers < 3);
+                if rotate_master_in {
+                    if let Some(m) = master {
+                        if !candidates.contains(&m) {
+                            candidates.push(m);
+                        }
+                    }
                 }
-                if peers.is_empty() || round >= grace[idx] {
+                if candidates.is_empty() {
+                    continue;
+                }
+                let primary = candidates[idx % candidates.len()];
+                let mut plist = vec![primary];
+                plist.extend(candidates.iter().copied().filter(|p| *p != primary));
+                if !rotate_master_in && round >= grace[idx] + SWARM_MASTER_GRACE_ROUNDS {
                     if let Some(m) = master {
                         if !plist.contains(&m) {
                             plist.push(m);
                         }
                     }
-                }
-                if plist.is_empty() {
-                    continue;
                 }
                 let req =
                     GetRequest::blob_ranges(hash, ChunkRanges::from(ChunkNum(lo)..ChunkNum(hi)));
@@ -888,7 +930,7 @@ impl ReconcileJob {
     }
 
     /// Live content providers for this job — see [`live_providers_from`].
-    fn live_providers(&self) -> (Vec<EndpointId>, Option<EndpointId>) {
+    fn live_providers(&self) -> (Vec<EndpointId>, usize, Option<EndpointId>) {
         live_providers_from(&self.roster, self.self_id, self.master_id)
     }
 
@@ -932,12 +974,15 @@ impl ReconcileJob {
                 return;
             }
         }
-        let (peers, master) = self.live_providers();
+        let (peers, _full_peers, master) = self.live_providers();
         if peers.is_empty() && master.is_none() {
             // Nobody to pull from yet (no peers, we are the only/master node).
             return;
         }
-        // Full fallback set for the simple path: master last so peers are preferred.
+        // Full fallback set for the simple path: fully-synced peers first (they
+        // can serve anything), then partial peers, master last. Sequential
+        // fallback means the master is dialed only when every peer failed —
+        // that's already "don't hammer the original seeder".
         let fallback: Vec<EndpointId> = peers.iter().copied().chain(master).collect();
         let swarm = size >= SWARM_MIN_SIZE && peers.len() >= 2;
 
