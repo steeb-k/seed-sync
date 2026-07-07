@@ -129,9 +129,13 @@ impl PresenceBroadcast {
         }
     }
 
-    /// Send the broadcast (best-effort; gossip delivery is unreliable by design).
+    /// Send the broadcast (best-effort; gossip delivery is unreliable by design,
+    /// but a *failing send* means our own topic handle is unhealthy — worth a
+    /// warning, since peers will age us out and the mesh looks dead from outside).
     pub async fn send(self) {
-        let _ = self.sender.broadcast(self.bytes).await;
+        if let Err(e) = self.sender.broadcast(self.bytes).await {
+            tracing::warn!("presence broadcast failed: {e:#}");
+        }
     }
 }
 
@@ -156,9 +160,14 @@ impl PresenceRejoin {
     }
 
     /// Ask the gossip swarm to connect to these peers (best-effort; idempotent for
-    /// peers already in the active view).
+    /// peers already in the active view). This is the mesh's only repair path —
+    /// the daemon calls it every ~6s — so persistent failure here is exactly the
+    /// "presence dead while sync still works" outage and must not be silent.
     pub async fn join(self) {
-        let _ = self.sender.join_peers(self.peers).await;
+        let n = self.peers.len();
+        if let Err(e) = self.sender.join_peers(self.peers).await {
+            tracing::warn!("presence mesh join ({n} peer(s)) failed: {e:#}");
+        }
     }
 }
 
@@ -207,9 +216,15 @@ pub(crate) async fn spawn_presence(
                         r.note(&id.to_string(), Some(false));
                     }
                 }
-                Event::Lagged => {}
+                Event::Lagged => {
+                    tracing::debug!("presence receiver lagged (events dropped)");
+                }
             }
         }
+        // The subscription stream ended: no more presence/neighbor events will
+        // ever arrive for this share (peers will read as offline within the TTL)
+        // until the share is reopened. Never expected in normal operation.
+        tracing::warn!("presence receive stream ENDED — roster updates stopped for this share");
     });
     Ok(PresenceHandle {
         sender,
