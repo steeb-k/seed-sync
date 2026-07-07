@@ -414,10 +414,36 @@ struct LocalEntry {
     abs: Option<PathBuf>,
 }
 
+/// Insert `entry` for `path`, resolving a collision between the content key `P`
+/// and the empty-file marker `\x00e/P` by record timestamp (LWW), newer wins.
+/// Within one author the two keys are mutually exclusive, but across two masters
+/// a path that flips empty↔non-empty can have a live entry under *both* keys —
+/// neither author deletes the other's. Deciding by stream order (the old
+/// behavior) ignored which edit was newer and, worse, could make two members
+/// with identical docs compute different merged views → different
+/// `manifest_fingerprint`s → a false OutOfSync. Tie on equal ts breaks
+/// deterministically: content beats the empty marker, then larger hash bytes —
+/// never insertion order, so every member resolves identically.
+fn insert_remote_lww(out: &mut HashMap<String, RemoteEntry>, path: String, entry: RemoteEntry) {
+    use std::collections::hash_map::Entry;
+    match out.entry(path) {
+        Entry::Vacant(v) => {
+            v.insert(entry);
+        }
+        Entry::Occupied(mut o) => {
+            let cur = o.get();
+            if (entry.ts, entry.size != 0, &entry.hash) > (cur.ts, cur.size != 0, &cur.hash) {
+                o.insert(entry);
+            }
+        }
+    }
+}
+
 /// Read the merged file view from the doc: latest-per-key, with deletion markers
 /// already excluded by the query (so a tombstoned file is simply absent). Normal
 /// keys carry content; `\x00e/<path>` keys mark empty files; other control keys
-/// (e.g. `\x00ignore`) are skipped.
+/// (e.g. `\x00ignore`) are skipped. A path live under both keyspaces resolves by
+/// LWW via [`insert_remote_lww`].
 async fn read_remote_files(doc: &Doc) -> anyhow::Result<HashMap<String, RemoteEntry>> {
     let mut out = HashMap::new();
     let mut s = std::pin::pin!(doc.get_many(Query::single_latest_per_key()).await?);
@@ -427,7 +453,8 @@ async fn read_remote_files(doc: &Doc) -> anyhow::Result<HashMap<String, RemoteEn
         if key.first() == Some(&CONTROL_PREFIX) {
             if let Some(rel) = key.strip_prefix(EMPTY_PREFIX) {
                 if let Ok(path) = std::str::from_utf8(rel) {
-                    out.insert(
+                    insert_remote_lww(
+                        &mut out,
                         path.to_string(),
                         RemoteEntry {
                             hash: Hash::EMPTY.as_bytes().to_vec(),
@@ -442,7 +469,8 @@ async fn read_remote_files(doc: &Doc) -> anyhow::Result<HashMap<String, RemoteEn
         let Ok(path) = std::str::from_utf8(key) else {
             continue;
         };
-        out.insert(
+        insert_remote_lww(
+            &mut out,
             path.to_string(),
             RemoteEntry {
                 hash: e.content_hash().as_bytes().to_vec(),
@@ -1529,7 +1557,10 @@ impl DocResync {
         if self.peers.is_empty() {
             return Ok(());
         }
-        self.doc.start_sync(self.peers).await.context("start sync")?;
+        self.doc
+            .start_sync(self.peers)
+            .await
+            .context("start sync")?;
         Ok(())
     }
 
@@ -1704,7 +1735,10 @@ impl Engine {
             // inline. Best-effort: a share whose peer can't be dialed now is retried
             // by the periodic self-heal (see `diverged_doc_resyncs`).
             if let Err(e) = state.doc.start_sync(boot).await {
-                tracing::warn!("start sync for reloaded share {} failed: {e:#}", rec.share_id);
+                tracing::warn!(
+                    "start sync for reloaded share {} failed: {e:#}",
+                    rec.share_id
+                );
             }
             // Restore the persisted change-signature so an unchanged folder isn't
             // re-imported on every restart.
@@ -2768,6 +2802,51 @@ mod tests {
         // Never the 0 (= "unknown") sentinel, even for an empty view.
         let empty: HashMap<String, RemoteEntry> = HashMap::new();
         assert_ne!(manifest_fingerprint(&empty), 0);
+    }
+
+    /// Cross-master empty↔non-empty flip: when both the content key and the
+    /// empty-marker key are live for one path, the merged view must keep the
+    /// newer record — and resolve identically regardless of stream order, or two
+    /// members with the same doc would fingerprint differently (false OutOfSync).
+    #[test]
+    fn remote_lww_resolves_empty_vs_content_by_timestamp() {
+        let content = |ts: u64| RemoteEntry {
+            hash: vec![7u8; 32],
+            size: 10,
+            ts,
+        };
+        let empty = |ts: u64| RemoteEntry {
+            hash: Hash::EMPTY.as_bytes().to_vec(),
+            size: 0,
+            ts,
+        };
+
+        // Newer empty marker beats older content, in both insertion orders.
+        let mut a = HashMap::new();
+        insert_remote_lww(&mut a, "p".into(), content(100));
+        insert_remote_lww(&mut a, "p".into(), empty(200));
+        let mut b = HashMap::new();
+        insert_remote_lww(&mut b, "p".into(), empty(200));
+        insert_remote_lww(&mut b, "p".into(), content(100));
+        assert_eq!(a["p"].size, 0, "newer truncation must win");
+        assert_eq!(a["p"].ts, b["p"].ts, "resolution must be order-insensitive");
+        assert_eq!(manifest_fingerprint(&a), manifest_fingerprint(&b));
+
+        // Newer content beats older empty marker.
+        let mut c = HashMap::new();
+        insert_remote_lww(&mut c, "p".into(), empty(100));
+        insert_remote_lww(&mut c, "p".into(), content(200));
+        assert_eq!(c["p"].size, 10, "newer content must win");
+
+        // Equal ts: deterministic tie-break (content over marker), either order.
+        let mut d = HashMap::new();
+        insert_remote_lww(&mut d, "p".into(), empty(300));
+        insert_remote_lww(&mut d, "p".into(), content(300));
+        let mut e = HashMap::new();
+        insert_remote_lww(&mut e, "p".into(), content(300));
+        insert_remote_lww(&mut e, "p".into(), empty(300));
+        assert_eq!(d["p"].size, 10);
+        assert_eq!(manifest_fingerprint(&d), manifest_fingerprint(&e));
     }
 
     /// Regression for "new folders vanish": empty-dir cleanup after a delete must
