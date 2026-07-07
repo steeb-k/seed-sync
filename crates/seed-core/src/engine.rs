@@ -670,6 +670,13 @@ pub struct ReconcileOutcome {
     /// Fingerprint of the merged manifest this pass, broadcast in presence and
     /// compared across members to detect divergence. See [`manifest_fingerprint`].
     manifest_fp: u64,
+    /// This pass ran because a deep verify was pending ([`ReconcileJob::force_scan`]).
+    /// Tells [`Engine::finish_reconcile`] to clear the pending flag and advance
+    /// `last_deep_verify` — completion, not request, satisfies the force.
+    forced_scan: bool,
+    /// This pass did a full hashing scan (forced or signature-triggered). Feeds the
+    /// per-share scan counter used by tests/soaks to assert rescan policy.
+    did_full_scan: bool,
 }
 
 impl ReconcileOutcome {
@@ -724,6 +731,10 @@ pub struct ReconcileJob {
     prev_skipped: Vec<String>,
     base: HashMap<String, Vec<u8>>,
     last_quick_sig: u64,
+    /// A deep verify is pending: do a full hashing scan regardless of the quick
+    /// signature. Read (not cleared) from `ShareState.force_deep_verify` at job
+    /// build; cleared by `finish_reconcile` only when this job's outcome commits.
+    force_scan: bool,
     progress: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
 }
 
@@ -990,7 +1001,7 @@ impl ReconcileJob {
         // gate-poisoning bug). The end-of-pass signature excludes the same way.
         let prev_skipped_set: HashSet<String> = self.prev_skipped.iter().cloned().collect();
         let quick_sig = scan::quick_signature(&self.folder, &ignore_set, &prev_skipped_set);
-        let do_scan = quick_sig != self.last_quick_sig;
+        let do_scan = self.force_scan || quick_sig != self.last_quick_sig;
         // Build the local view, plus the candidate paths to (re)attempt reading this
         // pass: when scanning, whatever the scan couldn't read; otherwise the set
         // skipped on the previous pass.
@@ -1355,6 +1366,8 @@ impl ReconcileJob {
             reclaim,
             skipped: still_skipped,
             manifest_fp: manifest_fingerprint(&remote),
+            forced_scan: self.force_scan,
+            did_full_scan: do_scan,
         })
     }
 }
@@ -1402,9 +1415,17 @@ struct ShareState {
     /// Whether we've already logged a WARN for the current divergence episode, to
     /// avoid repeating it every tick. Cleared when agreement returns.
     diverged_alerted: bool,
-    /// Unix seconds of the last forced deep verify (full hashing scan). Paces both
-    /// the periodic verify and the divergence-triggered self-heal rescan.
+    /// Unix seconds of the last *completed* deep verify (full hashing scan).
+    /// Advanced by [`Engine::finish_reconcile`] when a forced scan commits, so a
+    /// verify that never ran can't push the next one out a whole interval.
     last_deep_verify: i64,
+    /// A deep verify (full hashing scan) is pending for this share. Set by
+    /// [`Engine::request_deep_verify`], [`Engine::periodic_deep_verify`], and the
+    /// divergence self-heal; carried into the next [`ReconcileJob`] and cleared by
+    /// [`Engine::finish_reconcile`] only when a forced scan actually completed —
+    /// an in-flight unforced job or a failed job can no longer swallow the request
+    /// (the old `last_quick_sig = 0` force was clobbered by any concurrent commit).
+    force_deep_verify: bool,
 }
 
 impl ShareState {
@@ -1818,6 +1839,7 @@ impl Engine {
                 // Stagger the first periodic deep verify a full interval out, so a
                 // restart doesn't re-hash every share immediately.
                 last_deep_verify: now_secs(),
+                force_deep_verify: false,
             },
             bootstrap,
         ))
@@ -2021,29 +2043,33 @@ impl Engine {
     /// verify): re-examine every file on disk against the manifest rather than
     /// trusting the cheap change-signature. Catches drift the signature can't see
     /// (in-place corruption with unchanged size+mtime, a stale index) and re-asserts
-    /// / re-materializes to re-converge. Cheap to request — it just clears the gate.
+    /// / re-materializes to re-converge. Cheap to request — it just sets a pending
+    /// flag; `last_deep_verify` advances only when the forced scan completes.
     pub fn request_deep_verify(&mut self, share_id: &str) {
         if let Some(s) = self.shares.get_mut(share_id) {
-            s.last_quick_sig = 0;
-            s.last_deep_verify = now_secs();
+            s.force_deep_verify = true;
         }
     }
 
     /// Force a deep verify of every non-paused share whose last one is older than
     /// [`DEEP_VERIFY_INTERVAL_SECS`]. Called periodically by the daemon; returns the
-    /// ids that were due (for logging). A no-op for shares verified recently.
+    /// ids that were due (for logging). A no-op for shares verified recently or
+    /// with a verify already pending (so a pending one isn't re-logged every call).
     pub fn periodic_deep_verify(&mut self) -> Vec<String> {
         let now = now_secs();
         let due: Vec<String> = self
             .shares
             .iter()
-            .filter(|(_, s)| !s.paused && now - s.last_deep_verify >= DEEP_VERIFY_INTERVAL_SECS)
+            .filter(|(_, s)| {
+                !s.paused
+                    && !s.force_deep_verify
+                    && now - s.last_deep_verify >= DEEP_VERIFY_INTERVAL_SECS
+            })
             .map(|(id, _)| id.clone())
             .collect();
         for id in &due {
             if let Some(s) = self.shares.get_mut(id) {
-                s.last_quick_sig = 0;
-                s.last_deep_verify = now;
+                s.force_deep_verify = true;
             }
         }
         due
@@ -2251,6 +2277,7 @@ impl Engine {
             prev_skipped: state.skipped.clone(),
             base,
             last_quick_sig: state.last_quick_sig,
+            force_scan: state.force_deep_verify,
             progress,
         }))
     }
@@ -2288,6 +2315,13 @@ impl Engine {
         state.manifest_fp = out.manifest_fp;
         state.last_quick_sig = out.new_quick_sig;
         let _ = self.db.set_quick_sig(share_id, out.new_quick_sig);
+        if out.forced_scan {
+            // A pending deep verify actually ran and committed: satisfy it. A force
+            // set *during* this (unforced) job stays pending for the next one, and a
+            // failed job (outcome None above) never clears it.
+            state.force_deep_verify = false;
+            state.last_deep_verify = now_secs();
+        }
         if out.changed {
             state.last_seqno = state.last_seqno.saturating_add(1);
             state.last_updated = now_secs();
