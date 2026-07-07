@@ -210,9 +210,11 @@ const DIVERGENCE_SETTLE_SECS: i64 = 45;
 /// after a crash). Low frequency — it re-hashes the whole folder.
 const DEEP_VERIFY_INTERVAL_SECS: i64 = 4 * 3600;
 
-/// While a share is out of sync, how often the self-heal re-asserts local truth via a
-/// forced deep verify. Rate-limited so a large folder isn't re-hashed every tick.
-const DIVERGENCE_RESCAN_MIN_SECS: i64 = 60;
+/// How long a share must stay out of sync before the self-heal escalates from the
+/// cheap paths (per-tick re-materialization + the daemon's ~6s doc-resync kicks) to
+/// ONE forced deep verify for the episode. Long enough that a slow-but-converging
+/// peer never costs a full rehash of a multi-GB share.
+const DIVERGENCE_DEEP_VERIFY_SECS: i64 = 600;
 
 fn now_secs() -> i64 {
     SystemTime::now()
@@ -1426,6 +1428,14 @@ struct ShareState {
     /// an in-flight unforced job or a failed job can no longer swallow the request
     /// (the old `last_quick_sig = 0` force was clobbered by any concurrent commit).
     force_deep_verify: bool,
+    /// The current divergence episode has already escalated to its one forced deep
+    /// verify (see [`DIVERGENCE_DEEP_VERIFY_SECS`]). Cleared when agreement returns,
+    /// so the next episode may escalate again.
+    diverged_deep_verified: bool,
+    /// Full hashing scans committed this session (signature-triggered or forced).
+    /// Diagnostic: lets tests and soaks assert the rescan policy (e.g. that an
+    /// OutOfSync share isn't re-hashing on a cadence).
+    full_scans: u64,
 }
 
 impl ShareState {
@@ -1840,6 +1850,8 @@ impl Engine {
                 // restart doesn't re-hash every share immediately.
                 last_deep_verify: now_secs(),
                 force_deep_verify: false,
+                diverged_deep_verified: false,
+                full_scans: 0,
             },
             bootstrap,
         ))
@@ -2073,6 +2085,23 @@ impl Engine {
             }
         }
         due
+    }
+
+    /// Full hashing scans committed for a share this session. Diagnostic for tests
+    /// and soaks asserting the rescan policy; not part of the IPC surface.
+    #[doc(hidden)]
+    pub fn debug_full_scans(&self, share_id: &str) -> u64 {
+        self.shares.get(share_id).map(|s| s.full_scans).unwrap_or(0)
+    }
+
+    /// Whether a deep verify is pending (requested but not yet committed) for a
+    /// share. Diagnostic counterpart to [`Engine::request_deep_verify`].
+    #[doc(hidden)]
+    pub fn debug_deep_verify_pending(&self, share_id: &str) -> bool {
+        self.shares
+            .get(share_id)
+            .map(|s| s.force_deep_verify)
+            .unwrap_or(false)
     }
 
     /// Re-kick a share's doc live-sync against its currently-known peers, in case
@@ -2322,6 +2351,9 @@ impl Engine {
             state.force_deep_verify = false;
             state.last_deep_verify = now_secs();
         }
+        if out.did_full_scan {
+            state.full_scans = state.full_scans.saturating_add(1);
+        }
         if out.changed {
             state.last_seqno = state.last_seqno.saturating_add(1);
             state.last_updated = now_secs();
@@ -2357,13 +2389,17 @@ impl Engine {
                             .count(),
                     );
                 }
-                // Self-heal: force a deep verify (rate-limited) so we re-assert local
-                // truth into the manifest and re-materialize anything missing, instead
-                // of just alerting. The daemon separately re-kicks doc live-sync.
-                if now_secs() - state.last_deep_verify >= DIVERGENCE_RESCAN_MIN_SECS {
-                    state.last_quick_sig = 0;
-                    state.last_deep_verify = now_secs();
-                    tracing::info!("share {share_id}: self-heal — forcing deep verify");
+                // Self-heal escalation, at most ONCE per divergence episode: normal
+                // reconciles keep re-materializing missing blobs every tick and the
+                // daemon re-kicks doc live-sync every ~6s, which heals the common
+                // propagation-lag divergence with zero rehashes. Only when the
+                // disagreement outlives those cheap paths do we force one deep verify
+                // (full hashing scan) to re-assert local truth — the old 60s cadence
+                // re-hashed multi-GB shares every minute for the whole episode.
+                if elapsed >= DIVERGENCE_DEEP_VERIFY_SECS && !state.diverged_deep_verified {
+                    state.diverged_deep_verified = true;
+                    state.force_deep_verify = true;
+                    tracing::info!("share {share_id}: self-heal — forcing one deep verify");
                 }
             }
         } else {
@@ -2373,6 +2409,7 @@ impl Engine {
             }
             state.diverged_since = None;
             state.diverged_alerted = false;
+            state.diverged_deep_verified = false;
         }
     }
 
