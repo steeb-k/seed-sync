@@ -17,15 +17,16 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` landed (commit)
 
 ## Phases
 
-- `[ ]` **Phase 1 — deep-verify force flag** (known-issues #2): explicit
+- `[x]` **Phase 1 — deep-verify force flag** (known-issues #2): explicit
   `force_deep_verify` on `ShareState`, cleared only when a forced scan
   *completes*; `last_deep_verify` advances on completion, not on request.
-- `[ ]` **Phase 2 — OutOfSync self-heal rescan policy** (#3): drop the 60 s
+  (`ae42016`)
+- `[x]` **Phase 2 — OutOfSync self-heal rescan policy** (#3): drop the 60 s
   full-rehash cadence; escalate to **one** deep verify per divergence episode
-  after 10 min diverged (`DIVERGENCE_DEEP_VERIFY_SECS = 600`).
-- `[ ]` **Phase 3 — empty-marker vs content LWW** (#4): `read_remote_files`
+  after 10 min diverged (`DIVERGENCE_DEEP_VERIFY_SECS = 600`). (`e40b3cb`)
+- `[x]` **Phase 3 — empty-marker vs content LWW** (#4): `read_remote_files`
   resolves a live content key vs live empty marker for one path by record
-  timestamp with a deterministic tie-break, never stream order.
+  timestamp with a deterministic tie-break, never stream order. (`bad7983`)
 - `[ ]` **Phase 4 — test harness**: `crates/seed-harness` (deterministic corpus
   generator, daemon-process helpers, report writer), shared in-process
   `Cluster` helpers under `crates/seed-core/tests/common/`, and the

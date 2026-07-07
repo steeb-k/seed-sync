@@ -2,7 +2,8 @@
 
 Open bugs and design caveats in the sync engine, found by audit rather than by a
 failing test. Each entry notes where it lives, what goes wrong, why, and a suggested
-fix — **none of these are implemented yet.**
+fix. **#1–#4 are now fixed** (see each entry and `production-readiness-plan.md`);
+#5–#6 remain design notes.
 
 Scope: healing + multi-master behavior. The cross-member divergence *detection*
 (manifest fingerprint determinism, the 45 s settle window, the false-alarm guard)
@@ -54,10 +55,17 @@ await); drop the lock; then `start_sync` each off-lock.
 
 ---
 
-## 2. A requested / periodic deep-verify can be silently lost (race)
+## 2. A requested / periodic deep-verify can be silently lost (race) — **FIXED**
 **Tier:** confirmed · **Severity:** medium (silent: drops a scheduled integrity scan)
+**Status:** fixed
 **Where:** `crates/seed-core/src/engine.rs:1928` (`request_deep_verify`), `:1938`
 (`periodic_deep_verify`), clobbered at `:2168` (`finish_reconcile`)
+
+> **Fixed** per the suggestion below: the force is now an explicit
+> `ShareState.force_deep_verify` flag carried into the job as
+> `ReconcileJob.force_scan` and cleared only when a *forced outcome commits*
+> (`finish_reconcile`); `last_deep_verify` advances on completion, not request, so
+> a lost verify can no longer skip its 4 h re-arm. Original write-up kept below.
 
 ```rust
 // request_deep_verify / periodic_deep_verify force the next scan:
@@ -88,9 +96,17 @@ surviving a concurrent commit.
 
 ---
 
-## 3. Self-heal re-hashes the entire folder every 60 s while `OutOfSync`
+## 3. Self-heal re-hashes the entire folder every 60 s while `OutOfSync` — **FIXED**
 **Tier:** confirmed · **Severity:** medium (CPU/disk thrash on large shares)
+**Status:** fixed
 **Where:** `crates/seed-core/src/engine.rs:2208-2212`, constant at `:215`
+
+> **Fixed** per the second suggested option: the 60 s rescan cadence
+> (`DIVERGENCE_RESCAN_MIN_SECS`) is gone. While diverged, healing rides the cheap
+> paths (per-tick blob re-materialization + the daemon's ~6 s doc-resync kicks);
+> the self-heal escalates to at most **one** forced deep verify per divergence
+> episode, after 10 min diverged (`DIVERGENCE_DEEP_VERIFY_SECS = 600`), with the
+> episode latch cleared on re-agreement. Original write-up kept below.
 
 ```rust
 // finish_reconcile, while persistently diverged:
@@ -120,9 +136,17 @@ self-heal can degrade the responsiveness it's meant to restore.
 
 ---
 
-## 4. Empty-marker vs content-entry for one path resolved by key-sort, not LWW
+## 4. Empty-marker vs content-entry for one path resolved by key-sort, not LWW — **FIXED**
 **Tier:** needs verification · **Severity:** medium if confirmed (data + false alarm)
+**Status:** fixed
 **Where:** `crates/seed-core/src/engine.rs:419-453` (`read_remote_files`)
+
+> **Fixed** per the suggestion below: `insert_remote_lww` resolves a live content
+> entry vs a live empty marker for one path by record `ts` (newer wins) with a
+> deterministic tie-break (content over marker, then hash bytes) — never stream
+> order, so identical docs always fingerprint identically. Unit-tested both
+> insertion orders + ties; the cross-author loopback test ships with the
+> multi-master suite. Original write-up kept below.
 
 **Symptom (potential):** for a path that flips between empty and non-empty across two
 masters, the wrong side can win regardless of which edit is newer; and — worst case —
