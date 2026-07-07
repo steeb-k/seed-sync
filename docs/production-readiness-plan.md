@@ -81,6 +81,23 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` landed (commit)
 | 2026-07-06 | smoke | 3M+5V, scaled 0.47 GB, 8 min, churn+degrade+conflict, health 60/120s | (dir cleaned) | Sync + health pipeline PASS: all nodes Healthy + byte-identical; degraded→renotify→recovered events on masters; verdict line read FAIL only from a harness bug (race-file exclusion), fixed in the next soak commit |
 | 2026-07-07 | fullsize #1 | 3M+3V, full 41.9 GB/copy (6 ISOs 3–6 GB), 1 h window, churn+degrade+conflict, health 900/900s | interrupted (Windows rebooted mid-verify; no report) | **FINDING: presence mesh collapsed at t+91s under sustained 42 GB transfer load and never recovered for the whole hour** — every node read `online: 1 of 6` while doc/content sync continued; health events therefore 0, and swarm provider selection degraded to single-source fetches (nodes only 6–30 % after 1 h). Root cause: presence ran on the reconcile loop's tail → fixed (dedicated presence loop). Salvage restart also exposed known-issues #7 (unclean-shutdown recovery wedge). |
 | 2026-07-07 | fullsize #2 | 3M+3V, full 41.9 GB/copy, 90 min window, churn+degrade+conflict, health 600/900s | `docs/soak-reports/2026-07-07-fullsize-2-download-stall.md` | FAIL (sync), **health pipeline PASS**: mesh stayed up all run, named degraded alerts at exactly 600s + renotifies + self-alert + recoveries. **FINDING (known-issues #8): downloads wedge silently** — 4 of 5 receivers pinned at 0–5 % for 2.5 h, zero errors logged; the once-paused viewer (pause aborts + re-queues downloads) was the only node to reach 100 %. Stall watchdog (15 min abort + re-queue) landed; root cause open. |
+| 2026-07-07 | fullsize #3 | same config | aborted at ~t+2100 (diagnosis complete) | Watchdog alone insufficient: it recycled **5000+** downloads — the engine queued a task for every missing blob at once (~4000/node) and the ISOs head-of-line-blocked the pile. Root cause of #8 identified → `MAX_INFLIGHT_DOWNLOADS = 12` back-pressure landed. |
+| 2026-07-07 | fullsize #4 | same config, + download cap | aborted at ~t+4600 (behavior established) | Cap works: steady climb everywhere (vs #3's flatline), no wedges. New bottleneck exposed: master appended last in provider lists → the first finished peer became the fleet's **sole seeder** while the master idled. → balanced-seeding policy landed (master rotates in post-grace, retires at ≥3 fully-synced peers, liveness valve). |
+| 2026-07-07 | fullsize #5 | same config, + balanced seeding | `docs/soak-reports/` (see below) | **Zero watchdog fires, zero swarm-deadline timeouts, health pipeline exact** — reliability layer holds. Sync reached ~28 % (front-runners) in the 90 min window: small/mid files fast and even, the six 3–6 GB ISOs throughput-bound on one shared disk. Remaining work is bulk-transfer performance tuning (swarm pacing/slot allocation), not correctness. |
+
+## Next engineering (from the soaks, ordered)
+
+1. **Bulk-transfer throughput at ISO scale** — with reliability fixed (cap +
+   watchdog + balanced seeding), 3–6 GB blobs move correctly but slowly
+   (~1.5 MB/s/node on the shared-disk fleet). Tune: swarm round pacing /
+   backoff, per-part sizing, slot allocation (reserve slots for small files vs
+   ISOs), possibly fewer concurrent ISO swarms per node so each gets real
+   bandwidth. Validate on real separate machines — the single shared disk in
+   the soak understates production throughput.
+2. **known-issues #7** — unclean-shutdown recovery wedge (startup + first
+   reconcile under live peer pressure). Has a repro recipe.
+3. **known-issues #8 root cause** — why individual download futures could sit
+   unfinished (mitigated by cap+watchdog; understand the iroh-level behavior).
 
 ## Deferred / stretch
 
