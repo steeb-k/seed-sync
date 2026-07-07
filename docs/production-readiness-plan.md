@@ -27,22 +27,26 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` landed (commit)
 - `[x]` **Phase 3 — empty-marker vs content LWW** (#4): `read_remote_files`
   resolves a live content key vs live empty marker for one path by record
   timestamp with a deterministic tie-break, never stream order. (`bad7983`)
-- `[ ]` **Phase 4 — test harness**: `crates/seed-harness` (deterministic corpus
-  generator, daemon-process helpers, report writer), shared in-process
-  `Cluster` helpers under `crates/seed-core/tests/common/`, and the
-  `multi_master.rs` suite.
-- `[ ]` **Phase 5 — peer health tracking**: persisted `peer_health` table,
+- `[x]` **Phase 4 — test harness**: `crates/seed-harness` (deterministic corpus
+  generator, daemon-process helpers), shared in-process `Cluster` helpers under
+  `crates/seed-core/tests/common/`, and the `multi_master.rs` suite — all six
+  tests green, incl. 3-master concurrent burst + 1096-file convergence.
+  (`d4dae31`)
+- `[x]` **Phase 5 — peer health tracking**: persisted `peer_health` table,
   injectable `HealthPolicy` (12 h / 8 h / 24 h; `SEED_HEALTH_*` env overrides),
   `Engine::health_alerts()` detector (master-majority fingerprint consensus,
-  pause-not-reset timer), `tests/health.rs`.
-- `[ ]` **Phase 6 — IPC `PeerHealth` event + daemon emit**: new event +
-  `GetPeerHealth`; daemon emits off-lock; dead IPC variants removed;
-  `seed-daemon/tests/health_ipc.rs` (the automated notification test).
-- `[ ]` **Phase 7 — GUI/OS notifications**: `notify-rust` backend +
-  `adw::Toast`; self / remote / recovered copy; manual verify Win + Linux.
-- `[ ]` **Phase 8 — soaks**: `seed-soak` bin; full-size content soak
-  (3 masters + 3 viewers, ~210 GB, real 3–6 GB ISOs) and fleet soak
-  (3 masters + 25 viewers, scaled corpus) on `D:\`, each with a committed report.
+  pause-not-reset timer), `tests/health.rs` — 4/4 green.
+- `[x]` **Phase 6 — IPC `PeerHealth` event + daemon emit**: new event +
+  `GetPeerHealth` + `seed-cli peer-health`; daemon emits off-lock; dead IPC
+  variants removed; `seed-daemon/tests/health_ipc.rs` green (both masters
+  alerted over real IPC, recovery pair, split-brain self-alert).
+- `[x]` **Phase 7 — GUI/OS notifications**: `notify-rust` backend +
+  `adw::Toast`; self / remote / recovered copy; peers flyout shows the
+  unhealthy duration. Manual visual check on Win + Linux still pending.
+- `[~]` **Phase 8 — soaks**: `seed-soak` bin (fleet | fullsize | clean) built;
+  full-size content soak (3 masters + 3 viewers, ~210 GB, real 3–6 GB ISOs)
+  and fleet soak (3 masters + 25 viewers, scaled corpus) on `D:\` still to run,
+  each with a committed report.
 
 ## Decisions log
 
