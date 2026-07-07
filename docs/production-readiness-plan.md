@@ -78,7 +78,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` landed (commit)
 
 | Date | Run | Config | Report | Outcome |
 |------|-----|--------|--------|---------|
-| —    | —   | —      | —      | —       |
+| 2026-07-06 | smoke | 3M+5V, scaled 0.47 GB, 8 min, churn+degrade+conflict, health 60/120s | (dir cleaned) | Sync + health pipeline PASS: all nodes Healthy + byte-identical; degraded→renotify→recovered events on masters; verdict line read FAIL only from a harness bug (race-file exclusion), fixed in the next soak commit |
 
 ## Deferred / stretch
 

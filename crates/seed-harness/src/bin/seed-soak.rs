@@ -251,6 +251,20 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
     }
     println!("all members joined");
 
+    // Distinct display names (all nodes otherwise default to the hostname,
+    // which makes the health-event log ambiguous).
+    for n in &nodes {
+        let role = if n.is_master { "master" } else { "viewer" };
+        let _ = request(
+            &n.sock,
+            IpcRequest::SetDeviceName {
+                name: format!("{role}-{:02}", n.idx),
+            },
+        )
+        .await;
+    }
+
+    let start_unix = now_unix();
     // Subscribe on node-00 (a master): count PeerHealth events for the report.
     let health_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     {
@@ -282,7 +296,7 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
                 {
                     sink.lock().unwrap().push(format!(
                         "t+{}s  {}  {}  {percent}%  {unhealthy_secs}s  self={is_self}",
-                        now_unix(),
+                        now_unix() - start_unix,
                         if recovered { "RECOVERED" } else { "UNHEALTHY" },
                         name.unwrap_or(node_id),
                     ));
@@ -293,7 +307,6 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
 
     // --- watch loop ---
     let started = Instant::now();
-    let start_unix = now_unix();
     let mut csv = std::fs::File::create(root.join("samples.csv"))?;
     writeln!(
         csv,
@@ -387,13 +400,14 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
                     h.finalize().to_hex().to_string()
                 })
             });
-            // Deliberate sub-second race: observed in the report, NOT asserted
-            // (documented LWW limitation — local mtime vs record timestamp).
+            // Deliberate sub-second race: WHICH side wins is arbitrary by design
+            // (documented LWW limitation — local mtime vs record timestamp), but
+            // the fleet must still agree on ONE winner; final verification pins
+            // the manifest to whatever node-00 converged to.
             std::fs::write(nodes[0].folder.join("conflict/race.txt"), b"m0 racer")?;
             std::fs::write(nodes[1].folder.join("conflict/race.txt"), b"m1 racer")?;
-            manifest.remove("conflict/race.txt"); // excluded from verification
             anomalies.push(format!(
-                "t+{elapsed}s sub-second same-path race injected (conflict/race.txt) — winner arbitrary by design"
+                "t+{elapsed}s sub-second same-path race injected (conflict/race.txt) — winner arbitrary by design, fleet-consistency still asserted"
             ));
         }
 
@@ -494,6 +508,17 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
             break;
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
+    }
+    // The sub-second race has an arbitrary but fleet-consistent winner: pin the
+    // expected content to whatever node-00 settled on before verifying everyone.
+    if conflict_done {
+        let race = nodes[0].folder.join("conflict/race.txt");
+        if race.is_file() {
+            let size = std::fs::metadata(&race).map(|m| m.len()).unwrap_or(0);
+            if let Ok(hex) = corpus::hash_file(&race) {
+                manifest.insert("conflict/race.txt".to_string(), (size, hex));
+            }
+        }
     }
     let mut verify_lines = Vec::new();
     if !interrupted {
