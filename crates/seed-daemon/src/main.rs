@@ -344,6 +344,9 @@ async fn presence_loop(daemon: Daemon) {
                     verified.len()
                 );
             }
+            // Recycle downloads that have been in flight implausibly long: a
+            // wedged future otherwise blocks its blob's re-queue forever.
+            let _ = { daemon.engine.lock().await.abort_stalled_downloads() };
             // Long-term member health: collect due alerts under the brief lock
             // (the detector is sync, transition-only sqlite writes), emit to
             // subscribers off-lock. The GUI turns these into toast + OS

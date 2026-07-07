@@ -245,6 +245,14 @@ const DEEP_VERIFY_INTERVAL_SECS: i64 = 4 * 3600;
 /// peer never costs a full rehash of a multi-GB share.
 const DIVERGENCE_DEEP_VERIFY_SECS: i64 = 600;
 
+/// Stall watchdog: an in-flight download older than this is presumed wedged and is
+/// aborted so the next reconcile re-queues it (verified chunks persist on disk, so
+/// a healthy-but-slow fetch that gets recycled resumes where it left off — the cost
+/// is one connection re-setup, the win is that a hung future can't block its blob
+/// forever). Swarm attempts already self-bound at [`SWARM_DEADLINE_SECS`] per try;
+/// this bounds the task *around* the retries, catching hangs the deadline can't.
+const DOWNLOAD_STALL_ABORT_SECS: u64 = 900;
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -713,6 +721,13 @@ struct InflightDownload {
     /// (and, for a swarm, its `JoinSet` of part tasks), closing the connections;
     /// already-fetched chunks persist on disk and resume on the next attempt.
     abort: tokio::task::AbortHandle,
+    /// When the task was spawned, for the stall watchdog
+    /// ([`Engine::abort_stalled_downloads`]): the in-flight map deduplicates by
+    /// hash, so a download future that wedges without settling would otherwise
+    /// block that blob's re-queue *forever* — observed in the full-size soak,
+    /// where nodes sat at 0–5% for hours until a pause/resume (which aborts and
+    /// re-queues) unstuck them.
+    started: std::time::Instant,
 }
 
 pub struct ReconcileOutcome {
@@ -950,6 +965,7 @@ impl ReconcileJob {
                         InflightDownload {
                             share_id: self.share_id.clone(),
                             abort,
+                            started: std::time::Instant::now(),
                         },
                     );
                 }
@@ -2398,6 +2414,36 @@ impl Engine {
             }
         }
         due
+    }
+
+    /// Abort in-flight downloads older than [`DOWNLOAD_STALL_ABORT_SECS`] so the
+    /// next reconcile re-queues them (chunks persist; resumes where it left off).
+    /// The in-flight map dedupes by hash, so without this sweep a download future
+    /// that wedges without settling blocks its blob permanently — the full-size
+    /// soak hit exactly that (nodes pinned at 0–5% for hours; a manual
+    /// pause/resume, which aborts + re-queues, was the only unstick). Sync +
+    /// brief-lock safe; the daemon runs it on the presence-loop cadence. Returns
+    /// how many were recycled (0 in healthy operation).
+    pub fn abort_stalled_downloads(&self) -> usize {
+        let mut aborted = 0;
+        if let Ok(mut inflight) = self.downloads_inflight.lock() {
+            inflight.retain(|hash, dl| {
+                if dl.started.elapsed().as_secs() >= DOWNLOAD_STALL_ABORT_SECS {
+                    dl.abort.abort();
+                    tracing::warn!(
+                        "aborting stalled download {hash} (share {}, in flight {}s) — \
+                         re-queued next tick, verified chunks resume",
+                        dl.share_id,
+                        dl.started.elapsed().as_secs(),
+                    );
+                    aborted += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        aborted
     }
 
     /// Full hashing scans committed for a share this session. Diagnostic for tests
