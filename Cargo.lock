@@ -5515,6 +5515,7 @@ dependencies = [
  "notify",
  "rand 0.8.6",
  "rusqlite",
+ "seed-harness",
  "seed-ipc",
  "serde",
  "serde_bytes",
@@ -5567,6 +5568,18 @@ dependencies = [
  "tracing-subscriber",
  "tray-icon",
  "winresource",
+]
+
+[[package]]
+name = "seed-harness"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "seed-ipc",
+ "tempfile",
+ "tokio",
+ "walkdir",
 ]
 
 [[package]]
