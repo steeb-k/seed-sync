@@ -3,7 +3,8 @@
 Open bugs and design caveats in the sync engine, found by audit rather than by a
 failing test. Each entry notes where it lives, what goes wrong, why, and a suggested
 fix. **#1–#4 are now fixed** (see each entry and `production-readiness-plan.md`);
-#5–#6 remain design notes.
+#5–#6 remain design notes; **#7 (unclean-shutdown recovery wedge) is open**, found
+by the full-size soak.
 
 Scope: healing + multi-master behavior. The cross-member divergence *detection*
 (manifest fingerprint determinism, the 45 s settle window, the false-alarm guard)
@@ -173,6 +174,38 @@ converge to the same `manifest_fp` and the timestamp-correct winner, with no sti
 **Suggested fix:** if the transition matters, dedupe `out[P]` by `ts` in
 `read_remote_files` (compare the content entry's timestamp against the empty marker's
 and keep the newer) instead of letting stream order decide.
+
+---
+
+## 7. Recovery after an unclean shutdown mid-sync can wedge (startup + first reconcile)
+**Tier:** observed in soak · **Severity:** high (node stuck until manual intervention)
+**Where:** startup path (`Engine::new` → `reload_shares`) and the first
+`ReconcileJob::run` after recovery; exact wedge point not yet isolated.
+
+**Symptoms (fullsize soak, 6 nodes × 42 GB, 2026-07-07):**
+- After a hard reboot mid-sync, all nodes restarted and served IPC, but **no
+  node's first reconcile pass ever committed** (health stuck at the provisional
+  0%, ~zero CPU, no log output); downloads queued by the first pass completed
+  and then transfer stalled fleet-wide.
+- A daemon **force-killed mid-download** then restarted *while 5 peers were
+  live* never completed `Engine::new` at all (>5 min, full-debug log shows the
+  keystore read from `reload_shares`, then no further seed-core activity).
+  The same data dirs started in ~3 s right after the reboot when all nodes
+  came up together — suggesting inbound doc-sync/blob pressure during
+  recovery participates in the wedge.
+- Windows keystore ops also measured slow under load (20+ s per credential
+  read) — an aggravator, not the cause.
+
+**Repro recipe:** run `seed-soak fullsize`, kill one daemon mid-sync
+(`Stop-Process -Force`), restart it with the other daemons still running.
+
+**Suggested investigation:** timeout + WARN instrumentation around each await
+in `reload_shares`/`open_share` (doc open, keystore, gossip subscribe,
+`start_sync`) and in the first reconcile's store calls (`has`, export,
+`get_many`), to pin which actor call never resolves; then check iroh-blobs /
+iroh-docs recovery behavior for stores killed mid-write. Until fixed, treat
+power-loss-mid-sync recovery as requiring a retry (daemon restart when idle
+peers) or empty-store resync.
 
 ---
 
