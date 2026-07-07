@@ -122,6 +122,7 @@ pub fn accrued(row: &PeerHealthRow, now: i64) -> i64 {
 /// if any. Persists transitions (and refreshes the open row so a restart loses
 /// at most one interval); a member with no open episode and a healthy/offline
 /// observation costs nothing.
+#[allow(clippy::too_many_arguments)]
 pub fn observe(
     tracks: &mut Tracks,
     db: &Db,
