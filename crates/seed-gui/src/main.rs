@@ -13,6 +13,7 @@
 // for the logs (see `main`). Debug builds keep the console for `cargo run`.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod notify;
 mod tray;
 
 use std::cell::{Cell, RefCell};
@@ -62,6 +63,18 @@ enum UiMsg {
     /// "Daemon Not Started" page instead of spamming error toasts.
     DaemonDown,
     Toast(String),
+    /// A long-term health alert pushed by the daemon: a member of a share has
+    /// been online-but-degraded past the threshold (or recovered). Rendered as
+    /// an in-app toast AND an OS notification (the GUI is tray-resident).
+    PeerHealth {
+        share_name: String,
+        name: Option<String>,
+        node_id: String,
+        percent: u8,
+        unhealthy_secs: i64,
+        is_self: bool,
+        recovered: bool,
+    },
 }
 
 /// Send half plus the runtime handle and socket path — everything needed to
@@ -137,9 +150,25 @@ async fn stream_events(
                     up: up_bps,
                 },
                 IpcEvent::LastUpdated { ts, .. } => UiMsg::LastUpdated(ts),
-                IpcEvent::ShareListChanged
-                | IpcEvent::Membership { .. }
-                | IpcEvent::ShareStatus { .. } => UiMsg::Refresh,
+                IpcEvent::ShareListChanged => UiMsg::Refresh,
+                IpcEvent::PeerHealth {
+                    share_name,
+                    name,
+                    node_id,
+                    percent,
+                    unhealthy_secs,
+                    is_self,
+                    recovered,
+                    ..
+                } => UiMsg::PeerHealth {
+                    share_name,
+                    name,
+                    node_id,
+                    percent,
+                    unhealthy_secs,
+                    is_self,
+                    recovered,
+                },
             };
             if tx.send(msg).await.is_err() {
                 break;
@@ -944,6 +973,51 @@ fn build_ui(
                     }
                     UiMsg::Refresh => net.refresh(),
                     UiMsg::Toast(t) => toast_overlay.add_toast(adw::Toast::new(&t)),
+                    UiMsg::PeerHealth {
+                        share_name,
+                        name,
+                        node_id,
+                        percent,
+                        unhealthy_secs,
+                        is_self,
+                        recovered,
+                    } => {
+                        // Short display id when the member never announced a name.
+                        let who =
+                            name.unwrap_or_else(|| node_id.chars().take(16).collect::<String>());
+                        let (summary, body) = match (is_self, recovered) {
+                            (true, false) => (
+                                "This device is out of sync".to_string(),
+                                format!(
+                                    "'{share_name}' has been out of sync on this device for {} ({percent}% synced)",
+                                    notify::fmt_duration_secs(unhealthy_secs)
+                                ),
+                            ),
+                            (false, false) => (
+                                format!("Member unhealthy: {who}"),
+                                format!(
+                                    "'{who}' on '{share_name}' has been unhealthy for {} ({percent}% synced)",
+                                    notify::fmt_duration_secs(unhealthy_secs)
+                                ),
+                            ),
+                            (true, true) => (
+                                "This device is back in sync".to_string(),
+                                format!("'{share_name}' recovered on this device"),
+                            ),
+                            (false, true) => (
+                                format!("Member recovered: {who}"),
+                                format!("'{who}' on '{share_name}' is back in sync"),
+                            ),
+                        };
+                        // In-app toast (long timeout — this is an alert, not
+                        // click feedback) + OS notification for the tray-hidden
+                        // case, then refresh so status rows reflect it.
+                        let toast = adw::Toast::new(&body);
+                        toast.set_timeout(10);
+                        toast_overlay.add_toast(toast);
+                        notify::os_notify(&summary, &body);
+                        net.refresh();
+                    }
                 }
             }
         });
@@ -1187,7 +1261,6 @@ fn status_text(s: &ShareSummary) -> String {
             )
         }
         ShareStatus::Paused => "Paused".into(),
-        ShareStatus::Error => "Error".into(),
         ShareStatus::OutOfSync => "⚠ Out of sync — members disagree".into(),
     }
 }
@@ -2081,6 +2154,19 @@ fn update_peers_panel(list: &gtk::ListBox, peers: &[PeerInfo]) {
             .css_classes(["dim-label", "caption"])
             .build();
 
+        // Long-term health: how long this member has been online-but-degraded
+        // (the 12h-alert clock). Only shown while an episode is open.
+        let unhealthy = (p.unhealthy_secs > 0).then(|| {
+            gtk::Label::builder()
+                .label(format!(
+                    "⚠ unhealthy {}",
+                    notify::fmt_duration_secs(p.unhealthy_secs)
+                ))
+                .halign(gtk::Align::End)
+                .css_classes(["caption", "warning"])
+                .build()
+        });
+
         // Trailing action slot: empty for now, reserved so per-peer controls
         // (master boots a member; local rename) can be dropped in without
         // reflowing the row. Holds the panel's horizontal headroom open.
@@ -2089,6 +2175,9 @@ fn update_peers_panel(list: &gtk::ListBox, peers: &[PeerInfo]) {
 
         row.append(&dot);
         row.append(&name_lbl);
+        if let Some(u) = &unhealthy {
+            row.append(u);
+        }
         row.append(&role);
         row.append(&actions);
         list.append(&row);

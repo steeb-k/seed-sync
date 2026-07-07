@@ -106,6 +106,11 @@ pub enum IpcRequest {
     Subscribe,
     GetSettings,
     SetSettings(Settings),
+    /// Open long-term-health episodes for a share's members (poll counterpart
+    /// of [`IpcEvent::PeerHealth`], for the CLI / soak / GUI detail views).
+    GetPeerHealth {
+        share_id: ShareId,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +129,7 @@ pub enum IpcResponse {
         viewer_key: String,
     },
     Peers(Vec<PeerInfo>),
+    PeerHealth(Vec<PeerHealthInfo>),
     DeviceName(String),
     Settings(Settings),
     NodeAddr(String),
@@ -131,27 +137,52 @@ pub enum IpcResponse {
     Err(String),
 }
 
+/// One open long-term-health episode (see [`IpcRequest::GetPeerHealth`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerHealthInfo {
+    /// Full endpoint id of the member; empty when it is this device.
+    pub node_id: String,
+    pub name: Option<String>,
+    pub online: bool,
+    /// The member's last self-reported sync percent.
+    pub percent: u8,
+    /// Accrued online-degraded seconds so far this episode.
+    pub unhealthy_secs: i64,
+    /// Whether an alert has already fired for this episode.
+    pub alerted: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IpcEvent {
-    ShareStatus {
-        share_id: ShareId,
-        status: ShareStatus,
-        percent: u8,
-    },
     Throughput {
         down_bps: u64,
         up_bps: u64,
-    },
-    Membership {
-        share_id: ShareId,
-        online: u32,
-        total: u32,
     },
     ShareListChanged,
     LastUpdated {
         share_id: ShareId,
         /// Unix seconds.
         ts: i64,
+    },
+    /// A member of `share_id` crossed the long-term unhealthy threshold (or a
+    /// renotify is due, or it recovered). Emitted by the daemon's detector on
+    /// the node itself (`is_self`) and on every master observing the member;
+    /// the GUI turns it into a toast + OS notification.
+    PeerHealth {
+        share_id: ShareId,
+        /// Display name of the share (its folder name).
+        share_name: String,
+        /// Full endpoint id of the member; empty when it is this device.
+        node_id: String,
+        /// The member's self-chosen display name, if announced.
+        name: Option<String>,
+        /// The member's last self-reported sync percent.
+        percent: u8,
+        /// Accrued online-degraded seconds (0 for a recovery).
+        unhealthy_secs: i64,
+        is_self: bool,
+        /// True = the previously-alerted member is back in sync.
+        recovered: bool,
     },
 }
 
@@ -169,7 +200,6 @@ pub enum ShareStatus {
     /// (the initial publish or a republish). `percent`/`indexed_bytes` track it.
     Indexing,
     Paused,
-    Error,
     /// This member's manifest has disagreed with an online peer's for longer than
     /// the settle window: members hold different filesets. Surfaced distinctly so a
     /// silent multi-member divergence can't hide behind "Healthy".
@@ -219,6 +249,11 @@ pub struct PeerInfo {
     /// This member's manifest fingerprint (0 = unknown). Members that agree on the
     /// fileset share the same value; a different value means this member disagrees.
     pub manifest_fp: u64,
+    /// Seconds this member has been *online but degraded* in its current
+    /// long-term-health episode (0 = no open episode). Accrues across offline
+    /// gaps (pause-not-reset); drives the "unhealthy 12h+" notifications.
+    #[serde(default)]
+    pub unhealthy_secs: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

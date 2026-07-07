@@ -154,9 +154,38 @@ impl PeerRoster {
                 have_seqno: e.seqno,
                 percent: e.percent,
                 manifest_fp: e.manifest_fp,
+                unhealthy_secs: 0, // filled by Engine::peers from the health tracks
             })
             .collect()
     }
+
+    /// Full-fidelity view for the health detector: unlike [`infos`](Self::infos)
+    /// the node id is NOT truncated, because health episodes are keyed and
+    /// persisted by the full endpoint-id string.
+    fn health_snapshot(&self) -> Vec<PeerSnapshot> {
+        let now = now_secs();
+        self.peers
+            .iter()
+            .map(|(id, e)| PeerSnapshot {
+                id: id.clone(),
+                online: self.is_online(e, now),
+                is_master: e.role == Some(seed_ipc::Role::Master),
+                percent: e.percent,
+                manifest_fp: e.manifest_fp,
+                name: e.name.clone(),
+            })
+            .collect()
+    }
+}
+
+/// One roster entry as the health detector sees it (full node id).
+struct PeerSnapshot {
+    id: String,
+    online: bool,
+    is_master: bool,
+    percent: u8,
+    manifest_fp: u64,
+    name: Option<String>,
 }
 
 use crate::identity::{Role, ShareKey};
@@ -1497,6 +1526,26 @@ impl ShareState {
     }
 }
 
+/// One due long-term-health notification from [`Engine::health_alerts`]:
+/// either "unhealthy past the threshold" (first alert or a renotify) or
+/// "recovered" after a previously-alerted episode cleared.
+#[derive(Debug, Clone)]
+pub struct PeerHealthAlert {
+    pub share_id: String,
+    /// Display name of the share (its folder name).
+    pub share_name: String,
+    /// Full endpoint id of the member, or `""` when it is this device.
+    pub node_id: String,
+    /// The member's self-chosen display name, if it has announced one.
+    pub name: Option<String>,
+    /// The member's last self-reported sync percent.
+    pub percent: u8,
+    /// Total accrued online-degraded seconds (0 for a recovery).
+    pub unhealthy_secs: i64,
+    pub is_self: bool,
+    pub recovered: bool,
+}
+
 /// The engine owns the iroh node and the set of shares.
 pub struct Engine {
     node: IrohNode,
@@ -1533,6 +1582,12 @@ pub struct Engine {
     /// reconcile without touching the user's pause state. Deliberately *not*
     /// persisted: the host recomputes it from live conditions on every start.
     sync_suspended: StdMutex<bool>,
+    /// Long-term unhealthy-member thresholds (12 h / 8 h / 24 h in production;
+    /// seconds in tests via env or [`Engine::set_health_policy`]).
+    health_policy: crate::health::HealthPolicy,
+    /// Open degraded-member episodes, mirroring the `peer_health` table. Keyed
+    /// `(share_id, full node id)`, `""` = this device. See [`crate::health`].
+    health_tracks: crate::health::Tracks,
 }
 
 /// A deferred kick of one share's doc live-sync, built under the engine lock (cheap:
@@ -1595,6 +1650,7 @@ impl Engine {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(default_device_name);
         let paused_all = db.get_setting("paused_all")?.as_deref() == Some("1");
+        let health_tracks = crate::health::load_tracks(&db);
         let mut engine = Self {
             node,
             author,
@@ -1606,6 +1662,8 @@ impl Engine {
             device_name: StdMutex::new(device_name),
             paused_all: StdMutex::new(paused_all),
             sync_suspended: StdMutex::new(false),
+            health_policy: crate::health::HealthPolicy::from_env(),
+            health_tracks,
         };
         engine.reload_shares().await?;
         Ok(engine)
@@ -2001,18 +2059,239 @@ impl Engine {
             Role::Master => seed_ipc::Role::Master,
             Role::Viewer => seed_ipc::Role::Viewer,
         };
+        let now = now_secs();
         let mut out = vec![seed_ipc::PeerInfo {
             node_id: "This device".into(),
             name: Some(self.device_name()),
             role,
             online: true,
-            last_seen: now_secs(),
+            last_seen: now,
             have_seqno: state.last_seqno,
             percent: state.health,
             manifest_fp: state.manifest_fp,
+            unhealthy_secs: self
+                .health_tracks
+                .get(&(share_id.to_string(), String::new()))
+                .map(|r| crate::health::accrued(r, now))
+                .unwrap_or(0),
         }];
         out.extend(state.roster.lock().map(|r| r.infos()).unwrap_or_default());
+        // Health episodes are keyed by the FULL endpoint id; `infos()` shows the
+        // 16-char short form. Match by prefix (collision odds are negligible and
+        // the consequence is a cosmetic duration on the wrong row).
+        for p in out.iter_mut().skip(1) {
+            p.unhealthy_secs = self
+                .health_tracks
+                .iter()
+                .find(|((s, n), _)| s == share_id && n.starts_with(&p.node_id))
+                .map(|(_, r)| crate::health::accrued(r, now))
+                .unwrap_or(0);
+        }
         Ok(out)
+    }
+
+    /// Replace the long-term health thresholds (tests/soaks shrink hours to
+    /// seconds). Production uses the env/default policy set at construction.
+    pub fn set_health_policy(&mut self, policy: crate::health::HealthPolicy) {
+        self.health_policy = policy;
+    }
+
+    /// Open long-term-health episodes for a share (the `GetPeerHealth` IPC
+    /// poll). One entry per member with an open episode; an empty list means
+    /// nobody has been degraded long enough to track.
+    pub fn peer_health(&self, share_id: &str) -> anyhow::Result<Vec<seed_ipc::PeerHealthInfo>> {
+        let state = self
+            .shares
+            .get(share_id)
+            .ok_or_else(|| anyhow!("unknown share {share_id}"))?;
+        let snap = state
+            .roster
+            .lock()
+            .map(|r| r.health_snapshot())
+            .unwrap_or_default();
+        let now = now_secs();
+        Ok(self
+            .health_tracks
+            .iter()
+            .filter(|((s, _), _)| s == share_id)
+            .map(|((_, node_id), row)| {
+                let peer = snap.iter().find(|p| &p.id == node_id);
+                seed_ipc::PeerHealthInfo {
+                    node_id: node_id.clone(),
+                    name: if node_id.is_empty() {
+                        Some(self.device_name())
+                    } else {
+                        peer.and_then(|p| p.name.clone())
+                    },
+                    online: node_id.is_empty() || peer.map(|p| p.online).unwrap_or(false),
+                    percent: row.last_percent,
+                    unhealthy_secs: crate::health::accrued(row, now),
+                    alerted: row.last_notified_at > 0,
+                }
+            })
+            .collect())
+    }
+
+    /// Run the long-term health detector over every share and return the
+    /// notifications due this pass. Synchronous, no awaits, transition-only DB
+    /// writes — call under a brief engine lock and emit the results off-lock.
+    ///
+    /// Semantics (see [`crate::health`]): a member is degraded while *online but
+    /// not fully synced* (percent < 100, or fingerprint off the master-majority
+    /// consensus); offline pauses its clock. Every node self-reports; only
+    /// masters produce alerts about *other* members, so one broken viewer nags
+    /// its own operator and the masters — not the whole fleet.
+    pub fn health_alerts(&mut self) -> Vec<PeerHealthAlert> {
+        use crate::health::{consensus_fp, observe, Observation, TrackEvent};
+        let now = now_secs();
+        let policy = self.health_policy;
+        let paused_all = self.paused_all();
+        let mut alerts = Vec::new();
+        for (share_id, state) in self.shares.iter() {
+            let share_name = state
+                .folder
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| share_id.clone());
+            let snap = state
+                .roster
+                .lock()
+                .map(|r| r.health_snapshot())
+                .unwrap_or_default();
+            let self_master = matches!(state.key.role, Role::Master);
+
+            let mut votes: Vec<u64> = snap
+                .iter()
+                .filter(|p| p.online && p.is_master && p.manifest_fp != 0)
+                .map(|p| p.manifest_fp)
+                .collect();
+            if self_master && state.manifest_fp != 0 {
+                votes.push(state.manifest_fp);
+            }
+            let consensus = consensus_fp(&votes);
+
+            // Self: degraded only while unpaused with someone online to sync
+            // against — a lone or user-paused node never nags its operator.
+            let any_online_peer = snap.iter().any(|p| p.online);
+            let self_obs = if state.paused || paused_all || !any_online_peer {
+                Observation::Offline
+            } else if state.health < 100 || state.is_out_of_sync() {
+                Observation::OnlineDegraded
+            } else {
+                Observation::OnlineHealthy
+            };
+            if let Some(ev) = observe(
+                &mut self.health_tracks,
+                &self.db,
+                &policy,
+                now,
+                share_id,
+                "",
+                self_obs,
+                state.health,
+            ) {
+                alerts.push(PeerHealthAlert {
+                    share_id: share_id.clone(),
+                    share_name: share_name.clone(),
+                    node_id: String::new(),
+                    name: None,
+                    percent: state.health,
+                    unhealthy_secs: match ev {
+                        TrackEvent::Degraded(secs) => secs,
+                        TrackEvent::Recovered => 0,
+                    },
+                    is_self: true,
+                    recovered: ev == TrackEvent::Recovered,
+                });
+            }
+
+            if !self_master {
+                continue;
+            }
+            for p in &snap {
+                let obs = if !p.online {
+                    Observation::Offline
+                } else if p.percent < 100
+                    || (p.manifest_fp != 0 && consensus.is_some_and(|f| p.manifest_fp != f))
+                {
+                    Observation::OnlineDegraded
+                } else {
+                    Observation::OnlineHealthy
+                };
+                if let Some(ev) = observe(
+                    &mut self.health_tracks,
+                    &self.db,
+                    &policy,
+                    now,
+                    share_id,
+                    &p.id,
+                    obs,
+                    p.percent,
+                ) {
+                    alerts.push(PeerHealthAlert {
+                        share_id: share_id.clone(),
+                        share_name: share_name.clone(),
+                        node_id: p.id.clone(),
+                        name: p.name.clone(),
+                        percent: p.percent,
+                        unhealthy_secs: match ev {
+                            TrackEvent::Degraded(secs) => secs,
+                            TrackEvent::Recovered => 0,
+                        },
+                        is_self: false,
+                        recovered: ev == TrackEvent::Recovered,
+                    });
+                }
+            }
+            // Episodes for peers the roster no longer knows at all (e.g. after a
+            // restart rebuilt it from gossip): observe them offline so they pause
+            // and eventually expire rather than lingering forever.
+            let seen: HashSet<&str> = snap.iter().map(|p| p.id.as_str()).collect();
+            let vanished: Vec<String> = self
+                .health_tracks
+                .keys()
+                .filter(|(s, n)| s == share_id && !n.is_empty() && !seen.contains(n.as_str()))
+                .map(|(_, n)| n.clone())
+                .collect();
+            for node_id in vanished {
+                let _ = observe(
+                    &mut self.health_tracks,
+                    &self.db,
+                    &policy,
+                    now,
+                    share_id,
+                    &node_id,
+                    Observation::Offline,
+                    0,
+                );
+            }
+        }
+        for a in &alerts {
+            if a.recovered {
+                tracing::info!(
+                    "peer-health: share '{}' {} recovered (back in sync)",
+                    a.share_name,
+                    if a.is_self {
+                        "this device"
+                    } else {
+                        a.name.as_deref().unwrap_or(&a.node_id)
+                    },
+                );
+            } else {
+                tracing::warn!(
+                    "peer-health: share '{}' {} unhealthy for {}s ({}%)",
+                    a.share_name,
+                    if a.is_self {
+                        "this device"
+                    } else {
+                        a.name.as_deref().unwrap_or(&a.node_id)
+                    },
+                    a.unhealthy_secs,
+                    a.percent,
+                );
+            }
+        }
+        alerts
     }
 
     /// Build this tick's presence broadcasts — one per share with a live presence

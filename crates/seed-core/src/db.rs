@@ -35,6 +35,29 @@ pub struct ShareRecord {
     pub quick_sig: u64,
 }
 
+/// One open "degraded peer" episode: the accrual state behind the long-term
+/// unhealthy-peer notifications. `node_id` is the peer's *full* endpoint-id
+/// string, or `""` for this device itself. Persisted so a 12-hour clock
+/// survives daemon restarts; rows exist only while an episode is open (a peer
+/// observed healthy deletes its row).
+#[derive(Debug, Clone, Default)]
+pub struct PeerHealthRow {
+    pub share_id: String,
+    pub node_id: String,
+    /// Unix secs the current *online* degraded spell began; 0 while the peer is
+    /// offline (accrual paused, see `accum_secs`).
+    pub degraded_since: i64,
+    /// Degraded seconds accrued by earlier online spells of this episode
+    /// (offline gaps pause the clock rather than resetting it).
+    pub accum_secs: i64,
+    /// Unix secs the last notification for this episode fired; 0 = none yet.
+    pub last_notified_at: i64,
+    /// Peer's last self-reported sync percent (display).
+    pub last_percent: u8,
+    /// Unix secs the peer was last heard from (staleness cleanup).
+    pub last_seen: i64,
+}
+
 /// `Connection` is `Send` but not `Sync`; wrap it so the `Db` (and thus the
 /// `Engine`) is `Sync`, which the daemon needs to share the engine across tasks.
 pub struct Db {
@@ -67,6 +90,16 @@ impl Db {
                  path     TEXT NOT NULL,
                  hash     BLOB NOT NULL,
                  PRIMARY KEY (share_id, path)
+             );
+             CREATE TABLE IF NOT EXISTS peer_health (
+                 share_id         TEXT NOT NULL,
+                 node_id          TEXT NOT NULL,
+                 degraded_since   INTEGER NOT NULL DEFAULT 0,
+                 accum_secs       INTEGER NOT NULL DEFAULT 0,
+                 last_notified_at INTEGER NOT NULL DEFAULT 0,
+                 last_percent     INTEGER NOT NULL DEFAULT 0,
+                 last_seen        INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (share_id, node_id)
              );",
         )?;
         // Migration for DBs created before `quick_sig` existed; the error when the
@@ -154,11 +187,66 @@ impl Db {
         Ok(())
     }
 
-    /// Remove a share row (and its per-path sync index).
+    /// Remove a share row (and its per-path sync index + peer-health episodes).
     pub fn remove_share(&self, share_id: &str) -> anyhow::Result<()> {
         let conn = self.lock();
         conn.execute("DELETE FROM shares WHERE share_id=?1", [share_id])?;
         conn.execute("DELETE FROM sync_index WHERE share_id=?1", [share_id])?;
+        conn.execute("DELETE FROM peer_health WHERE share_id=?1", [share_id])?;
+        Ok(())
+    }
+
+    /// Load every open peer-health episode (all shares; filtered by the caller).
+    pub fn load_peer_health(&self) -> anyhow::Result<Vec<PeerHealthRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT share_id, node_id, degraded_since, accum_secs, last_notified_at,
+                    last_percent, last_seen
+             FROM peer_health",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PeerHealthRow {
+                share_id: row.get(0)?,
+                node_id: row.get(1)?,
+                degraded_since: row.get(2)?,
+                accum_secs: row.get(3)?,
+                last_notified_at: row.get(4)?,
+                last_percent: row.get::<_, i64>(5)? as u8,
+                last_seen: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Insert or update one peer-health episode row.
+    pub fn upsert_peer_health(&self, r: &PeerHealthRow) -> anyhow::Result<()> {
+        self.lock().execute(
+            "INSERT INTO peer_health (share_id, node_id, degraded_since, accum_secs,
+                                      last_notified_at, last_percent, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(share_id, node_id) DO UPDATE SET
+                 degraded_since=excluded.degraded_since, accum_secs=excluded.accum_secs,
+                 last_notified_at=excluded.last_notified_at,
+                 last_percent=excluded.last_percent, last_seen=excluded.last_seen",
+            rusqlite::params![
+                r.share_id,
+                r.node_id,
+                r.degraded_since,
+                r.accum_secs,
+                r.last_notified_at,
+                r.last_percent as i64,
+                r.last_seen,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Close one peer-health episode (peer observed healthy / episode expired).
+    pub fn delete_peer_health(&self, share_id: &str, node_id: &str) -> anyhow::Result<()> {
+        self.lock().execute(
+            "DELETE FROM peer_health WHERE share_id=?1 AND node_id=?2",
+            rusqlite::params![share_id, node_id],
+        )?;
         Ok(())
     }
 
@@ -256,6 +344,69 @@ mod tests {
 
         db.remove_share("abc").unwrap();
         assert!(db.load_all().unwrap().is_empty());
+    }
+
+    #[test]
+    fn peer_health_roundtrip_and_share_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("state.db")).unwrap();
+        let row = PeerHealthRow {
+            share_id: "s1".into(),
+            node_id: "peerA".into(),
+            degraded_since: 1000,
+            accum_secs: 50,
+            last_notified_at: 0,
+            last_percent: 73,
+            last_seen: 1100,
+        };
+        db.upsert_peer_health(&row).unwrap();
+        // Self row for the same share, and a row for another share.
+        db.upsert_peer_health(&PeerHealthRow {
+            share_id: "s1".into(),
+            node_id: "".into(),
+            ..row.clone()
+        })
+        .unwrap();
+        db.upsert_peer_health(&PeerHealthRow {
+            share_id: "s2".into(),
+            node_id: "peerB".into(),
+            ..row.clone()
+        })
+        .unwrap();
+
+        let all = db.load_peer_health().unwrap();
+        assert_eq!(all.len(), 3);
+        let got = all
+            .iter()
+            .find(|r| r.share_id == "s1" && r.node_id == "peerA")
+            .unwrap();
+        assert_eq!(
+            (
+                got.degraded_since,
+                got.accum_secs,
+                got.last_percent,
+                got.last_seen
+            ),
+            (1000, 50, 73, 1100)
+        );
+
+        // Update accrues in place (upsert, not duplicate).
+        db.upsert_peer_health(&PeerHealthRow {
+            accum_secs: 500,
+            ..row.clone()
+        })
+        .unwrap();
+        assert_eq!(db.load_peer_health().unwrap().len(), 3);
+
+        // Closing one episode leaves the others.
+        db.delete_peer_health("s1", "peerA").unwrap();
+        assert_eq!(db.load_peer_health().unwrap().len(), 2);
+
+        // Removing a share drops all its episodes.
+        db.remove_share("s1").unwrap();
+        let rest = db.load_peer_health().unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].share_id, "s2");
     }
 
     #[test]

@@ -16,6 +16,7 @@
 
 pub mod db;
 pub mod engine;
+pub mod health;
 pub mod identity;
 pub mod manifest;
 pub mod node;

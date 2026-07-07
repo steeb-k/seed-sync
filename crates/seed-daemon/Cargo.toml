@@ -27,3 +27,5 @@ windows-service.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+seed-harness = { path = "../seed-harness" }
+walkdir.workspace = true

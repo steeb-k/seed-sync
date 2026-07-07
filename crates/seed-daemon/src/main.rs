@@ -300,6 +300,23 @@ async fn reconcile_loop(daemon: Daemon) {
                     verified.len()
                 );
             }
+            // Long-term member health: collect due alerts under the brief lock
+            // (the detector is sync, transition-only sqlite writes), emit to
+            // subscribers off-lock. The GUI turns these into toast + OS
+            // notifications on this device and on every master.
+            let alerts = { daemon.engine.lock().await.health_alerts() };
+            for a in alerts {
+                let _ = daemon.events.send(IpcEvent::PeerHealth {
+                    share_id: a.share_id,
+                    share_name: a.share_name,
+                    node_id: a.node_id,
+                    name: a.name,
+                    percent: a.percent,
+                    unhealthy_secs: a.unhealthy_secs,
+                    is_self: a.is_self,
+                    recovered: a.recovered,
+                });
+            }
         }
 
         // Fingerprint the visible per-share state (membership counts + status)
@@ -564,6 +581,10 @@ async fn handle_request(daemon: &Daemon, req: IpcRequest) -> anyhow::Result<IpcR
         IpcRequest::GetPeers { share_id } => {
             let engine = daemon.engine.lock().await;
             IpcResponse::Peers(engine.peers(&share_id)?)
+        }
+        IpcRequest::GetPeerHealth { share_id } => {
+            let engine = daemon.engine.lock().await;
+            IpcResponse::PeerHealth(engine.peer_health(&share_id)?)
         }
         IpcRequest::GetDeviceName => {
             IpcResponse::DeviceName(daemon.engine.lock().await.device_name())

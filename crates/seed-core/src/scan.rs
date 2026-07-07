@@ -321,7 +321,10 @@ mod tests {
         let missing = dir.path().join("does-not-exist");
         let (ig, _) = IgnoreSet::compile(&[]);
         assert!(scan(&missing, &ig).is_err(), "missing root must error");
-        assert!(list_files(&missing, &ig).is_err(), "missing root must error");
+        assert!(
+            list_files(&missing, &ig).is_err(),
+            "missing root must error"
+        );
     }
 
     #[cfg(unix)]
@@ -341,8 +344,14 @@ mod tests {
 
         // Restore perms before asserting so the tempdir cleans up regardless.
         let _ = fs::set_permissions(&root, fs::Permissions::from_mode(0o755));
-        assert!(scanned.is_err(), "unreadable root must error, not scan empty");
-        assert!(listed.is_err(), "unreadable root must error, not list empty");
+        assert!(
+            scanned.is_err(),
+            "unreadable root must error, not scan empty"
+        );
+        assert!(
+            listed.is_err(),
+            "unreadable root must error, not list empty"
+        );
     }
 
     /// `quick_signature` must NOT count excluded paths — that's what stops a
