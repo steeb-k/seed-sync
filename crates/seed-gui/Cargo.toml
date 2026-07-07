@@ -26,6 +26,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 qrcode = { version = "0.14.1", default-features = false }
+# OS notifications (peer-health alerts): one API for all three desktops —
+# XDG D-Bus on Linux, WinRT toasts on Windows, osascript on macOS. GTK's own
+# gio::Notification is not reliable on Windows (needs a registered AUMID).
+notify-rust = "4"
 
 # Tray is wired on Windows/macOS (the primary targets for it). On Linux the
 # tray-icon backend pulls GTK3/appindicator which clashes with our GTK4 app, so

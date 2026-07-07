@@ -69,6 +69,8 @@ impl From<seed_ipc::Role> for Role {
     }
 }
 
+/// Keeps an `Error` variant the engine no longer produces (`seed_ipc` dropped
+/// it as dead) so the Android ABI and existing Kotlin `when` arms stay valid.
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
 pub enum ShareStatus {
     Healthy,
@@ -86,7 +88,6 @@ impl From<seed_ipc::ShareStatus> for ShareStatus {
             seed_ipc::ShareStatus::Syncing => ShareStatus::Syncing,
             seed_ipc::ShareStatus::Indexing => ShareStatus::Indexing,
             seed_ipc::ShareStatus::Paused => ShareStatus::Paused,
-            seed_ipc::ShareStatus::Error => ShareStatus::Error,
             seed_ipc::ShareStatus::OutOfSync => ShareStatus::OutOfSync,
         }
     }

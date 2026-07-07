@@ -54,7 +54,11 @@ pub async fn cluster(masters: usize, viewers: usize) -> anyhow::Result<Cluster> 
             "{}{i}",
             if i < masters { "master" } else { "viewer" }
         ))?;
-        nodes.push(Node { engine, data, folder });
+        nodes.push(Node {
+            engine,
+            data,
+            folder,
+        });
     }
     // Everyone online before exchanging bootstrap info.
     tokio::time::timeout(Duration::from_secs(20 + 5 * total as u64), async {
@@ -180,9 +184,11 @@ impl Cluster {
             && (0..self.nodes.len()).all(|i| self.status(i) != "OutOfSync")
     }
 
+    /// Best-effort teardown, bounded per node so a wedged iroh close can't
+    /// hang a test past its assertions (which have all passed by this point).
     pub async fn shutdown(self) -> anyhow::Result<()> {
         for n in self.nodes {
-            n.engine.shutdown().await?;
+            let _ = tokio::time::timeout(Duration::from_secs(15), n.engine.shutdown()).await;
         }
         Ok(())
     }

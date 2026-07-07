@@ -57,6 +57,12 @@ enum Command {
         #[arg(long)]
         share: String,
     },
+    /// Open long-term-health episodes for a share's members (degraded 12h+
+    /// tracking; empty when everyone is healthy).
+    PeerHealth {
+        #[arg(long)]
+        share: String,
+    },
     /// Print this device's display name.
     DeviceName,
     /// Set this device's display name (propagated to peers via presence).
@@ -89,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Publish { share } => IpcRequest::Publish { share_id: share },
         Command::Reveal { share } => IpcRequest::RevealKeys { share_id: share },
         Command::Peers { share } => IpcRequest::GetPeers { share_id: share },
+        Command::PeerHealth { share } => IpcRequest::GetPeerHealth { share_id: share },
         Command::DeviceName => IpcRequest::GetDeviceName,
         Command::SetName { name } => IpcRequest::SetDeviceName { name },
     };
@@ -176,6 +183,26 @@ fn print_response(resp: &IpcResponse) {
                     p.online,
                     p.have_seqno,
                     p.percent
+                );
+            }
+        }
+        IpcResponse::PeerHealth(rows) => {
+            if rows.is_empty() {
+                println!("(no open health episodes)");
+            }
+            for r in rows {
+                println!(
+                    "{}  name={}  online={}  {}%  unhealthy={}s  alerted={}",
+                    if r.node_id.is_empty() {
+                        "this-device"
+                    } else {
+                        r.node_id.as_str()
+                    },
+                    r.name.as_deref().unwrap_or("-"),
+                    r.online,
+                    r.percent,
+                    r.unhealthy_secs,
+                    r.alerted
                 );
             }
         }
