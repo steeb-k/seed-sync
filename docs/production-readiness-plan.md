@@ -79,6 +79,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` landed (commit)
 | Date | Run | Config | Report | Outcome |
 |------|-----|--------|--------|---------|
 | 2026-07-06 | smoke | 3M+5V, scaled 0.47 GB, 8 min, churn+degrade+conflict, health 60/120s | (dir cleaned) | Sync + health pipeline PASS: all nodes Healthy + byte-identical; degraded→renotify→recovered events on masters; verdict line read FAIL only from a harness bug (race-file exclusion), fixed in the next soak commit |
+| 2026-07-07 | fullsize #1 | 3M+3V, full 41.9 GB/copy (6 ISOs 3–6 GB), 1 h window, churn+degrade+conflict, health 900/900s | interrupted (Windows rebooted mid-verify; no report) | **FINDING: presence mesh collapsed at t+91s under sustained 42 GB transfer load and never recovered for the whole hour** — every node read `online: 1 of 6` while doc/content sync continued; health events therefore 0, and swarm provider selection degraded to single-source fetches (nodes only 6–30 % after 1 h). All presence failure paths were silent (`let _ =` on broadcast/join; recv-stream end unlogged) — diagnostics added, repro fleet restarted on the surviving data. |
 
 ## Deferred / stretch
 
