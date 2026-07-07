@@ -182,6 +182,7 @@ pub(crate) async fn serve(
     };
 
     tokio::spawn(reconcile_loop(daemon.clone()));
+    tokio::spawn(presence_loop(daemon.clone()));
     tokio::spawn(throughput_loop(daemon.clone()));
 
     let listener = transport::bind(&socket)?;
@@ -219,14 +220,8 @@ pub(crate) async fn serve(
 /// viewer) imports its local changes and materializes remote ones.
 async fn reconcile_loop(daemon: Daemon) {
     let mut tick = tokio::time::interval(Duration::from_millis(750));
-    let mut tick_n: u64 = 0;
-    // Last per-share membership/status fingerprint. A peer aging online/offline
-    // produces no reconcile change, so without this the GUI would never re-query
-    // and would show a stale "N of M" / dot until the next content change.
-    let mut last_membership: u64 = 0;
     loop {
         tick.tick().await;
-        tick_n = tick_n.wrapping_add(1);
         let mut changed = Vec::new();
 
         let ids = { daemon.engine.lock().await.share_ids() };
@@ -242,6 +237,7 @@ async fn reconcile_loop(daemon: Daemon) {
                     .flatten()
             };
             let Some(job) = job else { continue };
+            let job_started = std::time::Instant::now();
             match job.run().await {
                 Ok(outcome) => {
                     let did = outcome.changed();
@@ -251,7 +247,7 @@ async fn reconcile_loop(daemon: Daemon) {
                         .await
                         .finish_reconcile(&id, Some(outcome));
                     if did {
-                        changed.push(id);
+                        changed.push(id.clone());
                     }
                 }
                 Err(e) => {
@@ -259,39 +255,87 @@ async fn reconcile_loop(daemon: Daemon) {
                     daemon.engine.lock().await.finish_reconcile(&id, None);
                 }
             }
+            // A long pass (e.g. materializing a multi-GB blob to disk) is normal
+            // during a big sync, but it delays the other shares' reconciles —
+            // surface it. Presence/health no longer ride this loop, so it can't
+            // starve the mesh anymore (that fleet-wide outage came from exactly
+            // this: minutes-long passes silencing our broadcasts, peers aging us
+            // offline at the 20s TTL).
+            let took = job_started.elapsed();
+            if took > Duration::from_secs(30) {
+                tracing::info!("reconcile {id} pass took {}s", took.as_secs());
+            }
         }
 
         // Retry any deferred cross-volume blob reclaims.
         daemon.engine.lock().await.retry_reclaims();
 
-        // Presence: announce this device's name + health to each share's pool.
-        // Every ~4th tick (~3s), plus immediately whenever a share changed (its
-        // seqno/health just moved). Built under a brief lock, sent off-lock.
-        if tick_n.is_multiple_of(4) || !changed.is_empty() {
+        // A changed share just moved its seqno/health: announce immediately
+        // rather than waiting for the presence loop's next 3s beat.
+        if !changed.is_empty() {
             let jobs = { daemon.engine.lock().await.presence_broadcasts() };
             for job in jobs {
                 job.send().await;
             }
+            let ts = now_unix();
+            let _ = daemon.events.send(IpcEvent::ShareListChanged);
+            for share_id in &changed {
+                let _ = daemon.events.send(IpcEvent::LastUpdated {
+                    share_id: share_id.clone(),
+                    ts,
+                });
+            }
+            tracing::debug!("reconcile changed {} share(s)", changed.len());
+        }
+    }
+}
+
+/// Presence, gossip-mesh repair, divergence self-heal kicks, the periodic deep
+/// verify, long-term health alerts, and the GUI membership poke — everything
+/// whose *cadence* matters — on their own task, decoupled from reconcile.
+///
+/// Split out of `reconcile_loop` after the full-size soak: a reconcile pass
+/// that spends minutes materializing a multi-GB blob ran presence on its tail,
+/// so under a big initial sync every node fell silent for minutes at a time,
+/// peers aged each other offline (20s TTL), and the whole mesh read "1 of N
+/// online" for as long as the sync lasted — which also blinded the health
+/// detector and degraded swarm provider selection. Network dials (mesh joins,
+/// doc resyncs) are spawned detached with a timeout so one hung peer can't
+/// stall this loop either.
+async fn presence_loop(daemon: Daemon) {
+    let mut tick = tokio::time::interval(Duration::from_secs(3));
+    let mut tick_n: u64 = 0;
+    // Last per-share membership/status fingerprint. A peer aging online/offline
+    // produces no reconcile change, so without this the GUI would never re-query
+    // and would show a stale "N of M" / dot until the next content change.
+    let mut last_membership: u64 = 0;
+    loop {
+        tick.tick().await;
+        tick_n = tick_n.wrapping_add(1);
+
+        // Announce this device's name + health to each share's pool. Built
+        // under a brief lock, sent off-lock (queued to the gossip actor).
+        let jobs = { daemon.engine.lock().await.presence_broadcasts() };
+        for job in jobs {
+            job.send().await;
         }
 
-        // Actively grow each share's presence-gossip mesh toward all-to-all. Gossip's
-        // one-shot bootstrap leaves a fragile star (the creator bootstraps with no
-        // peers; leaves dial only the creator), so presence reaches 3+ member pools
-        // asymmetrically. Every ~6s, reconnect to every member doc-sync has discovered
-        // so each becomes a direct gossip neighbor. Built under a brief lock, run
-        // off-lock.
-        if tick_n.is_multiple_of(8) {
+        // Every ~6s: grow each share's gossip mesh toward all-to-all (gossip's
+        // one-shot bootstrap leaves a fragile star), re-kick doc live-sync for
+        // out-of-sync shares, schedule due deep verifies, and emit health
+        // alerts. Dials run detached + bounded.
+        if tick_n.is_multiple_of(2) {
             let rejoins = { daemon.engine.lock().await.presence_rejoins() };
             for rejoin in rejoins {
-                rejoin.join().await;
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(30), rejoin.join()).await;
+                });
             }
-            // Self-heal: re-kick doc live-sync for any share that's out of sync with a
-            // peer (pairs with the forced deep verify done inside finish_reconcile),
-            // and run the periodic deep verify for shares due a full disk-vs-manifest
-            // re-check. Both are cheap unless something actually needs healing.
             let resyncs = { daemon.engine.lock().await.diverged_doc_resyncs() };
             for resync in resyncs {
-                resync.run().await;
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(30), resync.run()).await;
+                });
             }
             let verified = { daemon.engine.lock().await.periodic_deep_verify() };
             if !verified.is_empty() {
@@ -320,8 +364,8 @@ async fn reconcile_loop(daemon: Daemon) {
         }
 
         // Fingerprint the visible per-share state (membership counts + status)
-        // so peer online/offline transitions refresh the GUI even on an otherwise
-        // idle tick.
+        // so peer online/offline transitions refresh the GUI even on an
+        // otherwise idle tick.
         let membership = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -335,21 +379,9 @@ async fn reconcile_loop(daemon: Daemon) {
             }
             h.finish()
         };
-        let membership_changed = membership != last_membership;
-        last_membership = membership;
-
-        if !changed.is_empty() || membership_changed {
+        if membership != last_membership {
+            last_membership = membership;
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
-        }
-        if !changed.is_empty() {
-            let ts = now_unix();
-            for share_id in &changed {
-                let _ = daemon.events.send(IpcEvent::LastUpdated {
-                    share_id: share_id.clone(),
-                    ts,
-                });
-            }
-            tracing::debug!("reconcile changed {} share(s)", changed.len());
         }
     }
 }
