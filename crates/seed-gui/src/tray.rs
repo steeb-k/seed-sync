@@ -84,20 +84,14 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow, wiring: 
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip("S.E.E.D.");
-    // macOS: hand the white glyph to the system as a *template* image so it's
-    // recolored to match the menu bar (dark glyph in light mode, white in dark).
-    // Windows: no template concept — pick a dark/white glyph up front to suit the
-    // current taskbar theme, then keep it in step in the poll loop below.
-    #[cfg(target_os = "macos")]
-    {
-        builder = builder.with_icon_as_template(true);
-        match load_tray_icon(false) {
-            Some(icon) => builder = builder.with_icon(icon),
-            None => tracing::warn!("tray icon failed to decode; using system default"),
-        }
-    }
-    #[cfg(windows)]
-    match load_tray_icon(taskbar_is_light()) {
+    // The glyph ships in two authored variants — a standard one tuned for a dark
+    // panel and a "light" one (with dark rings) tuned for a light panel. Pick the
+    // one matching the current panel background (`tray_bg_is_light` reads the
+    // Windows taskbar theme / the macOS system appearance) and keep it in step in
+    // the poll loop below. Note we no longer hand macOS a *template* image: the
+    // art is colored now, and template mode keeps only the alpha (recoloring it to
+    // the menu-bar tint), which would throw the color away.
+    match load_tray_icon(tray_bg_is_light()) {
         Some(icon) => builder = builder.with_icon(icon),
         None => tracing::warn!("tray icon failed to decode; using system default"),
     }
@@ -120,20 +114,17 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow, wiring: 
     let window = window.clone();
     let mut last_paused = paused.load(Ordering::Relaxed);
     let mut last_speeds = (u64::MAX, u64::MAX);
-    // Track the Windows taskbar theme so the glyph can be re-inverted when the
-    // user switches light/dark while the app is running.
-    #[cfg(windows)]
-    let mut last_light = taskbar_is_light();
+    // Track the panel background theme so the glyph variant can be re-picked when
+    // the user switches light/dark (taskbar on Windows, system appearance on
+    // macOS) while the app is running.
+    let mut last_light = tray_bg_is_light();
     glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
-        #[cfg(windows)]
-        {
-            let now_light = taskbar_is_light();
-            if now_light != last_light {
-                if let Some(new_icon) = load_tray_icon(now_light) {
-                    let _ = icon.set_icon(Some(new_icon));
-                }
-                last_light = now_light;
+        let now_light = tray_bg_is_light();
+        if now_light != last_light {
+            if let Some(new_icon) = load_tray_icon(now_light) {
+                let _ = icon.set_icon(Some(new_icon));
             }
+            last_light = now_light;
         }
         // Keep the menu label in step with the (externally driven) pause state.
         let now_paused = paused.load(Ordering::Relaxed);
@@ -181,25 +172,43 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow, wiring: 
     });
 }
 
-/// Decode the embedded app PNG into an RGBA tray icon for the `tray-icon`
+/// Whether the tray/panel background the icon sits on is *light*, which selects
+/// the light (dark-ringed) glyph variant over the standard one. Windows reads the
+/// taskbar theme; macOS follows the system appearance (the menu bar is dark in
+/// Dark Mode). Re-evaluated in the poll loop so a live theme switch re-picks the
+/// glyph.
+#[cfg(windows)]
+fn tray_bg_is_light() -> bool {
+    taskbar_is_light()
+}
+#[cfg(target_os = "macos")]
+fn tray_bg_is_light() -> bool {
+    use adw::prelude::*;
+    !adw::StyleManager::default().is_dark()
+}
+
+/// Decode the embedded tray PNG into an RGBA tray icon for the `tray-icon`
 /// backend (Windows/macOS). Returns `None` if decoding fails, in which case the
 /// tray falls back to the system default icon. Mirrors the Linux ksni
 /// `load_icons` decode, but emits RGBA (R,G,B,A) as `tray-icon` expects.
 ///
-/// The glyph is white (tuned for dark trays). When `invert` is set, its RGB is
-/// flipped to a dark glyph (alpha preserved) so it stays legible on a *light*
-/// tray background — used on Windows, which draws the icon verbatim. macOS
-/// doesn't need this: the tray there uses template mode (see `install`), so the
-/// system re-colors the glyph to match the menu bar automatically.
+/// Two authored variants are embedded: the standard glyph (tuned for a dark
+/// panel) and the light glyph (with dark rings, tuned for a light panel). Pick by
+/// `light_bg` — no runtime recoloring, since each variant is hand-drawn for its
+/// background.
 #[cfg(any(windows, target_os = "macos"))]
-fn load_tray_icon(invert: bool) -> Option<tray_icon::Icon> {
+fn load_tray_icon(light_bg: bool) -> Option<tray_icon::Icon> {
     use gtk::gdk_pixbuf::{InterpType, Pixbuf};
-    // High-visibility variant, chosen specifically for the small tray size.
-    const PNG: &[u8] = include_bytes!(concat!(
+    const DARK: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../icon/appIconHiVis.png"
+        "/../../icon/appTrayDark.png"
     ));
-    let src = Pixbuf::from_read(std::io::Cursor::new(PNG)).ok()?;
+    const LIGHT: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../icon/appTrayLight.png"
+    ));
+    let png = if light_bg { LIGHT } else { DARK };
+    let src = Pixbuf::from_read(std::io::Cursor::new(png)).ok()?;
     let pb = src.scale_simple(32, 32, InterpType::Bilinear)?;
     let pb = if pb.has_alpha() {
         pb
@@ -216,12 +225,7 @@ fn load_tray_icon(invert: bool) -> Option<tray_icon::Icon> {
         let row = &bytes[y * rowstride..y * rowstride + w as usize * nch];
         for px in row.chunks_exact(nch) {
             let a = if nch == 4 { px[3] } else { 255 };
-            let (r, g, b) = if invert {
-                (255 - px[0], 255 - px[1], 255 - px[2])
-            } else {
-                (px[0], px[1], px[2])
-            };
-            rgba.extend_from_slice(&[r, g, b, a]);
+            rgba.extend_from_slice(&[px[0], px[1], px[2], a]);
         }
     }
     tray_icon::Icon::from_rgba(rgba, w as u32, h as u32).ok()
@@ -400,14 +404,15 @@ mod linux {
     /// (StatusNotifier wants pixmaps in network byte order: bytes are A,R,G,B).
     /// Returns empty if decoding fails, in which case the tray is skipped.
     ///
-    /// The white glyph is kept as-is here: a StatusNotifier host's panel color
-    /// isn't reliably discoverable across desktops (and most panels are dark),
-    /// so — unlike Windows/macOS — Linux doesn't invert for light panels.
+    /// The standard (dark-panel) glyph is used unconditionally here: a
+    /// StatusNotifier host's panel color isn't reliably discoverable across
+    /// desktops (and most panels are dark), so — unlike Windows/macOS — Linux
+    /// doesn't switch to the light-panel variant.
     fn load_icons() -> Vec<ksni::Icon> {
         use gtk::gdk_pixbuf::{InterpType, Pixbuf};
         const PNG: &[u8] = include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../icon/appIconHiVis.png"
+            "/../../icon/appTrayDark.png"
         ));
         let Ok(src) = Pixbuf::from_read(std::io::Cursor::new(PNG)) else {
             return Vec::new();

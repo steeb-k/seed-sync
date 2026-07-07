@@ -3,15 +3,21 @@
 per-size PNGs under ``img/``.
 
 Source art (``img/``, one file per authored size):
-  seed-icon-<sz>.png      -> the application icon (full-bleed blue tile)
-  seed-trayicon-<sz>.png   -> the system-tray glyph (white, transparent bg)
+  seed-appicon-<sz>px.png       -> the application icon (full-bleed tile)
+  seed-trayicon-<sz>px.png      -> the system-tray glyph, standard variant
+                                   (tuned for a dark panel background)
+  seed-trayicon-<sz>px-light.png -> the system-tray glyph, "light" variant
+                                   (tuned for a light panel background)
 
 Deliverables written by this script:
   icon/appIcon.png          master app PNG (Linux hicolor + macOS .icns are
                             regenerated from this at package time)
   icon/appIcon.ico          multi-resolution Windows app icon, embedding the
                             hand-authored 16/32/48/64/128/256 renders
-  icon/appIconHiVis.png     tray master (decoded + rescaled at runtime)
+  icon/appTrayDark.png      tray master, standard variant  (decoded + rescaled
+                            at runtime; shown on dark panels)
+  icon/appTrayLight.png     tray master, light variant     (decoded + rescaled
+                            at runtime; shown on light panels)
   android/app/src/main/res/mipmap-*dpi/ic_launcher{,_round,_foreground}.png
                             per-density Android launcher bitmaps
 
@@ -57,11 +63,14 @@ ANDROID_DENSITIES = {
 
 def app_src(size: int) -> Path:
     """Nearest authored app-tile render at or above ``size`` (else the largest)."""
-    authored = sorted(int(p.stem.split("-")[-1]) for p in IMG.glob("seed-icon-*.png"))
+    authored = sorted(
+        int(p.stem.split("-")[-1].removesuffix("px"))
+        for p in IMG.glob("seed-appicon-*px.png")
+    )
     for s in authored:
         if s >= size:
-            return IMG / f"seed-icon-{s}.png"
-    return IMG / f"seed-icon-{authored[-1]}.png"
+            return IMG / f"seed-appicon-{s}px.png"
+    return IMG / f"seed-appicon-{authored[-1]}px.png"
 
 
 def load_app(size: int) -> Image.Image:
@@ -176,12 +185,36 @@ def build_android() -> None:
         write_png(load_app(fg_px), d / "ic_launcher_foreground.png")
 
 
+def _tray_size(path: Path) -> int:
+    """Parse the pixel size out of a tray render's filename (``...-<sz>px[-light]``)."""
+    return int(path.stem.replace("-light", "").split("-")[-1].removesuffix("px"))
+
+
+def tray_src(light: bool) -> Path:
+    """Largest authored tray render for the given variant (light or standard).
+
+    The "-light" files are the light-panel variant; everything else is the
+    standard (dark-panel) glyph. The plain ``*px.png`` glob would also catch the
+    ``*px-light.png`` names, so filter those out for the standard variant.
+    """
+    if light:
+        cands = list(IMG.glob("seed-trayicon-*px-light.png"))
+    else:
+        cands = [
+            p for p in IMG.glob("seed-trayicon-*px.png")
+            if not p.stem.endswith("-light")
+        ]
+    return max(cands, key=_tray_size)
+
+
 def main() -> None:
-    print("app master + tray master:")
+    print("app master + tray masters:")
     ICON.mkdir(parents=True, exist_ok=True)
     write_png(load_app(1024), ICON / "appIcon.png")
-    write_png(Image.open(IMG / "seed-trayicon-128.png").convert("RGBA"),
-              ICON / "appIconHiVis.png")
+    write_png(Image.open(tray_src(light=False)).convert("RGBA"),
+              ICON / "appTrayDark.png")
+    write_png(Image.open(tray_src(light=True)).convert("RGBA"),
+              ICON / "appTrayLight.png")
     print("windows .ico:")
     build_ico(ICON / "appIcon.ico")
     print("android launcher bitmaps:")
