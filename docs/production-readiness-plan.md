@@ -84,9 +84,14 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` landed (commit)
 | 2026-07-07 | fullsize #3 | same config | aborted at ~t+2100 (diagnosis complete) | Watchdog alone insufficient: it recycled **5000+** downloads — the engine queued a task for every missing blob at once (~4000/node) and the ISOs head-of-line-blocked the pile. Root cause of #8 identified → `MAX_INFLIGHT_DOWNLOADS = 12` back-pressure landed. |
 | 2026-07-07 | fullsize #4 | same config, + download cap | aborted at ~t+4600 (behavior established) | Cap works: steady climb everywhere (vs #3's flatline), no wedges. New bottleneck exposed: master appended last in provider lists → the first finished peer became the fleet's **sole seeder** while the master idled. → balanced-seeding policy landed (master rotates in post-grace, retires at ≥3 fully-synced peers, liveness valve). |
 | 2026-07-07 | fullsize #5 | same config, + balanced seeding | `docs/soak-reports/` (see below) | **Zero watchdog fires, zero swarm-deadline timeouts, health pipeline exact** — reliability layer holds. Sync reached ~28 % (front-runners) in the 90 min window: small/mid files fast and even, the six 3–6 GB ISOs throughput-bound on one shared disk. Remaining work is bulk-transfer performance tuning (swarm pacing/slot allocation), not correctness. |
+| 2026-07-07 | fleet (3M+25V) | scaled corpus 0.47 GB, 60 min window, churn 300s + degrade + conflict, health 600/900s | `docs/soak-reports/2026-07-07-fleet-28-mesh-fragmentation.md` | FAIL — **FINDING (known-issues #9): presence mesh fragments at 28 members.** Per-node membership oscillated 1/28 ↔ 25/28 all run (all-to-all `join_peers` every 6 s thrashes iroh-gossip's bounded active view); content spread starved by fragmented rosters (0/28 byte-identical of a corpus 8 nodes sync in minutes); health events 0 on node-00 (flapping "offline" pauses every episode clock). Works at ≤8 members; fix direction in known-issues #9. |
 
 ## Next engineering (from the soaks, ordered)
 
+0. **known-issues #9 — presence mesh fragmentation at fleet scale.** Blocks the
+   target topology outright (3 masters + 20–30 viewers): rejoin with a small
+   random subset instead of all-to-all `join_peers` every 6 s, verify with the
+   fleet soak (success = membership converges to 28/28 and holds).
 1. **Bulk-transfer throughput at ISO scale** — with reliability fixed (cap +
    watchdog + balanced seeding), 3–6 GB blobs move correctly but slowly
    (~1.5 MB/s/node on the shared-disk fleet). Tune: swarm round pacing /

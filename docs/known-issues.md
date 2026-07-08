@@ -236,6 +236,32 @@ firing on the wedged path).
 
 ---
 
+## 9. Presence mesh fragments at fleet scale (~28 members)
+**Tier:** observed in soak · **Severity:** high for the target topology (3 masters + 20–30 viewers)
+**Where:** `presence_rejoins` strategy (`crates/seed-core/src/engine.rs`) vs
+iroh-gossip's bounded active view.
+
+**Symptoms (fleet soak, 3M+25V, scaled corpus, 2026-07-07):** per-node
+membership wildly uneven and never converging (nodes see 1/28 … 25/28 online at
+t+21 min); content spread starved by the fragmented rosters (many nodes <10 %
+of a 0.47 GB corpus that an 8-node fleet syncs in minutes); widespread
+`OutOfSync` from slow doc propagation. Presence works all-to-all at ≤8 members
+(smoke run) and fragments at 28.
+
+**Hypothesis:** every node calls `join_peers` with ALL known members every ~6 s
+(`presence_rejoins`). iroh-gossip (HyParView) keeps a small bounded active
+view; at 28 members the constant full-set joins evict each other's neighbors,
+so the relay overlay never stabilizes and epidemic delivery breaks down. The
+all-to-all repair that fixes the 3-node star is poison at fleet scale.
+
+**Suggested fix:** rejoin with a small RANDOM subset (2–3 peers) and only when
+the roster looks stale (e.g. online count far below total known), letting
+gossip's own shuffle maintain the overlay; verify with the fleet soak
+(`seed-soak fleet --masters 3 --viewers 25 …`) — success = every node's
+membership converging to 28/28 and staying there.
+
+---
+
 ## 5. LWW compares local file mtime against the doc *record* timestamp
 **Tier:** note · **Severity:** low (semantic; skew-sensitive)
 **Where:** `crates/seed-core/src/engine.rs:1243-1244`
