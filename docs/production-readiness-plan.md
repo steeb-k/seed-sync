@@ -44,9 +44,10 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` landed (commit)
   `adw::Toast`; self / remote / recovered copy; peers flyout shows the
   unhealthy duration. Manual visual check on Win + Linux still pending.
 - `[~]` **Phase 8 — soaks**: `seed-soak` bin (fleet | fullsize | clean) built;
-  full-size content soak (3 masters + 3 viewers, ~210 GB, real 3–6 GB ISOs)
-  and fleet soak (3 masters + 25 viewers, scaled corpus) on `D:\` still to run,
-  each with a committed report.
+  **fleet soak (3 masters + 25 viewers) PASSED 2026-07-08** after the
+  fleet-scale fixes (#9–#11, #7 — see the soak run log); the full-size content
+  soak's remaining open item is bulk-transfer throughput at ISO scale
+  (reliability layer verified in fullsize #5).
 
 ## Decisions log
 
@@ -90,21 +91,22 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` landed (commit)
 | 2026-07-07 | fleet #4 (15 min) | same config, + provider cap + servable primaries | aborted (diagnosis) | Leak reduced but not fixed: RSS sane through the window (max 430 MB vs #3's 6.6 GB at same age) then exploded ~12 MB/s as transfers began succeeding en masse; 18/28 OOM deaths. **Phase watchdog paid off immediately**: the #7 cold-start wedge is passes stuck 25+ min inside iroh-docs reads (`read ignore list`, doc `get_many` stream) — docs actor unresponsive under fleet pressure; slow paths dominated by `compute health` store calls. |
 | 2026-07-07 | fleet #5 (alloc-trace) | same config, daemon built with ≥512 MB allocation-backtrace allocator | (diagnosis run) | **known-issues #11 root cause captured in one backtrace**: the doubling allocation is `VecDeque::push_back` in **iroh 1.0.0's per-remote `pending_open_paths` retry queue** (`remote_state.rs:1062`) — no dedup + per-connection re-push every 333 ms multiplies the queue without bound whenever a remote's CIDs stay exhausted (dead/wedged/overloaded peers). Not fixed upstream through iroh 1.0.2. → vendored iroh with a one-hunk dedup+cap patch; iroh-blobs/provider + swarm fixes kept as defense-in-depth. |
 | 2026-07-07 | fleet #6 (25 min) | same config, + vendored-iroh queue patch | `docs/soak-reports/2026-07-07-fleet-6-oom-fixed-convergence-tail.md` | **known-issues #11 VERIFIED FIXED**: 28/28 alive to the end, 0 OOM, 0 alloc-traces, RSS max 105→726 MB (plausible working set; runs #3–#5 were multi-GB and dying by the same age). Mesh held 27–28/28; sync ~3× faster (64 % at t+846 vs 39 % at t+1096 in #3). Verdict FAIL on convergence tail only: **10 nodes had reconcile passes wedged >10 min inside iroh-docs reads** (phase watchdog data) — known-issues #7 is now the top blocker; one node 0 % all run. |
+| 2026-07-08 | fleet #7 (full 60 min) | same config, + vendored iroh-docs deadlock patches + doc-read timeouts (#7 fix) | `docs/soak-reports/2026-07-08-fleet-7-consistent-harness-races.md` | **Every fleet-scale goal met**: membership 28.0/28 and holding, pct avg 100 mid-churn, RSS max 841 MB, 0 OOM, 0 wedges, **all nodes Healthy at end** — #7 fix verified (no doc-read wedges; prior run had 10/28). Verdict FAIL only on 4 verify lines, **identical on all 28 nodes** (fleet fully byte-consistent with itself): churn deletes resurrected by masters still mid-initial-publish (deletion-as-absence race → new known-issues #12) and the ordered-conflict write inverted by publish lag (#5, now soak-evidenced). Both are documented multi-master semantics the harness asserted naively → harness now gates churn/conflict on all masters Healthy @ 100 % and asserts *causal* conflict ordering. |
+| 2026-07-08 | fleet #8 (full 60 min) | same config, + gated harness | `docs/soak-reports/2026-07-08-fleet-8-PASS.md` | **PASS** (with benign anomalies: transient IPC sample timeouts under initial-sync load, by-design conflict notes). **28/28 byte-identical, all Healthy at end, 55 PeerHealth events, 0 swarm-deadline hits, 0 OOM, 0 wedges**; membership 28.0/28 and pct 100 held through 7 churn rounds + degrade/recover + conflict. The target topology (3 masters + 25 viewers) is validated end-to-end. |
 
 ## Next engineering (from the soaks, ordered)
 
-0. `[~]` **Fleet-scale stability (known-issues #9, #10, #11 fixed; #7 is the
-   remaining blocker).** Landed + soak-verified: subset presence rejoin (#9 —
-   mesh holds 27–28/28 under load), bounded doc-resync kicks (#10 — ~20× less
-   session load), vendored-iroh `pending_open_paths` dedup+cap (#11 — 0 OOM,
-   RSS bounded; also iroh-blobs 16-stream provider cap + servable-only swarm
-   primaries as defense-in-depth). Remaining for a PASSing fleet soak:
-   **known-issues #7** — reconcile passes wedge >10 min inside iroh-docs reads
-   (`read ignore list`, `get_many`); 10/28 nodes hit it in fleet #6 (phase-
-   watchdog data in each node's daemon.log). Fix #7, then re-run the full
-   60-min fleet soak (success = 28/28 membership, corpus byte-identical, all
-   Healthy, 0 OOM). Also: report the iroh queue bug upstream (n0-computer/
-   iroh) before any iroh bump.
+0. `[x]` **Fleet-scale stability — DONE, soak PASS (fleet #8, 2026-07-08).**
+   Fixed + verified at the target topology: #9 subset presence rejoin, #10
+   bounded doc-resync kicks, #11 vendored-iroh `pending_open_paths` dedup+cap
+   (+ iroh-blobs 16-stream provider cap, servable-only swarm primaries,
+   ≥512 MB alloc-trace allocator), #7 vendored iroh-docs deadlock patches
+   (try_send events + fair LiveActor polling) + 120 s doc-read timeouts +
+   60 s phase watchdog. New documented caveats: #12 (delete vs still-seeding
+   master resurrection), #5 evidence (publish-lag LWW inversion); harness now
+   gates mutation scenarios on all-masters-Healthy and asserts causal conflict
+   ordering. **Follow-up: report the iroh and iroh-docs bugs upstream
+   (n0-computer) before any iroh-stack bump.**
 1. **Bulk-transfer throughput at ISO scale** — with reliability fixed (cap +
    watchdog + balanced seeding), 3–6 GB blobs move correctly but slowly
    (~1.5 MB/s/node on the shared-disk fleet). Tune: swarm round pacing /

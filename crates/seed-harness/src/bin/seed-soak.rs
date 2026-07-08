@@ -331,6 +331,16 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
     let mut resumed_done = false;
     let mut conflict_done = false;
     let mut interrupted = false;
+    // Churn/conflict wait for every master to finish its initial import+publish
+    // (Healthy @ 100%). Mutating mid-seeding asserts semantics the engine
+    // deliberately does not provide: a churn DELETE races the other masters'
+    // still-pending initial publish of the same path — deletion is absence in
+    // the doc, indistinguishable from never-seen, so the slower master
+    // re-publishes the file and resurrects it fleet-wide (known-issues #12);
+    // and gross publish lag inverts wall-clock LWW expectations (#5). Fleet
+    // soak #7 converged 28/28 byte-identical but FAILed verify on exactly
+    // those two races. Steady-state mutation is what the product promises.
+    let mut fleet_seeded = false;
 
     while started.elapsed() < Duration::from_secs(a.duration) {
         tokio::select! {
@@ -372,9 +382,34 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
                 .await;
             }
         }
+        // Readiness gate for the mutation scenarios (see `fleet_seeded` above).
+        if (a.churn.is_some() || a.conflict) && !fleet_seeded {
+            let mut ready = 0;
+            for n in nodes.iter().filter(|n| n.is_master) {
+                if let Ok(IpcResponse::Shares(shares)) =
+                    request_bounded(&n.sock, IpcRequest::ListShares).await
+                {
+                    if shares.iter().any(|s| {
+                        s.share_id == share_id
+                            && s.percent == 100
+                            && format!("{:?}", s.status) == "Healthy"
+                    }) {
+                        ready += 1;
+                    }
+                }
+            }
+            if ready == a.masters {
+                fleet_seeded = true;
+                // Start the churn clock from readiness, not process start.
+                last_churn = Instant::now();
+                println!(
+                    "t+{elapsed}s all {ready} masters Healthy @ 100% — mutation scenarios armed"
+                );
+            }
+        }
         // Scenario: multi-master churn.
         if let Some(churn_secs) = a.churn {
-            if last_churn.elapsed() >= Duration::from_secs(churn_secs) {
+            if fleet_seeded && last_churn.elapsed() >= Duration::from_secs(churn_secs) {
                 last_churn = Instant::now();
                 let m = (churn_round as usize) % a.masters;
                 match corpus::mutate(&nodes[m].folder, &mut manifest, spec.seed, churn_round, 0.02)
@@ -391,7 +426,12 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
             }
         }
         // Scenario: same-path conflict at ~1/3 duration.
-        if a.conflict && !conflict_done && elapsed >= a.duration / 3 && a.masters >= 2 {
+        if a.conflict
+            && !conflict_done
+            && fleet_seeded
+            && elapsed >= a.duration / 3
+            && a.masters >= 2
+        {
             conflict_done = true;
             println!("t+{elapsed}s conflict scenario: ordered then sub-second same-path writes");
             let path = "conflict/ordered.txt";
@@ -399,6 +439,29 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
                 std::fs::create_dir_all(m.folder.join("conflict"))?;
             }
             std::fs::write(nodes[0].folder.join(path), b"from m0")?;
+            // Causal ordering: wait until m0's write is VISIBLE on m1 before
+            // writing the newer version there. A blind sleep asserts wall-clock
+            // ordering under unbounded publish lag, which no LWW system can
+            // honor — fleet soak #7 (heavy load, reconcile passes lagging
+            // minutes) converged unanimously on the OLDER write because m0's
+            // doc record carried a later timestamp than m1's file mtime
+            // (known-issues #5). "Edit made after seeing the other side" is
+            // the ordering LWW must and does get right.
+            let visible = tokio::time::timeout(Duration::from_secs(180), async {
+                loop {
+                    if std::fs::read(nodes[1].folder.join(path)).is_ok_and(|b| b == b"from m0") {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+            })
+            .await;
+            if visible.is_err() {
+                anomalies.push(format!(
+                    "t+{elapsed}s ordered-conflict: m0's write not visible on m1 within 180s — \
+                     ordered assertion may be unreliable this run"
+                ));
+            }
             tokio::time::sleep(Duration::from_millis(1200)).await;
             std::fs::write(nodes[1].folder.join(path), b"from m1 (newer, must win)")?;
             manifest.insert(path.to_string(), {
