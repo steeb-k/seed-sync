@@ -255,9 +255,17 @@ peers) or empty-store resync.
 
 ---
 
-## 8. Content downloads can wedge silently at multi-GB / multi-peer scale — **MITIGATED**
-**Tier:** observed in soak · **Severity:** high (sync stalls indefinitely) · **Status:** watchdog mitigation landed; root cause open
+## 8. Content downloads can wedge silently at multi-GB / multi-peer scale — **FIXED (via #7 + #11)**
+**Tier:** observed in soak · **Severity:** high (sync stalls indefinitely) · **Status:** closed — root causes were #7 (iroh-docs actor deadlock) and #11 (iroh path-retry queue collapse) as seen from the download path; watchdog retained as safety net
 **Where:** `ensure_download` / the in-flight map (`crates/seed-core/src/engine.rs`)
+
+> **Closed (fullsize #6, 2026-07-08, full fix stack):** the silent-wedge
+> signature (receivers pinned at 0–5 % for hours, zero log lines) did not
+> reproduce — every receiver progressed continuously for the whole window,
+> rate-bound only by the shared spinning disk. The 3 stall-watchdog fires in
+> the run were slow-transfer recycles under deliberate verify congestion
+> (aborted at the 15 min bound, resumed from verified chunks — by design).
+> Original write-up kept below.
 
 **Symptoms (fullsize soak #2, 3M+3V × 42 GB, 2026-07-07,
 `docs/soak-reports/2026-07-07-fullsize-2-download-stall.md`):** of five
