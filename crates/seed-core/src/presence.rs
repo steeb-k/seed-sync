@@ -10,9 +10,12 @@
 //! Delivery: a single broadcast is best-effort, but the swarm's one-shot bootstrap
 //! is a fragile star (the creator subscribes with an empty bootstrap; leaves dial
 //! only the creator), so in a 3+ member pool epidemic relay reaches members
-//! asymmetrically. The engine therefore periodically reconnects the mesh toward
-//! all-to-all via [`PresenceRejoin`] using the peers doc-sync has discovered, so
-//! every member ends up a direct neighbor and `broadcast` reaches everyone.
+//! asymmetrically. The engine therefore periodically repairs the mesh via
+//! [`PresenceRejoin`]: each tick it asks the swarm to connect to a small random
+//! sample of the members it currently can't hear (discovered via doc-sync),
+//! until epidemic relay reaches everyone. Repair is deliberately *not*
+//! all-to-all — full-set joins every tick evict gossip's bounded active view
+//! and fragment the overlay at fleet scale (known-issues #9).
 //!
 //! Trust: a message is attributed to its gossip `delivered_from` endpoint id,
 //! which iroh has already QUIC-authenticated. v1 does NOT sign the payload, so a
@@ -147,8 +150,11 @@ impl PresenceBroadcast {
 /// subscribes with an *empty* bootstrap (its own id is filtered out), while leaves
 /// bootstrap only from the creator. That leaves a fragile star whose epidemic relay
 /// delivers presence asymmetrically once there are 3+ members. Periodically calling
-/// [`GossipSender::join_peers`] with every peer doc-sync has discovered grows the
-/// mesh toward all-to-all, so `broadcast` reaches everyone directly.
+/// [`GossipSender::join_peers`] with a few of the members we can't currently hear
+/// repairs the mesh until relay reaches everyone. The peer set is a small random
+/// sample, never the full roster: joining every known member each tick thrashed
+/// gossip's bounded active view and fragmented the overlay at 28 members
+/// (known-issues #9).
 pub struct PresenceRejoin {
     sender: GossipSender,
     peers: Vec<EndpointId>,

@@ -1,0 +1,400 @@
+# seed-soak fleet report (1783491270)
+
+- config: 3 masters + 25 viewers, corpus 578 files / 0.47 GB, duration 1500s, interval 30s
+- scenarios: churn=Some(300) degrade_viewer=Some(0) conflict=true health_secs=Some("600/900")
+- verdict: **FAIL**
+- all nodes Healthy at end: false; swarm-deadline log hits: 0
+
+## Convergence verification
+
+- node-00: size mismatch: conflict/ordered.txt (7 != 25)
+- node-00: extra file: d01/d08/f00022-mid.bin
+- node-00: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-00: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-00: extra file: d10/d19/d15/f00124-small.bin
+- node-00: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-00: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-00: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-00: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-00: extra file: f00094-small.bin
+- node-00: … 4 more mismatches
+- node-01: content mismatch: conflict/race.txt
+- node-01: extra file: d10/d19/d15/f00124-small.bin
+- node-01: extra file: f00223-small.bin
+- node-01: missing file: d00/f00000-big.bin
+- node-01: missing file: d03/d11/f00011-swarm.bin
+- node-01: missing file: d04/d09/d12/f00001-swarm.bin
+- node-01: missing file: d05/d15/d02/d15/f00009-swarm.bin
+- node-01: missing file: d05/d18/f00007-swarm.bin
+- node-01: missing file: d06/d08/d14/d10/f00010-swarm.bin
+- node-01: missing file: d09/d15/d05/f00008-swarm.bin
+- node-01: … 4 more mismatches
+- node-02: size mismatch: conflict/ordered.txt (7 != 25)
+- node-02: extra file: d01/d08/f00022-mid.bin
+- node-02: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-02: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-02: extra file: d10/d19/d15/f00124-small.bin
+- node-02: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-02: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-02: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-02: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-02: extra file: f00094-small.bin
+- node-02: … 15 more mismatches
+- node-03: extra file: d01/d08/f00022-mid.bin
+- node-03: size mismatch: d04/d01/f00165-small.bin (11632 != 241377)
+- node-03: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-03: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-03: extra file: d10/d19/d15/f00124-small.bin
+- node-03: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-03: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-03: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-03: size mismatch: d19/d02/d07/d18/f00255-small.bin (3265 != 99757)
+- node-03: extra file: f00094-small.bin
+- node-03: … 39 more mismatches
+- node-04: size mismatch: conflict/ordered.txt (7 != 25)
+- node-04: extra file: d01/d08/f00022-mid.bin
+- node-04: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-04: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-04: extra file: d10/d19/d15/f00124-small.bin
+- node-04: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-04: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-04: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-04: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-04: extra file: f00094-small.bin
+- node-04: … 15 more mismatches
+- node-05: size mismatch: conflict/ordered.txt (7 != 25)
+- node-05: extra file: d01/d08/f00022-mid.bin
+- node-05: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-05: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-05: extra file: d10/d19/d15/f00124-small.bin
+- node-05: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-05: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-05: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-05: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-05: extra file: f00094-small.bin
+- node-05: … 15 more mismatches
+- node-06: size mismatch: conflict/ordered.txt (7 != 25)
+- node-06: extra file: d01/d08/f00022-mid.bin
+- node-06: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-06: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-06: extra file: d10/d19/d15/f00124-small.bin
+- node-06: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-06: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-06: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-06: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-06: extra file: f00094-small.bin
+- node-06: … 15 more mismatches
+- node-07: size mismatch: conflict/ordered.txt (7 != 25)
+- node-07: extra file: d01/d08/f00022-mid.bin
+- node-07: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-07: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-07: extra file: d10/d19/d15/f00124-small.bin
+- node-07: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-07: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-07: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-07: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-07: extra file: f00094-small.bin
+- node-07: … 15 more mismatches
+- node-08: size mismatch: conflict/ordered.txt (7 != 25)
+- node-08: extra file: d01/d08/f00022-mid.bin
+- node-08: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-08: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-08: extra file: d10/d19/d15/f00124-small.bin
+- node-08: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-08: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-08: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-08: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-08: extra file: f00094-small.bin
+- node-08: … 15 more mismatches
+- node-09: size mismatch: conflict/ordered.txt (7 != 25)
+- node-09: extra file: d01/d08/f00022-mid.bin
+- node-09: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-09: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-09: extra file: d10/d19/d15/f00124-small.bin
+- node-09: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-09: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-09: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-09: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-09: extra file: f00094-small.bin
+- node-09: … 17 more mismatches
+- node-10: size mismatch: conflict/ordered.txt (7 != 25)
+- node-10: extra file: d01/d08/f00022-mid.bin
+- node-10: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-10: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-10: extra file: d10/d19/d15/f00124-small.bin
+- node-10: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-10: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-10: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-10: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-10: extra file: f00094-small.bin
+- node-10: … 15 more mismatches
+- node-11: size mismatch: conflict/ordered.txt (7 != 25)
+- node-11: extra file: d01/d08/f00022-mid.bin
+- node-11: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-11: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-11: extra file: d10/d19/d15/f00124-small.bin
+- node-11: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-11: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-11: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-11: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-11: extra file: f00094-small.bin
+- node-11: … 15 more mismatches
+- node-12: missing file: churn/r000-78be7982.bin
+- node-12: missing file: churn/r000-82fb6e18.bin
+- node-12: missing file: churn/r000-9c24d7c0.bin
+- node-12: missing file: churn/r000-c77263f9.bin
+- node-12: missing file: churn/r001-68b74148.bin
+- node-12: missing file: churn/r001-f723c82f.bin
+- node-12: missing file: churn/r001-fef5aabb.bin
+- node-12: missing file: churn/r002-18af9808.bin
+- node-12: missing file: churn/r002-21fd7642.bin
+- node-12: missing file: churn/r002-2f5eeb8b.bin
+- node-12: … 568 more mismatches
+- node-13: missing file: churn/r000-78be7982.bin
+- node-13: missing file: churn/r000-82fb6e18.bin
+- node-13: missing file: churn/r000-9c24d7c0.bin
+- node-13: missing file: churn/r000-c77263f9.bin
+- node-13: missing file: churn/r001-68b74148.bin
+- node-13: missing file: churn/r001-f723c82f.bin
+- node-13: missing file: churn/r001-fef5aabb.bin
+- node-13: missing file: churn/r002-18af9808.bin
+- node-13: missing file: churn/r002-21fd7642.bin
+- node-13: missing file: churn/r002-2f5eeb8b.bin
+- node-13: … 568 more mismatches
+- node-14: size mismatch: conflict/ordered.txt (7 != 25)
+- node-14: extra file: d01/d08/f00022-mid.bin
+- node-14: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-14: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-14: extra file: d10/d19/d15/f00124-small.bin
+- node-14: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-14: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-14: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-14: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-14: extra file: f00094-small.bin
+- node-14: … 15 more mismatches
+- node-15: size mismatch: conflict/ordered.txt (7 != 25)
+- node-15: extra file: d01/d08/f00022-mid.bin
+- node-15: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-15: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-15: extra file: d10/d19/d15/f00124-small.bin
+- node-15: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-15: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-15: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-15: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-15: extra file: f00094-small.bin
+- node-15: … 15 more mismatches
+- node-16: size mismatch: conflict/ordered.txt (7 != 25)
+- node-16: extra file: d01/d08/f00022-mid.bin
+- node-16: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-16: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-16: extra file: d10/d19/d15/f00124-small.bin
+- node-16: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-16: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-16: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-16: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-16: extra file: f00094-small.bin
+- node-16: … 15 more mismatches
+- node-17: size mismatch: conflict/ordered.txt (7 != 25)
+- node-17: extra file: d01/d08/f00022-mid.bin
+- node-17: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-17: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-17: extra file: d10/d19/d15/f00124-small.bin
+- node-17: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-17: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-17: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-17: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-17: extra file: f00094-small.bin
+- node-17: … 16 more mismatches
+- node-18: missing file: churn/r000-78be7982.bin
+- node-18: missing file: churn/r000-82fb6e18.bin
+- node-18: missing file: churn/r000-9c24d7c0.bin
+- node-18: missing file: churn/r000-c77263f9.bin
+- node-18: missing file: churn/r001-68b74148.bin
+- node-18: missing file: churn/r001-f723c82f.bin
+- node-18: missing file: churn/r001-fef5aabb.bin
+- node-18: missing file: churn/r002-18af9808.bin
+- node-18: missing file: churn/r002-21fd7642.bin
+- node-18: missing file: churn/r002-2f5eeb8b.bin
+- node-18: … 568 more mismatches
+- node-19: missing file: churn/r000-78be7982.bin
+- node-19: missing file: churn/r000-82fb6e18.bin
+- node-19: missing file: churn/r000-9c24d7c0.bin
+- node-19: missing file: churn/r000-c77263f9.bin
+- node-19: missing file: churn/r001-68b74148.bin
+- node-19: missing file: churn/r001-f723c82f.bin
+- node-19: missing file: churn/r001-fef5aabb.bin
+- node-19: missing file: churn/r002-18af9808.bin
+- node-19: missing file: churn/r002-21fd7642.bin
+- node-19: missing file: churn/r002-2f5eeb8b.bin
+- node-19: … 568 more mismatches
+- node-20: missing file: churn/r000-78be7982.bin
+- node-20: missing file: churn/r000-82fb6e18.bin
+- node-20: missing file: churn/r000-9c24d7c0.bin
+- node-20: missing file: churn/r000-c77263f9.bin
+- node-20: missing file: churn/r001-68b74148.bin
+- node-20: missing file: churn/r001-f723c82f.bin
+- node-20: missing file: churn/r001-fef5aabb.bin
+- node-20: missing file: churn/r002-18af9808.bin
+- node-20: missing file: churn/r002-21fd7642.bin
+- node-20: missing file: churn/r002-2f5eeb8b.bin
+- node-20: … 568 more mismatches
+- node-21: missing file: churn/r000-78be7982.bin
+- node-21: missing file: churn/r000-82fb6e18.bin
+- node-21: missing file: churn/r000-9c24d7c0.bin
+- node-21: missing file: churn/r000-c77263f9.bin
+- node-21: missing file: churn/r001-68b74148.bin
+- node-21: missing file: churn/r001-f723c82f.bin
+- node-21: missing file: churn/r001-fef5aabb.bin
+- node-21: missing file: churn/r002-18af9808.bin
+- node-21: missing file: churn/r002-21fd7642.bin
+- node-21: missing file: churn/r002-2f5eeb8b.bin
+- node-21: … 568 more mismatches
+- node-22: missing file: churn/r000-78be7982.bin
+- node-22: missing file: churn/r000-82fb6e18.bin
+- node-22: missing file: churn/r000-9c24d7c0.bin
+- node-22: missing file: churn/r000-c77263f9.bin
+- node-22: missing file: churn/r001-68b74148.bin
+- node-22: missing file: churn/r001-f723c82f.bin
+- node-22: missing file: churn/r001-fef5aabb.bin
+- node-22: missing file: churn/r002-18af9808.bin
+- node-22: missing file: churn/r002-21fd7642.bin
+- node-22: missing file: churn/r002-2f5eeb8b.bin
+- node-22: … 568 more mismatches
+- node-23: missing file: churn/r000-78be7982.bin
+- node-23: missing file: churn/r000-82fb6e18.bin
+- node-23: missing file: churn/r000-9c24d7c0.bin
+- node-23: missing file: churn/r000-c77263f9.bin
+- node-23: missing file: churn/r001-68b74148.bin
+- node-23: missing file: churn/r001-f723c82f.bin
+- node-23: missing file: churn/r001-fef5aabb.bin
+- node-23: missing file: churn/r002-18af9808.bin
+- node-23: missing file: churn/r002-21fd7642.bin
+- node-23: missing file: churn/r002-2f5eeb8b.bin
+- node-23: … 568 more mismatches
+- node-24: missing file: churn/r000-78be7982.bin
+- node-24: missing file: churn/r000-82fb6e18.bin
+- node-24: missing file: churn/r000-9c24d7c0.bin
+- node-24: missing file: churn/r000-c77263f9.bin
+- node-24: missing file: churn/r001-68b74148.bin
+- node-24: missing file: churn/r001-f723c82f.bin
+- node-24: missing file: churn/r001-fef5aabb.bin
+- node-24: missing file: churn/r002-18af9808.bin
+- node-24: missing file: churn/r002-21fd7642.bin
+- node-24: missing file: churn/r002-2f5eeb8b.bin
+- node-24: … 568 more mismatches
+- node-25: size mismatch: conflict/ordered.txt (7 != 25)
+- node-25: extra file: d01/d08/f00022-mid.bin
+- node-25: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-25: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-25: extra file: d10/d19/d15/f00124-small.bin
+- node-25: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-25: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-25: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-25: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-25: extra file: f00094-small.bin
+- node-25: … 15 more mismatches
+- node-26: size mismatch: conflict/ordered.txt (7 != 25)
+- node-26: extra file: d01/d08/f00022-mid.bin
+- node-26: size mismatch: d07/f00096-small.bin (52613 != 3461)
+- node-26: size mismatch: d09/d12/f00060-small.bin (65059 != 201798)
+- node-26: extra file: d10/d19/d15/f00124-small.bin
+- node-26: extra file: d11/d06/d17/d04/f00025-mid.bin
+- node-26: size mismatch: d12/d00/d13/d00/f00403-small.bin (64900 != 28912)
+- node-26: size mismatch: d17/d00/d02/d15/f00235-small.bin (44026 != 140242)
+- node-26: size mismatch: d17/d18/f00045-mid.bin (1257120 != 113749)
+- node-26: extra file: f00094-small.bin
+- node-26: … 23 more mismatches
+- node-27: missing file: churn/r000-78be7982.bin
+- node-27: missing file: churn/r000-82fb6e18.bin
+- node-27: missing file: churn/r000-9c24d7c0.bin
+- node-27: missing file: churn/r000-c77263f9.bin
+- node-27: missing file: churn/r001-68b74148.bin
+- node-27: missing file: churn/r001-f723c82f.bin
+- node-27: missing file: churn/r001-fef5aabb.bin
+- node-27: missing file: churn/r002-18af9808.bin
+- node-27: missing file: churn/r002-21fd7642.bin
+- node-27: missing file: churn/r002-2f5eeb8b.bin
+- node-27: … 568 more mismatches
+
+## PeerHealth events (observed on node-00)
+
+- t+550s  UNHEALTHY  viewer-05  47%  607s  self=false
+- t+580s  UNHEALTHY  viewer-15  22%  603s  self=false
+- t+589s  UNHEALTHY  viewer-09  34%  617s  self=false
+- t+589s  UNHEALTHY  viewer-14  38%  617s  self=false
+- t+589s  UNHEALTHY  viewer-27  0%  604s  self=false
+- t+597s  UNHEALTHY  viewer-07  26%  603s  self=false
+- t+597s  UNHEALTHY  master-02  33%  604s  self=false
+- t+623s  UNHEALTHY    100%  615s  self=true
+- t+623s  UNHEALTHY  viewer-03  30%  611s  self=false
+- t+630s  UNHEALTHY  viewer-26  33%  603s  self=false
+- t+646s  UNHEALTHY  viewer-04  40%  603s  self=false
+- t+653s  UNHEALTHY  viewer-16  33%  604s  self=false
+- t+661s  UNHEALTHY  viewer-17  31%  606s  self=false
+- t+678s  UNHEALTHY  viewer-25  38%  604s  self=false
+- t+685s  UNHEALTHY  viewer-11  54%  607s  self=false
+- t+685s  UNHEALTHY  viewer-08  48%  600s  self=false
+- t+695s  UNHEALTHY  viewer-06  41%  606s  self=false
+- t+701s  UNHEALTHY  viewer-10  40%  607s  self=false
+- t+758s  UNHEALTHY  master-01  53%  613s  self=false
+- t+1034s  UNHEALTHY  viewer-22  100%  615s  self=false
+- t+1073s  UNHEALTHY  viewer-24  100%  621s  self=false
+- t+1073s  UNHEALTHY  viewer-19  100%  621s  self=false
+- t+1073s  UNHEALTHY  viewer-20  100%  621s  self=false
+- t+1132s  UNHEALTHY  viewer-12  100%  616s  self=false
+- t+1132s  UNHEALTHY  viewer-23  100%  616s  self=false
+- t+1132s  UNHEALTHY  viewer-18  100%  616s  self=false
+- t+1132s  UNHEALTHY  viewer-21  100%  600s  self=false
+- t+1154s  UNHEALTHY  viewer-13  100%  629s  self=false
+- t+1487s  UNHEALTHY  viewer-05  56%  1315s  self=false
+- t+1496s  UNHEALTHY  viewer-09  48%  1316s  self=false
+- t+1496s  UNHEALTHY  viewer-15  59%  1316s  self=false
+- t+1496s  UNHEALTHY  viewer-14  60%  1220s  self=false
+- t+1496s  UNHEALTHY  viewer-27  0%  1325s  self=false
+- t+1508s  UNHEALTHY  viewer-07  61%  1201s  self=false
+- t+1508s  UNHEALTHY  master-02  58%  1125s  self=false
+- t+1564s  UNHEALTHY    100%  1540s  self=true
+- t+1564s  UNHEALTHY  viewer-26  58%  1261s  self=false
+- t+1571s  UNHEALTHY  viewer-17  58%  1345s  self=false
+- t+1571s  UNHEALTHY  viewer-16  59%  1400s  self=false
+- t+1616s  UNHEALTHY  viewer-03  54%  1402s  self=false
+- t+1616s  UNHEALTHY  viewer-04  60%  1272s  self=false
+- t+1616s  UNHEALTHY  viewer-25  60%  1295s  self=false
+- t+1628s  UNHEALTHY  viewer-06  62%  1405s  self=false
+- t+1628s  UNHEALTHY  viewer-11  60%  1279s  self=false
+- t+1628s  UNHEALTHY  viewer-10  60%  1420s  self=false
+- t+1628s  UNHEALTHY  viewer-08  58%  1233s  self=false
+- t+1698s  RECOVERED    100%  0s  self=true
+- t+1698s  UNHEALTHY  master-01  60%  1059s  self=false
+- t+1956s  UNHEALTHY  viewer-24  100%  1189s  self=false
+- t+1956s  UNHEALTHY  viewer-22  100%  1343s  self=false
+- t+1987s  UNHEALTHY  viewer-19  100%  1010s  self=false
+- t+1987s  UNHEALTHY  viewer-20  100%  1276s  self=false
+- t+2051s  UNHEALTHY  viewer-12  100%  1112s  self=false
+- t+2051s  UNHEALTHY  viewer-23  100%  1202s  self=false
+- t+2051s  UNHEALTHY  viewer-18  100%  1226s  self=false
+- t+2051s  UNHEALTHY  viewer-13  100%  1238s  self=false
+- t+2051s  UNHEALTHY  viewer-21  100%  1340s  self=false
+
+## Anomaly timeline
+
+- t+525s sub-second same-path race injected (conflict/race.txt) — winner arbitrary by design, fleet-consistency still asserted
+- t+525s node-01 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+846s node-01 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+975s node-01 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+975s node-15 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+975s node-26 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1092s node-02 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1092s node-08 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1312s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1312s node-01 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1391s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1391s node-01 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1391s node-02 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1391s node-15 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1391s node-25 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1505s node-01 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1505s node-02 OutOfSync sustained > 5 min
+- t+1505s node-03 IPC failed (daemon dead?): IPC request timed out (15s)
+
+Samples: `samples.csv` next to this report. Per-daemon logs under `node-NN/daemon.log`.

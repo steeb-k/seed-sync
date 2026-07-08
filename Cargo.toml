@@ -85,10 +85,27 @@ lto = true
 codegen-units = 1
 strip = true
 
-# Vendored, one-line-patched iroh-blobs (see vendor/iroh-blobs, docs/cross-os-testing.md #1):
-# upstream's `ExportMode::TryReference` only treated EXDEV (unix, 18) as a cross-volume
-# move, so on Windows (ERROR_NOT_SAME_DEVICE, 17) a viewer whose mirror is on a different
-# drive than its data dir failed the reference export and kept a second full copy. The
-# patch adds the Windows code so the export falls back to copy + sets External there too.
+# Vendored, minimally-patched iroh-blobs (see vendor/iroh-blobs). Two patches:
+# 1. Cross-volume export (docs/cross-os-testing.md #1): upstream's
+#    `ExportMode::TryReference` only treated EXDEV (unix, 18) as a cross-volume
+#    move, so on Windows (ERROR_NOT_SAME_DEVICE, 17) a viewer whose mirror is on a
+#    different drive than its data dir failed the reference export and kept a
+#    second full copy. The patch adds the Windows code so the export falls back to
+#    copy + sets External there too.
+# 2. Bounded provider accept loop (docs/known-issues.md #11): upstream spawns one
+#    detached task per inbound request stream with no cap, so a fleet's swarm
+#    retry storm piles unbounded stream tasks + send buffers onto a serving node
+#    (soak-observed OOM aborts). The patch holds a semaphore permit per in-flight
+#    stream (16/connection) so QUIC flow control pushes back instead.
+#
+# Vendored, one-hunk-patched iroh 1.0.0 (see vendor/iroh, docs/known-issues.md #11):
+# upstream's per-remote path-open retry queue (`pending_open_paths`,
+# socket/remote_map/remote_state.rs) pushes without dedup and the 333 ms drain
+# re-pushes every entry that still fails, so a remote with exhausted CIDs (dead
+# or stalled peer) multiplies the queue without bound — fleet-soak daemons died
+# on the deque's doubling realloc (single 5-80 GiB allocation failures). The
+# patch dedups the queue and caps it at 64 entries. Not fixed upstream as of
+# iroh 1.0.2 (2026-07-06); report upstream before any iroh bump.
 [patch.crates-io]
 iroh-blobs = { path = "vendor/iroh-blobs" }
+iroh = { path = "vendor/iroh" }

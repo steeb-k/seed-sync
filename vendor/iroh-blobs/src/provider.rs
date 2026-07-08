@@ -282,6 +282,11 @@ impl<W: SendStream> ProgressWriter<W> {
     }
 }
 
+/// SEED-SYNC PATCH: cap on concurrently-served request streams per connection
+/// (see the comment in [`handle_connection`]). 16 matches one full swarm's part
+/// fan-out on the requesting side.
+const MAX_STREAMS_PER_CONNECTION: usize = 16;
+
 /// Handle a single connection.
 pub async fn handle_connection(
     connection: endpoint::Connection,
@@ -302,10 +307,32 @@ pub async fn handle_connection(
             debug!("closing connection: {cause}");
             return;
         }
-        while let Ok(pair) = StreamPair::accept(&connection, progress.clone()).await {
+        // SEED-SYNC PATCH (see the [patch.crates-io] note in the workspace
+        // Cargo.toml): bound concurrent request streams per connection. Upstream
+        // spawns one detached task per inbound bi-stream with no ceiling, so a
+        // peer swarm re-requesting ranges on a tight retry loop can pile up
+        // unbounded stream tasks + their transport send buffers on the serving
+        // node (observed: fleet-soak daemons OOM-aborted after RSS grew at wire
+        // speed while mostly *rejecting* range requests). Holding a semaphore
+        // permit per in-flight stream makes the accept loop stop accepting at
+        // the cap, so QUIC flow control pushes back on requesters instead of
+        // memory absorbing the storm.
+        let stream_limit = std::sync::Arc::new(tokio::sync::Semaphore::new(
+            MAX_STREAMS_PER_CONNECTION,
+        ));
+        while let Ok(permit) = stream_limit.clone().acquire_owned().await {
+            let Ok(pair) = StreamPair::accept(&connection, progress.clone()).await else {
+                break;
+            };
             let span = debug_span!("stream", stream_id = %pair.stream_id());
             let store = store.clone();
-            n0_future::task::spawn(handle_stream(pair, store).instrument(span));
+            n0_future::task::spawn(
+                async move {
+                    let _permit = permit;
+                    handle_stream(pair, store).await
+                }
+                .instrument(span),
+            );
         }
         progress
             .connection_closed(|| ConnectionClosed { connection_id })
