@@ -81,6 +81,15 @@ struct RunArgs {
     /// Poll/sample interval, seconds.
     #[arg(long, default_value_t = 30)]
     interval: u64,
+    /// Alternate working root for the LAST `--alt-nodes` nodes (split-disk A/B:
+    /// e.g. seeder + most nodes on an SSD root, the tail nodes on an HDD root,
+    /// so per-node rates in the SAME run compare disk classes with identical
+    /// machine/background conditions).
+    #[arg(long)]
+    alt_root: Option<PathBuf>,
+    /// How many trailing nodes live under `--alt-root`.
+    #[arg(long, default_value_t = 2)]
+    alt_nodes: usize,
 }
 
 #[tokio::main]
@@ -101,10 +110,22 @@ async fn main() -> anyhow::Result<()> {
 /// A `request` that can't stall the sample loop: a daemon that is slow to answer
 /// (observed during heavy materialization) costs one skipped sample, not minutes
 /// of blind time between samples.
+///
+/// The request runs on its OWN spawned task and the timeout waits on the
+/// JoinHandle: a plain `timeout(request(...))` proved insufficient — the
+/// fullsize HDD soak froze forever pre-report with zero CPU/IO, consistent
+/// with the connect/read blocking its worker thread inside poll, where a
+/// same-task timeout can never fire. Timing out the JoinHandle always fires;
+/// a truly stuck request leaks one abandoned task instead of the whole run
+/// (minidump of the hang: seed-soak-hang-2720.dmp).
 async fn request_bounded(sock: &std::path::Path, req: IpcRequest) -> anyhow::Result<IpcResponse> {
-    tokio::time::timeout(Duration::from_secs(15), request(sock, req))
-        .await
-        .map_err(|_| anyhow::anyhow!("IPC request timed out (15s)"))?
+    let sock = sock.to_path_buf();
+    let handle = tokio::spawn(async move { request(&sock, req).await });
+    match tokio::time::timeout(Duration::from_secs(15), handle).await {
+        Ok(Ok(res)) => res,
+        Ok(Err(join)) => Err(anyhow::anyhow!("IPC request task failed: {join}")),
+        Err(_) => Err(anyhow::anyhow!("IPC request timed out (15s)")),
+    }
 }
 
 fn now_unix() -> i64 {
@@ -141,6 +162,8 @@ fn clean(root: &Path) -> anyhow::Result<()> {
 struct NodeHandle {
     idx: usize,
     is_master: bool,
+    /// This node's working dir (`<root or alt_root>/node-NN`).
+    dir: PathBuf,
     sock: PathBuf,
     folder: PathBuf,
     pid: u32,
@@ -168,8 +191,25 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
     let mut nodes = Vec::with_capacity(total);
     let mut children = Vec::with_capacity(total);
     let mut pids = String::new();
+    let alt_from = a
+        .alt_root
+        .as_ref()
+        .map(|_| total.saturating_sub(a.alt_nodes))
+        .unwrap_or(total);
     for i in 0..total {
-        let dir = root.join(format!("node-{i:02}"));
+        let base = if i >= alt_from {
+            a.alt_root.as_ref().unwrap()
+        } else {
+            &root
+        };
+        let dir = base.join(format!("node-{i:02}"));
+        if i == alt_from {
+            println!(
+                "nodes {alt_from}..{} live under alt root {}",
+                total - 1,
+                base.display()
+            );
+        }
         let folder = dir.join("folder");
         std::fs::create_dir_all(&folder)?;
         let sock = dir.join("sock");
@@ -189,6 +229,7 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
         nodes.push(NodeHandle {
             idx: i,
             is_master: i < a.masters,
+            dir,
             sock,
             folder,
             pid: child.id(),
@@ -362,7 +403,7 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
             if !degraded_done && elapsed >= a.degrade_at && idx < nodes.len() {
                 degraded_done = true;
                 println!("t+{elapsed}s pausing viewer node-{idx:02} (degrade scenario)");
-                let _ = request(
+                let _ = request_bounded(
                     &nodes[idx].sock,
                     IpcRequest::Pause {
                         share_id: share_id.clone(),
@@ -373,7 +414,7 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
             if degraded_done && !resumed_done && elapsed >= a.duration / 2 {
                 resumed_done = true;
                 println!("t+{elapsed}s resuming viewer node-{idx:02}");
-                let _ = request(
+                let _ = request_bounded(
                     &nodes[idx].sock,
                     IpcRequest::Resume {
                         share_id: share_id.clone(),
@@ -617,8 +658,7 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
     // Swarm-deadline retries: grep the daemon logs (usability-findings #7).
     let mut deadline_retries = 0usize;
     for n in &nodes {
-        if let Ok(log) = std::fs::read_to_string(root.join(format!("node-{:02}/daemon.log", n.idx)))
-        {
+        if let Ok(log) = std::fs::read_to_string(n.dir.join("daemon.log")) {
             deadline_retries += log.matches("deadline").count();
         }
     }
@@ -650,6 +690,15 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
         "- scenarios: churn={:?} degrade_viewer={:?} conflict={} health_secs={:?}",
         a.churn, a.degrade_viewer, a.conflict, a.health_secs
     );
+    if let Some(alt) = &a.alt_root {
+        let _ = writeln!(
+            report,
+            "- split roots: nodes {alt_from}..{} under {} (rest under {})",
+            total - 1,
+            alt.display(),
+            root.display()
+        );
+    }
     let _ = writeln!(report, "- verdict: **{verdict}**");
     let _ = writeln!(
         report,
