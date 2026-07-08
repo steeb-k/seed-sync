@@ -106,6 +106,17 @@ strip = true
 # on the deque's doubling realloc (single 5-80 GiB allocation failures). The
 # patch dedups the queue and caps it at 64 entries. Not fixed upstream as of
 # iroh 1.0.2 (2026-07-06); report upstream before any iroh bump.
+# Vendored, two-hunk-patched iroh-docs 0.101 (see vendor/iroh-docs,
+# docs/known-issues.md #7): the single-threaded docs sync actor deadlocked
+# against the LiveActor at fleet scale — per-insert event emission AWAITED a
+# bounded subscriber channel while holding the actor thread (sync.rs
+# Subscribers::send), and the LiveActor that drains that channel polled
+# `biased;` toward an inbox whose handlers re-enter the sync actor
+# (live.rs run loop). Under a divergence-driven sync-report storm this froze
+# the actor permanently; every doc read (get_one/get_many/open/subscribe)
+# queued behind it forever. Patches: try_send (drop event on full) + fair
+# polling. Not fixed upstream as of 0.101; report before any bump.
 [patch.crates-io]
 iroh-blobs = { path = "vendor/iroh-blobs" }
 iroh = { path = "vendor/iroh" }
+iroh-docs = { path = "vendor/iroh-docs" }

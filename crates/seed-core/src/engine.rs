@@ -268,6 +268,17 @@ const DEEP_VERIFY_INTERVAL_SECS: i64 = 4 * 3600;
 /// peer never costs a full rehash of a multi-GB share.
 const DIVERGENCE_DEEP_VERIFY_SECS: i64 = 600;
 
+/// Upper bound on the two iroh-docs reads a reconcile pass makes before its
+/// merge loop (the ignore-list lookup and the full `get_many` manifest read).
+/// Both normally finish in milliseconds; the fleet soak caught them wedging
+/// FOREVER on ~1/3 of a 28-node fleet (known-issues #7: the docs actor stops
+/// answering under sustained peer-session pressure), which held the share's
+/// `publishing` guard and silently stopped it from birth. A bounded failure
+/// turns that into a WARN + clean pass failure retried next tick — the share
+/// stays visibly unhealthy (health alerts fire) instead of invisibly dead.
+/// Generous: ~100× the worst legitimate read on the target corpus.
+const DOC_READ_TIMEOUT_SECS: u64 = 120;
+
 /// Minimum spacing between doc-resync kicks for one out-of-sync share. The kick
 /// (`doc.start_sync`) restarts a possibly-stalled replication session, and every
 /// session runs iroh-docs set reconciliation on BOTH ends — so issuing one per
@@ -1202,7 +1213,12 @@ impl ReconcileJob {
         //    (so viewers honor what a master ignored, e.g. don't delete those
         //    files). A master (re)publishes its configured list when it drifts.
         self.set_phase("read ignore list (doc + blob store)");
-        let live_ignore = read_ignore_list(&self.doc, &self.blobs).await?;
+        let live_ignore = tokio::time::timeout(
+            Duration::from_secs(DOC_READ_TIMEOUT_SECS),
+            read_ignore_list(&self.doc, &self.blobs),
+        )
+        .await
+        .map_err(|_| anyhow!("ignore-list doc read timed out after {DOC_READ_TIMEOUT_SECS}s"))??;
         let effective_ignore = if self.is_master {
             if live_ignore.as_deref() != Some(self.configured_ignore.as_slice()) {
                 let mut cbor = Vec::new();
@@ -1221,7 +1237,12 @@ impl ReconcileJob {
 
         // 2. Merged remote view.
         self.set_phase("merge remote view (doc get_many stream)");
-        let remote = read_remote_files(&self.doc).await?;
+        let remote = tokio::time::timeout(
+            Duration::from_secs(DOC_READ_TIMEOUT_SECS),
+            read_remote_files(&self.doc),
+        )
+        .await
+        .map_err(|_| anyhow!("manifest doc read timed out after {DOC_READ_TIMEOUT_SECS}s"))??;
 
         // 3. Local view. Hashing the whole folder is costly, so only do it when the
         //    cheap (path,size,mtime) signature changed since last reconcile;

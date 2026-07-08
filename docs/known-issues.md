@@ -177,10 +177,43 @@ and keep the newer) instead of letting stream order decide.
 
 ---
 
-## 7. Recovery after an unclean shutdown mid-sync can wedge (startup + first reconcile)
-**Tier:** observed in soak · **Severity:** high (node stuck until manual intervention)
-**Where:** startup path (`Engine::new` → `reload_shares`) and the first
-`ReconcileJob::run` after recovery; exact wedge point not yet isolated.
+## 7. Recovery after an unclean shutdown mid-sync can wedge (startup + first reconcile) — **FIXED (soak-verified)**
+**Tier:** observed in soak, root-caused by code audit · **Severity:** high (node stuck until manual intervention)
+**Status:** fixed (vendored iroh-docs patch + app-side timeouts); verified by fleet soaks #7–#8 (0 wedges vs 10/28 before; #8 PASS)
+**Where:** iroh-docs 0.101's single-threaded sync actor (`src/actor.rs`) deadlocking
+against its `LiveActor` (`src/engine/live.rs`); surfaced in `Engine::new` →
+`reload_shares` and in `ReconcileJob::run`'s doc reads.
+
+> **Root cause (phase-watchdog data + iroh-docs code audit).** All replica ops
+> — queries, opens, subscribes, AND every inbound sync session's message
+> processing — serialize through ONE actor thread with a bounded(1024) action
+> FIFO. During a sync insert, the actor emits subscriber events with an
+> **awaited bounded-channel send while holding the actor thread**
+> (`sync.rs` `Subscribers::send`). The consumer of those events, the
+> `LiveActor`, polls `biased;` with its inbox FIRST — and inbox handlers
+> (`IncomingSyncReport` → `has_news_for_us`, `StartSync` → `open`) call back
+> into the sync actor and await its reply. Under a divergence-driven
+> sync-report storm (27 peers, persistently diverged replicas) the event
+> buffer fills, the sync actor blocks mid-insert, the LiveActor is stuck in an
+> inbox handler waiting on the frozen actor → **hard deadlock**. Every
+> subsequent `get_one`/`get_many`/`open`/`subscribe` queues forever behind it,
+> while the rest of the process (IPC, gossip, blobs) stays healthy. Explains
+> both variants: the cold-start wedge (first reconcile's doc reads — 10/28
+> nodes in fleet soak #6, passes stuck 10–25+ min in "read ignore list" /
+> "merge remote view") and the restart-under-pressure wedge (`open_share`'s
+> doc open/subscribe queue behind the frozen action).
+>
+> **Fix (landed):**
+> - *Vendored iroh-docs, two hunks*: `Subscribers::send` uses `try_send` and
+>   drops the event when a subscriber is full (never blocks the actor thread);
+>   the LiveActor select drops `biased;` so event drainage can't be starved by
+>   the inbox. See the `[patch.crates-io]` note in the workspace `Cargo.toml`.
+> - *App-side backstop*: the reconcile pass's two doc reads are bounded by
+>   `DOC_READ_TIMEOUT_SECS = 120` — a wedged read fails the pass cleanly
+>   (WARN + retry next tick) instead of holding `publishing` forever; the
+>   60 s phase watchdog keeps naming any overrunning phase.
+>
+> Original write-up kept below for the observed symptoms.
 
 **Symptoms (fullsize soak, 6 nodes × 42 GB, 2026-07-07):**
 - After a hard reboot mid-sync, all nodes restarted and served IPC, but **no
@@ -249,9 +282,9 @@ firing on the wedged path).
 
 ---
 
-## 9. Presence mesh fragments at fleet scale (~28 members) — **FIX LANDED, soak verification pending**
+## 9. Presence mesh fragments at fleet scale (~28 members) — **FIXED (soak-verified)**
 **Tier:** observed in soak · **Severity:** high for the target topology (3 masters + 20–30 viewers)
-**Status:** fix landed (subset rejoin); fleet-soak re-run pending
+**Status:** fixed (subset rejoin); verified by fleet soaks #6–#8 (membership 28.0/28 held; #8 PASS)
 **Where:** `presence_rejoins` strategy (`crates/seed-core/src/engine.rs`) vs
 iroh-gossip's bounded active view.
 
@@ -360,9 +393,49 @@ allocation backtrace shows the daemon-killing growth is this queue.
 
 ---
 
+## 12. Multi-master delete races a peer's still-pending initial publish (deletion-as-absence)
+**Tier:** observed in soak · **Severity:** medium (unexpected resurrection; multi-master only)
+**Where:** the reconcile merge's "on disk, absent from replica → publish" branch
+(`crates/seed-core/src/engine.rs`, `(Some(le), None)` master arm) interacting with
+tombstones being iroh-docs *deletions* (empty entries, filtered out of reads).
+
+**Symptom (fleet soak #7, 3M+25V):** files deleted by churn on one master while
+another master was still working through its initial import/publish of the same
+seeded corpus came back fleet-wide: the slower master reached the path, saw
+file-on-disk + **no live replica entry** (the tombstone reads as absence, which
+is indistinguishable from never-seen), classified it as a brand-new local file
+and re-published it. All 28 nodes then converged — consistently — on the
+resurrected copy. Steady-state deletes propagate correctly (base == remote hash
+→ tombstone honored); only the concurrent-independent-seeding window is racy.
+
+**Why it's a design caveat, not a plain bug:** deletion-as-absence cannot
+distinguish "deleted" from "not yet seen", and the engine deliberately biases
+toward not destroying content it can't prove was deleted.
+
+**Suggested durable fix (future):** a timestamped tombstone control entry
+(e.g. `\x00t/<path>` carrying the delete time) so a master meeting an on-disk
+file can LWW the delete against its own content instead of assuming "new".
+Until then: the soak harness gates churn on all masters reaching Healthy @
+100 % (steady state), and users should expect that deleting a file while
+another master is still doing its first full sync of the same folder may bring
+it back.
+
+---
+
 ## 5. LWW compares local file mtime against the doc *record* timestamp
-**Tier:** note · **Severity:** low (semantic; skew-sensitive)
+**Tier:** note · **Severity:** low (semantic; skew-sensitive) · **Observed in soak** (fleet #7)
 **Where:** `crates/seed-core/src/engine.rs:1243-1244`
+
+> **Soak evidence (2026-07-07, fleet #7):** not just theoretical — under heavy
+> initial-sync load (reconcile passes lagging seconds-to-minutes), a write on
+> master A followed 1.2 s later by a write on master B resolved fleet-wide to
+> **A's older content**: A's doc *record* got its timestamp at publish (after
+> B's file mtime), so B's LWW took A's "newer" record. The fleet stayed fully
+> consistent — the ordering just didn't match wall-clock intent. Wall-clock
+> ordering across masters is only honored when edits are spaced further apart
+> than publish lag; ordering between edits made *after seeing* the other side
+> (causal ordering) is always honored. The soak harness now asserts the causal
+> form.
 
 ```rust
 let local_ts = le.abs.as_ref().map(|a| mtime_micros(a)).unwrap_or(0);
