@@ -44,6 +44,18 @@ use rand::Rng;
 /// peer offline within a few seconds of it actually leaving.
 const PEER_ONLINE_TTL_SECS: i64 = 20;
 
+/// Cap on how many peers one presence rejoin asks the gossip swarm to connect
+/// (known-issues #9). iroh-gossip (HyParView) keeps a small bounded *active
+/// view*; joining EVERY known member every ~6s worked as mesh repair at ≤8
+/// members but destroyed the overlay at fleet scale — with 28 members the
+/// constant full-set joins evicted each other's neighbors faster than the
+/// swarm could stabilize, per-node membership oscillated 1/28 ↔ 25/28 for a
+/// whole soak, and epidemic delivery never formed. A few random targets per
+/// tick still heal a partition within a handful of ticks (the partitioned side
+/// drives its own repair) while leaving the active view stable enough for
+/// gossip's own shuffle to maintain.
+const PRESENCE_REJOIN_SAMPLE: usize = 3;
+
 /// Tracks the peers seen for one share, fed by the doc's live events + presence
 /// gossip. `total` is every distinct peer seen since the daemon started; `online`
 /// is those heard-from within [`PEER_ONLINE_TTL_SECS`].
@@ -256,6 +268,24 @@ const DEEP_VERIFY_INTERVAL_SECS: i64 = 4 * 3600;
 /// peer never costs a full rehash of a multi-GB share.
 const DIVERGENCE_DEEP_VERIFY_SECS: i64 = 600;
 
+/// Minimum spacing between doc-resync kicks for one out-of-sync share. The kick
+/// (`doc.start_sync`) restarts a possibly-stalled replication session, and every
+/// session runs iroh-docs set reconciliation on BOTH ends — so issuing one per
+/// share every ~6s (the daemon's ask cadence) from every diverged member is an
+/// O(N²) CPU storm at fleet scale. The first 28-node soak after the mesh fix
+/// measured it directly: 1200+ kicks in 17 min, daemons at 300–1400% CPU,
+/// presence beats starved past the online TTL, roster collapse. Live doc sync
+/// keeps replicating on its own between kicks; this only bounds the *repair
+/// nudge* rate.
+const DIVERGENCE_RESYNC_KICK_SECS: i64 = 30;
+
+/// Cap on how many peers one doc-resync kick syncs against, sampled at random
+/// from the known members. Set reconciliation is pairwise — any one peer that
+/// holds the newer entries heals us — so syncing with all ~27 members per kick
+/// buys nothing over a few and multiplies the fleet-wide session count by the
+/// member count. Same bounded-repair philosophy as [`PRESENCE_REJOIN_SAMPLE`].
+const DOC_RESYNC_SAMPLE: usize = 3;
+
 /// Stall watchdog: an in-flight download older than this is presumed wedged and is
 /// aborted so the next reconcile re-queues it (verified chunks persist on disk, so
 /// a healthy-but-slow fetch that gets recycled resumes where it left off — the cost
@@ -358,6 +388,29 @@ fn peer_providers(key: &ShareKey, roster: &Arc<StdMutex<PeerRoster>>) -> Vec<End
         }
     }
     ids
+}
+
+/// Pick which peers a presence rejoin should ask the swarm to connect: the
+/// candidates the roster has NOT heard from within the online TTL, capped at
+/// [`PRESENCE_REJOIN_SAMPLE`] chosen uniformly at random. A peer we can't hear
+/// is either partitioned from us — exactly what a join repairs — or genuinely
+/// down, where the dial fails harmlessly. Peers we already hear are never
+/// dialed: re-joining a live member does nothing for delivery and only churns
+/// gossip's bounded active view (the known-issues #9 fragmentation). Returns
+/// empty when every candidate is heard — a converged mesh needs no repair, the
+/// swarm's own shuffle maintains it from there.
+fn select_rejoin_targets<R: Rng>(
+    rng: &mut R,
+    candidates: Vec<EndpointId>,
+    online: &HashSet<String>,
+) -> Vec<EndpointId> {
+    let mut unheard: Vec<EndpointId> = candidates
+        .into_iter()
+        .filter(|id| !online.contains(&id.to_string()))
+        .collect();
+    unheard.shuffle(rng);
+    unheard.truncate(PRESENCE_REJOIN_SAMPLE);
+    unheard
 }
 
 /// Re-fetch a blob's verified bytes from a peer and atomically rewrite the mirror
@@ -688,7 +741,30 @@ async fn swarm_download(
                 if candidates.is_empty() {
                     continue;
                 }
-                let primary = candidates[idx % candidates.len()];
+                // Primary rotation pool: members that can serve ANY range — the
+                // fully-synced peers (sorted first in `peers`) plus the master
+                // when rotated in. Rotating primaries through *partial* peers
+                // hammered them with range requests they mostly had to reject
+                // (25 requesters × 16 parts × 400 ms rounds), which is the
+                // request storm behind the provider-side OOM (known-issues
+                // #11). Partial peers stay in the fallback chain so part
+                // trading still works; with no servable member at all (cold
+                // start, master still in grace) the rotation falls back to
+                // everyone, which is exactly the desired part-trading phase.
+                let mut servable: Vec<EndpointId> = peers[..full_peers.min(peers.len())].to_vec();
+                if rotate_master_in {
+                    if let Some(m) = master {
+                        if !servable.contains(&m) {
+                            servable.push(m);
+                        }
+                    }
+                }
+                let pool: &[EndpointId] = if servable.is_empty() {
+                    &candidates
+                } else {
+                    &servable
+                };
+                let primary = pool[idx % pool.len()];
                 let mut plist = vec![primary];
                 plist.extend(candidates.iter().copied().filter(|p| *p != primary));
                 if !rotate_master_in && round >= grace[idx] + SWARM_MASTER_GRACE_ROUNDS {
@@ -863,11 +939,32 @@ pub struct ReconcileJob {
     /// build; cleared by `finish_reconcile` only when this job's outcome commits.
     force_scan: bool,
     progress: Arc<StdMutex<HashMap<String, (u64, u64)>>>,
+    /// Diagnostic breadcrumb for the slow-pass watchdog: which step [`run`] is
+    /// currently in (updated as the pass moves through its awaits). Exists to
+    /// localize known-issues #7: passes observed never returning under live
+    /// fleet pressure, with nothing logged — the daemon reads this via
+    /// [`ReconcileJob::phase_handle`] and WARNs with it while a pass overruns.
+    ///
+    /// [`run`]: ReconcileJob::run
+    phase: Arc<StdMutex<String>>,
 }
 
 impl ReconcileJob {
     pub fn share_id(&self) -> &str {
         &self.share_id
+    }
+
+    /// Cloneable handle to this job's current-phase breadcrumb, so a watchdog can
+    /// report where an overrunning pass is stuck while [`run`](Self::run) holds
+    /// `&self`.
+    pub fn phase_handle(&self) -> Arc<StdMutex<String>> {
+        self.phase.clone()
+    }
+
+    fn set_phase(&self, p: impl Into<String>) {
+        if let Ok(mut g) = self.phase.lock() {
+            *g = p.into();
+        }
     }
 
     fn set_progress(&self, done: u64, total: u64) {
@@ -1104,6 +1201,7 @@ impl ReconcileJob {
         // 1. Effective ignore set: the replicated `\x00ignore` is authoritative
         //    (so viewers honor what a master ignored, e.g. don't delete those
         //    files). A master (re)publishes its configured list when it drifts.
+        self.set_phase("read ignore list (doc + blob store)");
         let live_ignore = read_ignore_list(&self.doc, &self.blobs).await?;
         let effective_ignore = if self.is_master {
             if live_ignore.as_deref() != Some(self.configured_ignore.as_slice()) {
@@ -1122,6 +1220,7 @@ impl ReconcileJob {
         let (ignore_set, _bad) = IgnoreSet::compile(&effective_ignore);
 
         // 2. Merged remote view.
+        self.set_phase("merge remote view (doc get_many stream)");
         let remote = read_remote_files(&self.doc).await?;
 
         // 3. Local view. Hashing the whole folder is costly, so only do it when the
@@ -1134,6 +1233,7 @@ impl ReconcileJob {
         // a skipped file mask the folder as "settled" and suppress full scans (the
         // gate-poisoning bug). The end-of-pass signature excludes the same way.
         let prev_skipped_set: HashSet<String> = self.prev_skipped.iter().cloned().collect();
+        self.set_phase("scan folder");
         let quick_sig = scan::quick_signature(&self.folder, &ignore_set, &prev_skipped_set);
         let do_scan = self.force_scan || quick_sig != self.last_quick_sig;
         // Build the local view, plus the candidate paths to (re)attempt reading this
@@ -1181,6 +1281,7 @@ impl ReconcileJob {
         // rest of the share, even after a silent unlock that wouldn't change the
         // folder signature. (On a full-scan tick the scan already tried these, so we
         // just carry forward the ones still unreadable.)
+        self.set_phase("retry previously-skipped files");
         let mut still_skipped: Vec<String> = Vec::new();
         for rel in skip_candidates {
             if local.contains_key(&rel) {
@@ -1237,6 +1338,10 @@ impl ReconcileJob {
         let mut emptied_parents: HashSet<PathBuf> = HashSet::new();
 
         for path in keys {
+            // Per-file breadcrumb: every branch below can await store/doc/network
+            // ops (import, materialize, tombstone), and #7-style wedges are
+            // per-call, so name the exact file being merged.
+            self.set_phase(format!("merge {path}"));
             let l = local.get(&path);
             let r = remote.get(&path);
             let b = self.base.get(&path);
@@ -1451,6 +1556,7 @@ impl ReconcileJob {
         // staying flat until it finishes and jumping straight to done. The blob store
         // tracks this at chunk granularity (that's how the resumable swarm works), so
         // it's accurate and survives restarts.
+        self.set_phase("compute health (blob store has/local_bytes)");
         let mut total_bytes: u64 = 0;
         let mut present_bytes: u64 = 0;
         for re in remote.values() {
@@ -1489,6 +1595,7 @@ impl ReconcileJob {
         // targeted retry chases them instead, and any genuinely new add/delete still
         // flips the signature and triggers a full scan.
         let skipped_set: HashSet<String> = still_skipped.iter().cloned().collect();
+        self.set_phase("finalize (settle signature)");
         let new_quick_sig = scan::quick_signature(&self.folder, &ignore_set, &skipped_set);
 
         Ok(ReconcileOutcome {
@@ -1568,6 +1675,10 @@ struct ShareState {
     /// Diagnostic: lets tests and soaks assert the rescan policy (e.g. that an
     /// OutOfSync share isn't re-hashing on a cadence).
     full_scans: u64,
+    /// Unix seconds of the last doc-resync kick issued for this share while out
+    /// of sync; throttles the self-heal to one kick per
+    /// [`DIVERGENCE_RESYNC_KICK_SECS`] (the daemon *asks* every ~6s).
+    last_doc_resync: i64,
 }
 
 impl ShareState {
@@ -2019,6 +2130,7 @@ impl Engine {
                 force_deep_verify: false,
                 diverged_deep_verified: false,
                 full_scans: 0,
+                last_doc_resync: 0,
             },
             bootstrap,
         ))
@@ -2405,29 +2517,43 @@ impl Engine {
         out
     }
 
-    /// Build this tick's gossip re-join requests — one per share with a live presence
-    /// channel — asking the swarm to connect to every member doc-sync has discovered.
-    /// Call under the engine lock (cheap: clones the gossip sender + snapshots the
-    /// roster); run the results off-lock via [`PresenceRejoin::join`].
+    /// Build this tick's gossip re-join requests — one per share whose presence
+    /// roster is missing members — asking the swarm to connect to a small random
+    /// sample of the peers we can't currently hear. Call under the engine lock
+    /// (cheap: clones the gossip sender + snapshots the roster); run the results
+    /// off-lock via [`PresenceRejoin::join`].
     ///
     /// This repairs the presence mesh: gossip's one-shot bootstrap leaves a partitioned
     /// star (the creator bootstraps with nothing; leaves only dial the creator), so
-    /// without this, presence reaches 3+ member pools asymmetrically. The peer set comes
-    /// from [`peer_providers`] (the master id carried in the key + every endpoint id the
-    /// roster learned from doc events), minus ourselves.
+    /// without this, presence reaches 3+ member pools asymmetrically. The candidate set
+    /// comes from [`peer_providers`] (the master id carried in the key + every endpoint
+    /// id the roster learned from doc events), minus ourselves; targets are the
+    /// not-heard-from subset, capped at [`PRESENCE_REJOIN_SAMPLE`] — joining the full
+    /// set every tick fragmented the overlay at fleet scale (known-issues #9). Once
+    /// every known member is heard, this returns nothing for the share and gossip's
+    /// own shuffle maintains the mesh.
     ///
     /// [`PresenceRejoin::join`]: crate::presence::PresenceRejoin::join
     pub fn presence_rejoins(&self) -> Vec<crate::presence::PresenceRejoin> {
         let self_id = self.node.endpoint.id();
+        let mut rng = rand::thread_rng();
         let mut out = Vec::new();
         for s in self.shares.values() {
             let Some(h) = s.presence.as_ref() else {
                 continue;
             };
-            let peers: Vec<EndpointId> = peer_providers(&s.key, &s.roster)
+            let candidates: Vec<EndpointId> = peer_providers(&s.key, &s.roster)
                 .into_iter()
                 .filter(|id| *id != self_id)
                 .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            let online: HashSet<String> = match s.roster.lock() {
+                Ok(r) => r.online_peer_ids().into_iter().collect(),
+                Err(_) => continue,
+            };
+            let peers = select_rejoin_targets(&mut rng, candidates, &online);
             if peers.is_empty() {
                 continue;
             }
@@ -2559,15 +2685,26 @@ impl Engine {
     /// the loop broke its otherwise-consistent "build under the lock, await off-lock"
     /// discipline. This mirrors [`presence_rejoins`].
     ///
+    /// Bounded like the mesh repair: at most one kick per share per
+    /// [`DIVERGENCE_RESYNC_KICK_SECS`], against at most [`DOC_RESYNC_SAMPLE`]
+    /// randomly-sampled members. The unthrottled version (every ask, all ~27
+    /// peers) ran pairwise set reconciliation everywhere at once and saturated
+    /// the 28-node fleet's CPU within minutes of load.
+    ///
     /// [`presence_rejoins`]: Engine::presence_rejoins
-    pub fn diverged_doc_resyncs(&self) -> Vec<DocResync> {
+    pub fn diverged_doc_resyncs(&mut self) -> Vec<DocResync> {
         let self_id = self.node.endpoint.id();
+        let mut rng = rand::thread_rng();
+        let now = now_secs();
         let mut out = Vec::new();
-        for (id, s) in self.shares.iter() {
+        for (id, s) in self.shares.iter_mut() {
             if s.paused || !s.is_out_of_sync() {
                 continue;
             }
-            let peers: Vec<iroh::EndpointAddr> = peer_providers(&s.key, &s.roster)
+            if now - s.last_doc_resync < DIVERGENCE_RESYNC_KICK_SECS {
+                continue;
+            }
+            let mut peers: Vec<iroh::EndpointAddr> = peer_providers(&s.key, &s.roster)
                 .into_iter()
                 .filter(|pid| *pid != self_id)
                 .map(iroh::EndpointAddr::new)
@@ -2575,6 +2712,9 @@ impl Engine {
             if peers.is_empty() {
                 continue;
             }
+            peers.shuffle(&mut rng);
+            peers.truncate(DOC_RESYNC_SAMPLE);
+            s.last_doc_resync = now;
             out.push(DocResync {
                 share_id: id.clone(),
                 doc: s.doc.clone(),
@@ -2726,6 +2866,7 @@ impl Engine {
             last_quick_sig: state.last_quick_sig,
             force_scan: state.force_deep_verify,
             progress,
+            phase: Arc::new(StdMutex::new("queued".to_string())),
         }))
     }
 
@@ -3131,6 +3272,55 @@ fn prune_emptied_ancestors(dirs: &HashSet<PathBuf>, root: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Endpoint ids are ed25519 public keys, so derive valid ones from signing
+    /// keys rather than arbitrary bytes (which aren't on-curve).
+    fn eid(seed: u8) -> EndpointId {
+        let bytes = ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes();
+        EndpointId::from_bytes(&bytes).unwrap()
+    }
+
+    /// Mesh-repair target selection (known-issues #9): dial only peers we can't
+    /// currently hear, never more than [`PRESENCE_REJOIN_SAMPLE`] of them, and
+    /// nothing at all once the roster hears everyone — the old full-set join
+    /// every tick evicted gossip's bounded active view at fleet scale and
+    /// fragmented the overlay.
+    #[test]
+    fn rejoin_targets_sample_unheard_only() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(42);
+        let all: Vec<EndpointId> = (1u8..=28).map(eid).collect();
+
+        // Everyone heard → converged mesh, no repair traffic at all.
+        let heard_all: HashSet<String> = all.iter().map(|id| id.to_string()).collect();
+        assert!(select_rejoin_targets(&mut rng, all.clone(), &heard_all).is_empty());
+
+        // Nobody heard (cold start / full partition) → a capped random sample,
+        // not the full set.
+        let heard_none = HashSet::new();
+        let picked = select_rejoin_targets(&mut rng, all.clone(), &heard_none);
+        assert_eq!(picked.len(), PRESENCE_REJOIN_SAMPLE);
+
+        // Partially heard → targets drawn only from the unheard remainder.
+        let heard: HashSet<String> = all[..24].iter().map(|id| id.to_string()).collect();
+        let picked = select_rejoin_targets(&mut rng, all.clone(), &heard);
+        assert_eq!(picked.len(), PRESENCE_REJOIN_SAMPLE);
+        for id in &picked {
+            assert!(
+                !heard.contains(&id.to_string()),
+                "must never dial a peer we already hear"
+            );
+        }
+
+        // Fewer unheard than the cap → all of them, never padded with heard peers.
+        let heard: HashSet<String> = all[..27].iter().map(|id| id.to_string()).collect();
+        assert_eq!(
+            select_rejoin_targets(&mut rng, all.clone(), &heard),
+            vec![all[27]]
+        );
+    }
 
     fn re(hash: &[u8], size: u64) -> RemoteEntry {
         RemoteEntry {

@@ -199,6 +199,19 @@ and keep the newer) instead of letting stream order decide.
 **Repro recipe:** run `seed-soak fullsize`, kill one daemon mid-sync
 (`Stop-Process -Force`), restart it with the other daemons still running.
 
+**New evidence (fleet soak #3, 2026-07-07): a COLD-start variant.** 3 of 28
+freshly-started nodes (fresh data dirs, no recovery involved) wedged the same
+way: ~3 MB of blobs arrived, then the node went silent — `seqno=0` (never
+applied a doc update), 0 %, near-zero CPU, **2 log lines total**, IPC and
+presence still fine. Signature fits the share's first `ReconcileJob` never
+returning: `publishing` stays set, so no new job is ever built and nothing is
+ever logged. The common precondition across both variants is *first reconcile
+under live pressure from a large peer set*, not unclean shutdown per se.
+**Instrumentation landed:** per-pass phase breadcrumb on `ReconcileJob`
+(`phase_handle`) + a daemon slow-pass watchdog that WARNs every 60 s with the
+phase while a pass overruns — the next soak/repro names the exact wedged await
+(doc stream read, store `has`, import, materialize, …).
+
 **Suggested investigation:** timeout + WARN instrumentation around each await
 in `reload_shares`/`open_share` (doc open, keystore, gossip subscribe,
 `start_sync`) and in the first reconcile's store calls (`has`, export,
@@ -236,10 +249,22 @@ firing on the wedged path).
 
 ---
 
-## 9. Presence mesh fragments at fleet scale (~28 members)
+## 9. Presence mesh fragments at fleet scale (~28 members) — **FIX LANDED, soak verification pending**
 **Tier:** observed in soak · **Severity:** high for the target topology (3 masters + 20–30 viewers)
+**Status:** fix landed (subset rejoin); fleet-soak re-run pending
 **Where:** `presence_rejoins` strategy (`crates/seed-core/src/engine.rs`) vs
 iroh-gossip's bounded active view.
+
+> **Fix landed** per the suggestion below: `presence_rejoins` now targets only
+> the peers the roster has NOT heard within the online TTL (a peer we can't
+> hear is either partitioned — exactly what a join repairs — or down, where the
+> dial fails harmlessly), sampled at random and capped at
+> `PRESENCE_REJOIN_SAMPLE = 3` per share per tick. Once every known member is
+> heard, no rejoins are issued at all and gossip's own shuffle maintains the
+> overlay; repair of a partition is driven by the partitioned side, which sees
+> the low online count. Selection logic is the pure `select_rejoin_targets`
+> (unit-tested: unheard-only, capped, empty when converged). Verification =
+> re-run the fleet soak below. Original write-up kept for context.
 
 **Symptoms (fleet soak, 3M+25V, scaled corpus, 2026-07-07):** per-node
 membership wildly uneven and never converging (nodes see 1/28 … 25/28 online at
@@ -259,6 +284,79 @@ the roster looks stale (e.g. online count far below total known), letting
 gossip's own shuffle maintain the overlay; verify with the fleet soak
 (`seed-soak fleet --masters 3 --viewers 25 …`) — success = every node's
 membership converging to 28/28 and staying there.
+
+---
+
+## 10. OutOfSync doc-resync storm saturates fleet CPU (O(N²) sessions) — **FIXED**
+**Tier:** observed in soak · **Severity:** high for the target topology · **Status:** fixed
+**Where:** `Engine::diverged_doc_resyncs` (`crates/seed-core/src/engine.rs`), asked
+every ~6 s by the daemon's presence loop.
+
+**Symptoms (fleet soak re-run after the #9 mesh fix, 3M+25V, 2026-07-07):** the
+mesh held 25–27/28 while idle (the #9 fix works), then collapsed to avg ~7/28
+within a minute of churn starting; daemon CPU climbed monotonically to
+300–1400 % per node; reconcile passes took 69 s on a 0.47 GB corpus; sample IPC
+requests timed out fleet-wide. Node logs showed 1200+ "re-kicked doc sync"
+lines in 17 min, with several completing in the same millisecond (piled-up
+sessions).
+
+**Root cause:** while a share reads OutOfSync, *every* member issued a
+`doc.start_sync` kick *every ~6 s* against **all** known members (~27). Set
+reconciliation runs on both ends of every session, so a mostly-diverged fleet
+(which a fresh 28-node deploy or any churn wave is, thanks to the 45 s settle
+window) runs O(N²) concurrent reconciliation sessions continuously. The CPU
+saturation then delays presence beats past the 20 s online TTL, collapsing the
+roster — which starves provider selection, prolongs OutOfSync, and feeds back
+into more resync kicks. The same "repair everything, all the time" pattern as
+issue #9, one layer up.
+
+**Fix (landed with the #9 fix):** bounded repair — at most one kick per share
+per `DIVERGENCE_RESYNC_KICK_SECS` (30 s), each against at most
+`DOC_RESYNC_SAMPLE = 3` randomly-sampled members (pairwise reconciliation
+means any one up-to-date peer heals us). Live doc sync keeps replicating on
+its own between kicks; the kick is only the stalled-session nudge.
+
+---
+
+## 11. Unbounded path-open retry queue in iroh core → OOM abort at fleet scale — **FIXED (vendored patch)**
+**Tier:** observed in soak, allocation-backtrace-confirmed · **Severity:** critical (daemon death) · **Status:** fixed via vendored iroh patch; report upstream
+**Where:** `iroh 1.0.0` `src/socket/remote_map/remote_state.rs` (`pending_open_paths`,
+`open_path_on_conn`); amplifiers fixed in `vendor/iroh-blobs/src/provider.rs` and
+`swarm_download` (`crates/seed-core/src/engine.rs`).
+
+**Symptoms (fleet soaks #3–#4, 3M+25V, 2026-07-07):** daemons died with
+`memory allocation of N bytes failed`, N forming a doubling sequence (5, 10,
+20, 40, 80 GiB). RSS grew 15–40 MB/s on nodes with *partially-synced, actively
+churning* peer sets; growth continued unchanged through a share pause; blob
+data on disk barely moved; deaths cascaded (each dead peer accelerated the
+leak on survivors). Pre-existing (visible in soak #2's samples) — first
+surfaced as OOM once the mesh + resync fixes let runs live long enough.
+
+**Root cause (allocation backtrace via a tracing global allocator in the
+daemon, `[alloc-trace]` in `seed-daemon/src/main.rs`):** the huge allocation is
+`VecDeque::push_back` growth in **iroh's per-remote path-open retry queue**
+(`remote_state.rs:1062`). When `open_path_ensure` fails with
+`RemoteCidsExhausted` / `MaxPathIdReached`, the address is pushed to
+`pending_open_paths` **without dedup** and a drain runs 333 ms later that
+re-opens each entry on **all** connections — every entry that still fails is
+re-pushed (multiplied per connection). A remote whose CIDs stay exhausted — a
+dead, wedged, or overloaded peer, which a struggling fleet has plenty of —
+turns the queue into unbounded (worse than linear) growth until the deque's
+doubling realloc fails. Not fixed upstream as of iroh 1.0.2 (2026-07-06).
+
+An earlier audit blamed iroh-blobs' uncapped provider accept loop; that is a
+real unboundedness and its fix is kept as defense-in-depth, but the
+allocation backtrace shows the daemon-killing growth is this queue.
+
+**Fix (landed):**
+- *Vendored iroh patch* (`vendor/iroh`, one hunk): dedup `pending_open_paths`
+  on push and cap it at 64 entries. See the `[patch.crates-io]` note in the
+  workspace `Cargo.toml`. **Report upstream before any iroh bump.**
+- *Defense-in-depth, kept:* iroh-blobs provider accept loop capped at 16
+  concurrent streams/connection (vendor patch 2); swarm part-primaries rotate
+  only over members that can serve any range (fully-synced peers + master per
+  seeding policy), with partial peers as fallbacks — cuts the pointless
+  request storm that overloads partial nodes in the first place.
 
 ---
 

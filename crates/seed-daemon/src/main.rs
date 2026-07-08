@@ -19,6 +19,51 @@ use seed_ipc::transport::{self, read_frame, write_frame};
 use seed_ipc::{Frame, IpcEvent, IpcRequest, IpcResponse, Message};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
+/// Diagnostic allocator for the fleet-soak OOM hunt (known-issues #11): daemons
+/// died on single doubling allocations (5 → 80 GiB), so logging a backtrace at
+/// the moment a huge allocation happens names the exact growth site. Wraps the
+/// system allocator; does nothing beyond delegation unless a single request is
+/// ≥ [`ALLOC_TRACE_MIN`]. Backtrace capture itself allocates, so a thread-local
+/// guard breaks the recursion. Zero overhead on the hot path beyond one branch.
+struct TraceAlloc;
+
+/// Threshold for logging an allocation's backtrace: far above anything the
+/// daemon legitimately allocates in one call (the whole soak corpus is ~0.5 GB),
+/// far below where the leak killed nodes.
+const ALLOC_TRACE_MIN: usize = 512 * 1024 * 1024;
+
+thread_local! {
+    static IN_ALLOC_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+unsafe impl std::alloc::GlobalAlloc for TraceAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if layout.size() >= ALLOC_TRACE_MIN {
+            IN_ALLOC_TRACE.with(|g| {
+                if !g.get() {
+                    g.set(true);
+                    // stderr directly — tracing itself allocates and may be the
+                    // one asking for this memory.
+                    eprintln!(
+                        "[alloc-trace] single allocation of {} bytes\n{}",
+                        layout.size(),
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                    g.set(false);
+                }
+            });
+        }
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: TraceAlloc = TraceAlloc;
+
 #[derive(Parser)]
 #[command(name = "seed-daemon", version, about)]
 struct Cli {
@@ -238,7 +283,31 @@ async fn reconcile_loop(daemon: Daemon) {
             };
             let Some(job) = job else { continue };
             let job_started = std::time::Instant::now();
-            match job.run().await {
+            // Slow-pass watchdog (known-issues #7): a pass that never returns
+            // wedges this share silently — `publishing` stays set, so no new job
+            // is ever built and the share just stops, with nothing in the log
+            // (fleet soak: nodes stuck at 0% for the whole run, 2 log lines).
+            // WARN once a minute with the job's phase breadcrumb so a wedge is
+            // visible and localized. Diagnostic only — the pass is not aborted.
+            let phase = job.phase_handle();
+            let run = job.run();
+            let mut run = std::pin::pin!(run);
+            let outcome = loop {
+                match tokio::time::timeout(Duration::from_secs(60), &mut run).await {
+                    Ok(res) => break res,
+                    Err(_) => {
+                        let at = phase
+                            .lock()
+                            .map(|g| g.clone())
+                            .unwrap_or_else(|_| "?".into());
+                        tracing::warn!(
+                            "reconcile {id} pass still running after {}s — phase: {at}",
+                            job_started.elapsed().as_secs(),
+                        );
+                    }
+                }
+            };
+            match outcome {
                 Ok(outcome) => {
                     let did = outcome.changed();
                     daemon
@@ -320,10 +389,12 @@ async fn presence_loop(daemon: Daemon) {
             job.send().await;
         }
 
-        // Every ~6s: grow each share's gossip mesh toward all-to-all (gossip's
-        // one-shot bootstrap leaves a fragile star), re-kick doc live-sync for
-        // out-of-sync shares, schedule due deep verifies, and emit health
-        // alerts. Dials run detached + bounded.
+        // Every ~6s: repair each share's gossip mesh (gossip's one-shot
+        // bootstrap leaves a fragile star; the engine picks a few unheard
+        // members to join — never the full roster, which fragments the overlay
+        // at fleet scale), re-kick doc live-sync for out-of-sync shares,
+        // schedule due deep verifies, and emit health alerts. Dials run
+        // detached + bounded.
         if tick_n.is_multiple_of(2) {
             let rejoins = { daemon.engine.lock().await.presence_rejoins() };
             for rejoin in rejoins {

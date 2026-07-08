@@ -1,0 +1,994 @@
+# seed-soak fleet report (1783481159)
+
+- config: 3 masters + 25 viewers, corpus 588 files / 0.47 GB, duration 3600s, interval 30s
+- scenarios: churn=Some(300) degrade_viewer=Some(0) conflict=true health_secs=Some("600/900")
+- verdict: **FAIL**
+- all nodes Healthy at end: false; swarm-deadline log hits: 0
+
+## Convergence verification
+
+- node-00: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-00: size mismatch: conflict/ordered.txt (7 != 25)
+- node-00: size mismatch: d00/f00042-small.bin (27640 != 132486)
+- node-00: extra file: d00/f00083-small.bin
+- node-00: size mismatch: d01/d08/f00395-small.bin (25025 != 230282)
+- node-00: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-00: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-00: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-00: size mismatch: d02/d11/d10/d16/f00062-small.bin (2497 != 70984)
+- node-00: size mismatch: d02/f00058-mid.bin (1974083 != 140242)
+- node-00: … 68 more mismatches
+- node-01: content mismatch: conflict/race.txt
+- node-01: size mismatch: d00/f00042-small.bin (74197 != 132486)
+- node-01: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-01: extra file: d01/f00047-mid.bin
+- node-01: size mismatch: d02/f00268-small.bin (35526 != 102650)
+- node-01: size mismatch: d06/d11/f00408-small.bin (11910 != 47613)
+- node-01: extra file: d08/d16/f00390-small.bin
+- node-01: size mismatch: d08/d17/d12/d09/f00460-small.bin (45361 != 243338)
+- node-01: extra file: d09/d12/f00060-small.bin
+- node-01: size mismatch: d10/d07/d09/f00467-small.bin (64132 != 100006)
+- node-01: … 363 more mismatches
+- node-02: size mismatch: churn/r002-18af9808.bin (168904 != 186282)
+- node-02: size mismatch: churn/r002-2f5eeb8b.bin (2321 != 112227)
+- node-02: size mismatch: d01/d11/f00379-small.bin (1737 != 184063)
+- node-02: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-02: extra file: d01/f00047-mid.bin
+- node-02: size mismatch: d02/d11/d10/d16/f00062-small.bin (2497 != 70984)
+- node-02: size mismatch: d03/d16/d18/f00286-small.bin (65441 != 217757)
+- node-02: size mismatch: d04/d01/d01/d14/f00251-small.bin (46960 != 241377)
+- node-02: size mismatch: d05/d12/d19/d11/f00053-mid.bin (197935 != 204066)
+- node-02: size mismatch: d06/d05/d07/f00303-small.bin (8909 != 126580)
+- node-02: … 329 more mismatches
+- node-03: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-03: extra file: d00/f00083-small.bin
+- node-03: size mismatch: d01/d11/f00379-small.bin (1737 != 184063)
+- node-03: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-03: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-03: size mismatch: d02/d11/d10/d16/f00062-small.bin (2497 != 70984)
+- node-03: size mismatch: d02/f00248-small.bin (6817 != 193794)
+- node-03: size mismatch: d04/d01/d01/d14/f00251-small.bin (46960 != 241377)
+- node-03: size mismatch: d04/d01/f00165-small.bin (11632 != 176970)
+- node-03: size mismatch: d05/d12/d19/d11/f00053-mid.bin (545395 != 204066)
+- node-03: … 259 more mismatches
+- node-04: size mismatch: d01/d11/f00379-small.bin (1737 != 184063)
+- node-04: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-04: size mismatch: d02/f00268-small.bin (35526 != 102650)
+- node-04: size mismatch: d05/d12/d19/d11/f00053-mid.bin (545395 != 204066)
+- node-04: size mismatch: d06/d13/f00298-small.bin (50024 != 65731)
+- node-04: size mismatch: d10/d07/d09/f00467-small.bin (64132 != 100006)
+- node-04: extra file: d10/d11/d11/d09/f00174-small.bin
+- node-04: extra file: d11/d14/d07/f00023-small.bin
+- node-04: size mismatch: d12/d10/d17/d08/f00430-small.bin (49915 != 216634)
+- node-04: size mismatch: d12/d12/d02/f00258-small.bin (62642 != 108394)
+- node-04: … 455 more mismatches
+- node-05: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-05: size mismatch: d00/f00042-small.bin (27640 != 132486)
+- node-05: size mismatch: d01/d08/f00395-small.bin (25025 != 230282)
+- node-05: size mismatch: d01/d11/f00379-small.bin (1737 != 184063)
+- node-05: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-05: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-05: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-05: size mismatch: d02/d11/d10/d16/f00062-small.bin (2497 != 70984)
+- node-05: size mismatch: d02/f00058-mid.bin (1974083 != 140242)
+- node-05: size mismatch: d02/f00248-small.bin (6817 != 193794)
+- node-05: … 198 more mismatches
+- node-06: missing file: churn/r000-78be7982.bin
+- node-06: missing file: churn/r000-82fb6e18.bin
+- node-06: missing file: churn/r000-914ae50b.bin
+- node-06: missing file: churn/r000-9c24d7c0.bin
+- node-06: missing file: churn/r000-c77263f9.bin
+- node-06: missing file: churn/r001-68b74148.bin
+- node-06: missing file: churn/r001-f723c82f.bin
+- node-06: missing file: churn/r001-fef5aabb.bin
+- node-06: missing file: churn/r002-18af9808.bin
+- node-06: missing file: churn/r002-21fd7642.bin
+- node-06: … 578 more mismatches
+- node-07: missing file: churn/r000-78be7982.bin
+- node-07: missing file: churn/r000-82fb6e18.bin
+- node-07: missing file: churn/r000-914ae50b.bin
+- node-07: missing file: churn/r000-9c24d7c0.bin
+- node-07: missing file: churn/r000-c77263f9.bin
+- node-07: missing file: churn/r001-68b74148.bin
+- node-07: missing file: churn/r001-f723c82f.bin
+- node-07: missing file: churn/r001-fef5aabb.bin
+- node-07: missing file: churn/r002-18af9808.bin
+- node-07: missing file: churn/r002-21fd7642.bin
+- node-07: … 578 more mismatches
+- node-08: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-08: size mismatch: d00/f00042-small.bin (27640 != 132486)
+- node-08: extra file: d00/f00083-small.bin
+- node-08: size mismatch: d01/d08/f00395-small.bin (25025 != 230282)
+- node-08: size mismatch: d01/d11/f00379-small.bin (1737 != 184063)
+- node-08: size mismatch: d01/d12/d07/f00295-small.bin (49777 != 177957)
+- node-08: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-08: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-08: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-08: size mismatch: d02/d11/d10/d16/f00062-small.bin (2497 != 70984)
+- node-08: … 99 more mismatches
+- node-09: size mismatch: d01/d11/f00379-small.bin (1737 != 184063)
+- node-09: extra file: d01/f00047-mid.bin
+- node-09: size mismatch: d02/f00058-mid.bin (1974083 != 140242)
+- node-09: size mismatch: d03/f00222-small.bin (27626 != 173234)
+- node-09: size mismatch: d04/d01/f00165-small.bin (11632 != 176970)
+- node-09: extra file: d04/f00041-mid.bin
+- node-09: size mismatch: d06/d00/d00/d19/f00463-small.bin (15092 != 40791)
+- node-09: size mismatch: d06/d10/f00382-small.bin (1755 != 36343)
+- node-09: size mismatch: d06/d13/f00298-small.bin (50024 != 65731)
+- node-09: extra file: d08/d16/f00390-small.bin
+- node-09: … 393 more mismatches
+- node-10: extra file: d00/f00083-small.bin
+- node-10: extra file: d01/f00047-mid.bin
+- node-10: size mismatch: d02/f00058-mid.bin (1974083 != 140242)
+- node-10: size mismatch: d03/d16/d18/f00286-small.bin (65441 != 217757)
+- node-10: size mismatch: d03/f00222-small.bin (27626 != 173234)
+- node-10: extra file: d04/f00041-mid.bin
+- node-10: size mismatch: d06/d02/d08/d09/f00447-small.bin (17936 != 201798)
+- node-10: size mismatch: d06/d05/d07/f00303-small.bin (8909 != 126580)
+- node-10: size mismatch: d06/d10/f00382-small.bin (1755 != 36343)
+- node-10: size mismatch: d06/d13/f00298-small.bin (50024 != 65731)
+- node-10: … 403 more mismatches
+- node-11: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-11: size mismatch: d02/f00268-small.bin (35526 != 102650)
+- node-11: size mismatch: d03/f00222-small.bin (27626 != 173234)
+- node-11: size mismatch: d04/d01/f00165-small.bin (11632 != 176970)
+- node-11: extra file: d05/f00344-small.bin
+- node-11: size mismatch: d06/d00/d00/d19/f00463-small.bin (15092 != 40791)
+- node-11: size mismatch: d06/d13/f00298-small.bin (50024 != 65731)
+- node-11: size mismatch: d08/d17/d12/d09/f00460-small.bin (45361 != 243338)
+- node-11: extra file: d11/d10/f00483-small.bin
+- node-11: extra file: d11/d14/d07/f00023-small.bin
+- node-11: … 425 more mismatches
+- node-12: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-12: size mismatch: d00/f00042-small.bin (27640 != 132486)
+- node-12: extra file: d00/f00083-small.bin
+- node-12: size mismatch: d01/d08/f00395-small.bin (25025 != 230282)
+- node-12: size mismatch: d01/d11/f00379-small.bin (1737 != 184063)
+- node-12: size mismatch: d01/d12/d07/f00295-small.bin (49777 != 177957)
+- node-12: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-12: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-12: extra file: d01/f00047-mid.bin
+- node-12: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-12: … 109 more mismatches
+- node-13: missing file: churn/r000-78be7982.bin
+- node-13: missing file: churn/r000-82fb6e18.bin
+- node-13: missing file: churn/r000-914ae50b.bin
+- node-13: missing file: churn/r000-9c24d7c0.bin
+- node-13: missing file: churn/r000-c77263f9.bin
+- node-13: missing file: churn/r001-68b74148.bin
+- node-13: missing file: churn/r001-f723c82f.bin
+- node-13: missing file: churn/r001-fef5aabb.bin
+- node-13: missing file: churn/r002-18af9808.bin
+- node-13: missing file: churn/r002-21fd7642.bin
+- node-13: … 578 more mismatches
+- node-14: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-14: size mismatch: d00/f00042-small.bin (27640 != 132486)
+- node-14: extra file: d00/f00083-small.bin
+- node-14: size mismatch: d01/d08/f00395-small.bin (25025 != 230282)
+- node-14: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-14: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-14: size mismatch: d02/f00058-mid.bin (1974083 != 140242)
+- node-14: size mismatch: d03/d16/d18/f00286-small.bin (65441 != 217757)
+- node-14: size mismatch: d03/f00222-small.bin (27626 != 173234)
+- node-14: size mismatch: d04/d01/f00165-small.bin (11632 != 176970)
+- node-14: … 258 more mismatches
+- node-15: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-15: size mismatch: conflict/ordered.txt (7 != 25)
+- node-15: size mismatch: d00/f00042-small.bin (27640 != 132486)
+- node-15: extra file: d00/f00083-small.bin
+- node-15: size mismatch: d01/d08/f00395-small.bin (25025 != 230282)
+- node-15: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-15: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-15: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-15: size mismatch: d02/d11/d10/d16/f00062-small.bin (2497 != 70984)
+- node-15: size mismatch: d02/f00058-mid.bin (1974083 != 140242)
+- node-15: … 80 more mismatches
+- node-16: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-16: size mismatch: conflict/ordered.txt (7 != 25)
+- node-16: size mismatch: d00/f00042-small.bin (27640 != 132486)
+- node-16: extra file: d00/f00083-small.bin
+- node-16: size mismatch: d01/d08/f00395-small.bin (25025 != 230282)
+- node-16: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-16: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-16: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-16: size mismatch: d02/d11/d10/d16/f00062-small.bin (2497 != 70984)
+- node-16: size mismatch: d02/f00058-mid.bin (1974083 != 140242)
+- node-16: … 79 more mismatches
+- node-17: missing file: churn/r000-78be7982.bin
+- node-17: missing file: churn/r000-82fb6e18.bin
+- node-17: missing file: churn/r000-914ae50b.bin
+- node-17: missing file: churn/r000-9c24d7c0.bin
+- node-17: missing file: churn/r000-c77263f9.bin
+- node-17: missing file: churn/r001-68b74148.bin
+- node-17: missing file: churn/r001-f723c82f.bin
+- node-17: missing file: churn/r001-fef5aabb.bin
+- node-17: missing file: churn/r002-18af9808.bin
+- node-17: missing file: churn/r002-21fd7642.bin
+- node-17: … 578 more mismatches
+- node-18: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-18: size mismatch: conflict/ordered.txt (7 != 25)
+- node-18: size mismatch: d00/f00042-small.bin (27640 != 132486)
+- node-18: extra file: d00/f00083-small.bin
+- node-18: size mismatch: d01/d08/f00395-small.bin (25025 != 230282)
+- node-18: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-18: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-18: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-18: size mismatch: d02/d11/d10/d16/f00062-small.bin (2497 != 70984)
+- node-18: size mismatch: d02/f00058-mid.bin (1974083 != 140242)
+- node-18: … 80 more mismatches
+- node-19: missing file: churn/r000-78be7982.bin
+- node-19: missing file: churn/r000-82fb6e18.bin
+- node-19: missing file: churn/r000-914ae50b.bin
+- node-19: missing file: churn/r000-9c24d7c0.bin
+- node-19: missing file: churn/r000-c77263f9.bin
+- node-19: missing file: churn/r001-68b74148.bin
+- node-19: missing file: churn/r001-f723c82f.bin
+- node-19: missing file: churn/r001-fef5aabb.bin
+- node-19: missing file: churn/r002-18af9808.bin
+- node-19: missing file: churn/r002-21fd7642.bin
+- node-19: … 578 more mismatches
+- node-20: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-20: size mismatch: conflict/ordered.txt (7 != 25)
+- node-20: size mismatch: d00/f00042-small.bin (27640 != 132486)
+- node-20: extra file: d00/f00083-small.bin
+- node-20: size mismatch: d01/d08/f00395-small.bin (25025 != 230282)
+- node-20: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-20: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-20: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-20: size mismatch: d02/d11/d10/d16/f00062-small.bin (2497 != 70984)
+- node-20: size mismatch: d02/f00058-mid.bin (1974083 != 140242)
+- node-20: … 80 more mismatches
+- node-21: missing file: churn/r000-78be7982.bin
+- node-21: missing file: churn/r000-82fb6e18.bin
+- node-21: missing file: churn/r000-914ae50b.bin
+- node-21: missing file: churn/r000-9c24d7c0.bin
+- node-21: missing file: churn/r000-c77263f9.bin
+- node-21: missing file: churn/r001-68b74148.bin
+- node-21: missing file: churn/r001-f723c82f.bin
+- node-21: missing file: churn/r001-fef5aabb.bin
+- node-21: missing file: churn/r002-18af9808.bin
+- node-21: missing file: churn/r002-21fd7642.bin
+- node-21: … 578 more mismatches
+- node-22: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-22: size mismatch: conflict/ordered.txt (7 != 25)
+- node-22: size mismatch: d00/f00042-small.bin (27640 != 132486)
+- node-22: extra file: d00/f00083-small.bin
+- node-22: size mismatch: d01/d08/f00395-small.bin (25025 != 230282)
+- node-22: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-22: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-22: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-22: size mismatch: d02/d11/d10/d16/f00062-small.bin (2497 != 70984)
+- node-22: size mismatch: d02/f00058-mid.bin (1974083 != 140242)
+- node-22: … 79 more mismatches
+- node-23: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-23: size mismatch: conflict/ordered.txt (7 != 25)
+- node-23: size mismatch: d00/f00042-small.bin (27640 != 132486)
+- node-23: extra file: d00/f00083-small.bin
+- node-23: size mismatch: d01/d08/f00395-small.bin (25025 != 230282)
+- node-23: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-23: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-23: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-23: size mismatch: d02/d11/d10/d16/f00062-small.bin (2497 != 70984)
+- node-23: size mismatch: d02/f00058-mid.bin (1974083 != 140242)
+- node-23: … 79 more mismatches
+- node-24: missing file: churn/r000-78be7982.bin
+- node-24: missing file: churn/r000-82fb6e18.bin
+- node-24: missing file: churn/r000-914ae50b.bin
+- node-24: missing file: churn/r000-9c24d7c0.bin
+- node-24: missing file: churn/r000-c77263f9.bin
+- node-24: missing file: churn/r001-68b74148.bin
+- node-24: missing file: churn/r001-f723c82f.bin
+- node-24: missing file: churn/r001-fef5aabb.bin
+- node-24: missing file: churn/r002-18af9808.bin
+- node-24: missing file: churn/r002-21fd7642.bin
+- node-24: … 578 more mismatches
+- node-25: missing file: churn/r000-78be7982.bin
+- node-25: missing file: churn/r000-82fb6e18.bin
+- node-25: missing file: churn/r000-914ae50b.bin
+- node-25: missing file: churn/r000-9c24d7c0.bin
+- node-25: missing file: churn/r000-c77263f9.bin
+- node-25: missing file: churn/r001-68b74148.bin
+- node-25: missing file: churn/r001-f723c82f.bin
+- node-25: missing file: churn/r001-fef5aabb.bin
+- node-25: missing file: churn/r002-18af9808.bin
+- node-25: missing file: churn/r002-21fd7642.bin
+- node-25: … 578 more mismatches
+- node-26: size mismatch: churn/r000-9c24d7c0.bin (97505 != 227808)
+- node-26: size mismatch: conflict/ordered.txt (7 != 25)
+- node-26: size mismatch: d00/f00042-small.bin (27640 != 132486)
+- node-26: extra file: d00/f00083-small.bin
+- node-26: size mismatch: d01/d08/f00395-small.bin (25025 != 230282)
+- node-26: size mismatch: d01/d15/d11/f00210-small.bin (40459 != 103501)
+- node-26: size mismatch: d01/d19/d16/f00176-small.bin (51109 != 131785)
+- node-26: size mismatch: d01/f00386-small.bin (21696 != 55880)
+- node-26: size mismatch: d02/d11/d10/d16/f00062-small.bin (2497 != 70984)
+- node-26: size mismatch: d02/f00058-mid.bin (1974083 != 140242)
+- node-26: … 79 more mismatches
+- node-27: missing file: churn/r000-78be7982.bin
+- node-27: missing file: churn/r000-82fb6e18.bin
+- node-27: missing file: churn/r000-914ae50b.bin
+- node-27: missing file: churn/r000-9c24d7c0.bin
+- node-27: missing file: churn/r000-c77263f9.bin
+- node-27: missing file: churn/r001-68b74148.bin
+- node-27: missing file: churn/r001-f723c82f.bin
+- node-27: missing file: churn/r001-fef5aabb.bin
+- node-27: missing file: churn/r002-18af9808.bin
+- node-27: missing file: churn/r002-21fd7642.bin
+- node-27: … 578 more mismatches
+
+## PeerHealth events (observed on node-00)
+
+- t+530s  UNHEALTHY  viewer-07  0%  602s  self=false
+- t+536s  UNHEALTHY  viewer-09  24%  605s  self=false
+- t+542s  UNHEALTHY  viewer-05  23%  605s  self=false
+- t+567s  UNHEALTHY  viewer-21  100%  601s  self=false
+- t+576s  UNHEALTHY  viewer-04  30%  602s  self=false
+- t+576s  UNHEALTHY  viewer-15  23%  604s  self=false
+- t+576s  UNHEALTHY  viewer-26  13%  601s  self=false
+- t+582s  UNHEALTHY  viewer-06  0%  602s  self=false
+- t+582s  UNHEALTHY  viewer-24  100%  601s  self=false
+- t+582s  UNHEALTHY  viewer-11  23%  605s  self=false
+- t+582s  UNHEALTHY  viewer-12  25%  605s  self=false
+- t+582s  UNHEALTHY  viewer-03  17%  608s  self=false
+- t+588s  UNHEALTHY  viewer-17  100%  605s  self=false
+- t+594s  UNHEALTHY  viewer-13  0%  605s  self=false
+- t+599s  UNHEALTHY  viewer-08  8%  603s  self=false
+- t+605s  UNHEALTHY  viewer-19  0%  603s  self=false
+- t+612s  UNHEALTHY  viewer-23  30%  604s  self=false
+- t+622s  UNHEALTHY  viewer-18  8%  602s  self=false
+- t+622s  UNHEALTHY  viewer-16  10%  602s  self=false
+- t+631s  UNHEALTHY    100%  606s  self=true
+- t+631s  UNHEALTHY  viewer-14  21%  602s  self=false
+- t+639s  UNHEALTHY  viewer-27  100%  606s  self=false
+- t+639s  UNHEALTHY  viewer-22  28%  607s  self=false
+- t+661s  UNHEALTHY  viewer-25  100%  603s  self=false
+- t+667s  UNHEALTHY  master-02  42%  604s  self=false
+- t+683s  UNHEALTHY  viewer-20  24%  603s  self=false
+- t+806s  UNHEALTHY  viewer-10  15%  601s  self=false
+- t+954s  RECOVERED  viewer-17  100%  0s  self=false
+- t+954s  RECOVERED  viewer-27  100%  0s  self=false
+- t+954s  RECOVERED  viewer-24  100%  0s  self=false
+- t+954s  RECOVERED  viewer-25  100%  0s  self=false
+- t+954s  RECOVERED  viewer-21  100%  0s  self=false
+- t+1436s  UNHEALTHY  viewer-07  0%  1499s  self=false
+- t+1444s  UNHEALTHY  viewer-05  35%  1458s  self=false
+- t+1486s  UNHEALTHY  viewer-06  0%  1502s  self=false
+- t+1486s  UNHEALTHY  viewer-12  46%  1463s  self=false
+- t+1486s  UNHEALTHY  viewer-15  36%  1484s  self=false
+- t+1486s  UNHEALTHY  viewer-03  17%  1495s  self=false
+- t+1494s  UNHEALTHY  viewer-26  33%  1471s  self=false
+- t+1512s  UNHEALTHY  viewer-13  0%  1479s  self=false
+- t+1521s  UNHEALTHY  viewer-18  32%  1425s  self=false
+- t+1521s  UNHEALTHY  viewer-19  0%  1516s  self=false
+- t+1521s  UNHEALTHY  viewer-23  48%  1473s  self=false
+- t+1521s  UNHEALTHY  viewer-08  48%  1455s  self=false
+- t+1537s  UNHEALTHY    100%  1511s  self=true
+- t+1537s  UNHEALTHY  viewer-16  22%  1456s  self=false
+- t+1546s  UNHEALTHY  viewer-22  50%  1478s  self=false
+- t+1588s  UNHEALTHY  viewer-20  33%  1474s  self=false
+- t+1620s  UNHEALTHY  master-02  43%  993s  self=false
+- t+1620s  UNHEALTHY  viewer-04  29%  777s  self=false
+- t+1635s  UNHEALTHY  viewer-09  25%  1146s  self=false
+- t+1635s  UNHEALTHY  viewer-14  22%  778s  self=false
+- t+1792s  UNHEALTHY  viewer-10  15%  646s  self=false
+- t+2177s  UNHEALTHY  viewer-11  23%  727s  self=false
+- t+2351s  UNHEALTHY  viewer-07  0%  2400s  self=false
+- t+2394s  UNHEALTHY  viewer-05  27%  1683s  self=false
+- t+2401s  UNHEALTHY  viewer-06  0%  2420s  self=false
+- t+2401s  UNHEALTHY  viewer-12  57%  2332s  self=false
+- t+2401s  UNHEALTHY  viewer-13  0%  2250s  self=false
+- t+2401s  UNHEALTHY  viewer-03  17%  2289s  self=false
+- t+2408s  UNHEALTHY  viewer-15  57%  2220s  self=false
+- t+2420s  UNHEALTHY  viewer-18  58%  2125s  self=false
+- t+2420s  UNHEALTHY  viewer-19  0%  2343s  self=false
+- t+2420s  UNHEALTHY  viewer-23  60%  2184s  self=false
+- t+2420s  UNHEALTHY  viewer-08  57%  2307s  self=false
+- t+2440s  UNHEALTHY    100%  2419s  self=true
+- t+2440s  UNHEALTHY  viewer-16  58%  2296s  self=false
+- t+2448s  UNHEALTHY  viewer-26  59%  2255s  self=false
+- t+2448s  UNHEALTHY  viewer-22  59%  2236s  self=false
+- t+2487s  UNHEALTHY  viewer-20  60%  2172s  self=false
+- t+2532s  UNHEALTHY  viewer-14  26%  942s  self=false
+- t+2536s  UNHEALTHY  master-02  45%  1046s  self=false
+- t+2814s  UNHEALTHY  viewer-10  15%  685s  self=false
+- t+2846s  UNHEALTHY  viewer-09  25%  1167s  self=false
+- t+3095s  UNHEALTHY  viewer-11  23%  777s  self=false
+- t+3202s  UNHEALTHY  viewer-04  29%  863s  self=false
+- t+3239s  UNHEALTHY  viewer-07  0%  3214s  self=false
+- t+3271s  UNHEALTHY  viewer-05  35%  1749s  self=false
+- t+3298s  UNHEALTHY  viewer-06  0%  3171s  self=false
+- t+3298s  UNHEALTHY  viewer-13  0%  3106s  self=false
+- t+3339s  UNHEALTHY  viewer-19  0%  3259s  self=false
+- t+3339s  UNHEALTHY  viewer-23  60%  2960s  self=false
+- t+3339s  UNHEALTHY  viewer-15  57%  3057s  self=false
+- t+3342s  UNHEALTHY    100%  3323s  self=true
+- t+3342s  UNHEALTHY  viewer-18  58%  2921s  self=false
+- t+3342s  UNHEALTHY  viewer-16  58%  3173s  self=false
+- t+3345s  UNHEALTHY  viewer-26  60%  3112s  self=false
+- t+3345s  UNHEALTHY  viewer-22  59%  3125s  self=false
+- t+3401s  UNHEALTHY  viewer-20  60%  3082s  self=false
+- t+3439s  UNHEALTHY  viewer-14  29%  1823s  self=false
+- t+3602s  UNHEALTHY  viewer-08  57%  3020s  self=false
+- t+3602s  UNHEALTHY  viewer-12  57%  2944s  self=false
+- t+3778s  UNHEALTHY  viewer-10  15%  723s  self=false
+- t+3778s  UNHEALTHY  viewer-03  17%  2310s  self=false
+- t+4058s  UNHEALTHY  viewer-24  100%  606s  self=false
+- t+4058s  UNHEALTHY  viewer-25  100%  606s  self=false
+- t+4116s  UNHEALTHY  viewer-17  100%  616s  self=false
+- t+4116s  UNHEALTHY  viewer-27  100%  619s  self=false
+- t+4116s  UNHEALTHY  viewer-21  100%  616s  self=false
+- t+4159s  UNHEALTHY  viewer-09  25%  1189s  self=false
+- t+4159s  RECOVERED  viewer-17  100%  0s  self=false
+- t+4159s  RECOVERED  viewer-27  100%  0s  self=false
+- t+4159s  RECOVERED  viewer-24  100%  0s  self=false
+- t+4159s  UNHEALTHY  viewer-07  0%  4038s  self=false
+- t+4159s  RECOVERED  viewer-25  100%  0s  self=false
+- t+4159s  RECOVERED  viewer-21  100%  0s  self=false
+- t+4198s  UNHEALTHY  viewer-06  0%  4071s  self=false
+- t+4198s  UNHEALTHY  viewer-13  0%  3892s  self=false
+- t+4234s  UNHEALTHY  viewer-19  0%  4161s  self=false
+- t+4234s  UNHEALTHY  viewer-23  63%  3751s  self=false
+- t+4234s  UNHEALTHY  viewer-15  60%  3907s  self=false
+- t+4241s  UNHEALTHY    100%  4223s  self=true
+- t+4241s  UNHEALTHY  viewer-18  61%  3691s  self=false
+- t+4241s  UNHEALTHY  viewer-16  59%  4012s  self=false
+- t+4247s  UNHEALTHY  viewer-26  64%  4014s  self=false
+- t+4247s  UNHEALTHY  viewer-22  63%  4022s  self=false
+- t+4303s  UNHEALTHY  viewer-20  62%  3978s  self=false
+- t+4337s  UNHEALTHY  viewer-14  33%  2664s  self=false
+- t+4355s  UNHEALTHY  viewer-04  29%  874s  self=false
+- t+4449s  UNHEALTHY  master-02  45%  1075s  self=false
+- t+4498s  UNHEALTHY  viewer-08  59%  3922s  self=false
+- t+4603s  UNHEALTHY  viewer-11  23%  789s  self=false
+- t+4696s  UNHEALTHY  viewer-10  15%  723s  self=false
+- t+4936s  UNHEALTHY  viewer-03  17%  2353s  self=false
+- t+5060s  UNHEALTHY  viewer-05  35%  1780s  self=false
+- t+5060s  UNHEALTHY  viewer-07  0%  4944s  self=false
+- t+5101s  UNHEALTHY  viewer-06  0%  4965s  self=false
+- t+5101s  UNHEALTHY  viewer-13  0%  4786s  self=false
+
+## Anomaly timeline
+
+- t+234s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+287s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+343s node-00 OutOfSync sustained > 5 min
+- t+343s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+343s node-02 OutOfSync sustained > 5 min
+- t+343s node-04 OutOfSync sustained > 5 min
+- t+343s node-05 OutOfSync sustained > 5 min
+- t+343s node-08 OutOfSync sustained > 5 min
+- t+343s node-09 OutOfSync sustained > 5 min
+- t+343s node-10 OutOfSync sustained > 5 min
+- t+343s node-11 OutOfSync sustained > 5 min
+- t+343s node-12 OutOfSync sustained > 5 min
+- t+343s node-14 OutOfSync sustained > 5 min
+- t+343s node-15 OutOfSync sustained > 5 min
+- t+343s node-16 OutOfSync sustained > 5 min
+- t+343s node-17 OutOfSync sustained > 5 min
+- t+343s node-18 OutOfSync sustained > 5 min
+- t+343s node-20 OutOfSync sustained > 5 min
+- t+343s node-21 OutOfSync sustained > 5 min
+- t+343s node-22 OutOfSync sustained > 5 min
+- t+343s node-23 OutOfSync sustained > 5 min
+- t+343s node-24 OutOfSync sustained > 5 min
+- t+343s node-25 OutOfSync sustained > 5 min
+- t+343s node-26 OutOfSync sustained > 5 min
+- t+343s node-27 OutOfSync sustained > 5 min
+- t+386s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+386s node-08 CPU > 25% sustained > 5 min (231%)
+- t+386s node-11 CPU > 25% sustained > 5 min (157%)
+- t+443s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+443s node-02 CPU > 25% sustained > 5 min (204%)
+- t+443s node-03 CPU > 25% sustained > 5 min (243%)
+- t+443s node-05 CPU > 25% sustained > 5 min (253%)
+- t+443s node-09 CPU > 25% sustained > 5 min (267%)
+- t+479s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+479s node-04 CPU > 25% sustained > 5 min (208%)
+- t+479s node-10 CPU > 25% sustained > 5 min (261%)
+- t+516s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+558s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+558s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+595s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+595s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+632s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+632s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+632s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+673s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+673s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+673s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+673s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+717s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+717s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+717s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+717s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+752s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+752s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+752s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+752s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+784s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+784s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+784s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+784s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+826s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+826s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+826s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+826s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+874s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+874s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+874s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+874s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+917s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+917s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+917s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+917s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+965s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+965s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+965s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+965s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+997s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+997s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+997s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+997s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1032s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1032s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1032s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1032s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1032s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1062s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1062s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1062s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1062s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1062s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1062s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1096s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1096s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1096s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1096s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1096s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1096s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1128s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1128s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1128s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1128s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1128s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1128s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1168s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1168s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1168s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1168s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1168s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1168s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1202s sub-second same-path race injected (conflict/race.txt) — winner arbitrary by design, fleet-consistency still asserted
+- t+1202s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1202s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1202s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1202s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1202s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1202s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1253s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1253s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1253s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1253s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1253s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1253s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1299s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1299s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1299s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1299s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1299s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1299s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1299s node-20 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1361s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1361s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1361s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1361s node-08 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1361s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1361s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1361s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1361s node-18 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1438s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1438s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1438s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1438s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1438s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1438s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1474s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1474s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1474s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1474s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1474s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1474s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1519s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1519s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1519s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1519s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1519s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1519s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1519s node-16 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1573s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1573s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1573s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1573s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1573s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1573s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1619s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1619s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1619s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1619s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1619s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1619s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1619s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1651s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1651s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1651s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1651s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1651s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1651s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1651s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1651s node-12 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1651s node-15 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1651s node-20 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1728s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1728s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1728s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1728s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1728s node-08 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1728s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1728s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1728s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1781s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1781s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1781s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1781s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1781s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1781s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1781s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1815s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1815s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1815s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1815s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1815s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1815s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1815s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1815s node-26 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1871s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1871s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1871s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1871s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1871s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1871s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1871s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1871s node-26 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1919s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1919s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1919s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1919s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1919s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1919s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1919s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1919s node-16 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+1977s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1977s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1977s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1977s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1977s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1977s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+1977s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2012s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2012s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2012s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2012s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2012s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2012s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2012s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2044s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2044s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2044s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2044s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2044s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2044s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2044s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2044s node-14 OutOfSync sustained > 5 min
+- t+2044s node-20 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2044s node-22 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2044s node-23 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2125s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2125s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2125s node-03 OutOfSync sustained > 5 min
+- t+2125s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2125s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2125s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2125s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2125s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2125s node-18 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2173s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2173s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2173s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2173s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2173s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2173s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2173s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2173s node-15 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2227s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2227s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2227s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2227s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2227s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2227s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2227s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2281s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2281s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2281s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2281s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2281s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2281s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2281s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2281s node-18 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2281s node-23 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2281s node-26 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2391s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2391s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2391s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2391s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2391s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2391s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2391s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2391s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2391s node-26 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2439s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2439s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2439s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2439s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2439s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2439s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2439s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2439s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2439s node-15 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2439s node-20 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2503s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2503s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2503s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2503s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2503s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2503s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2503s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2503s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2540s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2540s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2540s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2540s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2540s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2540s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2540s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2540s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2573s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2573s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2573s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2573s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2573s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2573s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2573s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2573s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2605s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2605s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2605s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2605s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2605s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2605s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2605s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2605s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2642s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2642s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2642s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2642s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2642s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2642s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2642s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2642s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2687s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2687s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2687s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2687s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2687s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2687s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2687s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2687s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2687s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2743s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2743s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2743s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2743s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2743s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2743s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2743s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2743s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2743s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2802s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2802s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2802s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2802s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2802s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2802s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2802s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2802s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2844s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2844s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2844s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2844s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2844s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2844s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2844s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2844s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2844s node-12 CPU > 25% sustained > 5 min (1167%)
+- t+2876s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2876s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2876s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2876s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2876s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2876s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2876s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2876s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2909s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+2909s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2909s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2909s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2909s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2909s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2909s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2909s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2909s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2909s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+2909s node-22 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+3010s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3010s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3010s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3010s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3010s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3010s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3010s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3010s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3010s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3048s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+3048s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3048s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3048s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3048s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3048s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3048s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3048s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3048s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3048s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3101s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+3101s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3101s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3101s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3101s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3101s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3101s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3101s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3101s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3101s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3146s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3146s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3146s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3146s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3146s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3146s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3146s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3146s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3146s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3181s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+3181s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3181s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3181s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3181s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3181s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3181s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3181s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3181s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3181s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3227s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3227s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3227s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3227s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3227s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3227s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3227s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3227s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3227s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3265s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3265s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3265s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3265s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3265s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3265s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3265s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3265s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3265s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3298s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+3298s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3298s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3298s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3298s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3298s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3298s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3298s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3298s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3298s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3346s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3346s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3346s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3346s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3346s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3346s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3346s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3346s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3346s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3379s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+3379s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3379s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3379s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3379s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3379s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3379s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3379s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3379s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3379s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3426s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3426s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3426s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3426s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3426s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3426s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3426s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3426s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3426s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3464s node-00 OutOfSync sustained > 5 min
+- t+3464s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3464s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3464s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3464s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3464s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3464s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3464s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3464s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3464s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3498s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3498s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3498s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3498s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3498s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3498s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3498s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3498s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3498s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3534s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3534s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3534s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3534s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3534s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3534s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3534s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3534s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3534s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3569s node-00 IPC failed (daemon dead?): IPC request timed out (15s)
+- t+3569s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3569s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3569s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3569s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3569s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3569s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3569s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3569s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3569s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3616s node-01 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3616s node-02 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3616s node-03 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3616s node-04 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3616s node-05 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3616s node-09 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3616s node-10 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3616s node-11 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+- t+3616s node-12 IPC failed (daemon dead?): The system cannot find the file specified. (os error 2)
+
+Samples: `samples.csv` next to this report. Per-daemon logs under `node-NN/daemon.log`.
