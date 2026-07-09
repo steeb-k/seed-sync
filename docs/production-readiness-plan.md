@@ -117,12 +117,19 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` landed (commit)
    uncontended spinning HDD** (midsize ceiling run); the historic
    "1.5 MiB/s/node" was six daemons seek-thrashing one spindle (839 % disk
    time, queue ~9.5). Contention scaling measured: 1 HDD node ≈ 35–40 MiB/s,
-   2 nodes ≈ 10–13 MiB/s each, 6 nodes ≈ 1.5 MiB/s each. Remaining follow-ups
-   (graceful degradation, not rescue): a large-blob slot class (fewer
-   concurrent ISO downloads per node → more sequential writes on spindles),
-   health-loop chunk-bitmap caching (per-tick `local_bytes` re-reads during
-   the ISO tail), and a look at ~2.5-core CPU per daemon during 40 MiB/s
-   transfers.
+   2 nodes ≈ 10–13 MiB/s each, 6 nodes ≈ 1.5 MiB/s each.
+   **Landed:** large-blob slot class (`MAX_INFLIGHT_LARGE = 2` of the 12
+   download slots) — a 2-HDD-viewer midsize A/B measured **no change**
+   (~15 MiB/s/node both sides, PASS both runs); kept anyway because it bounds
+   the un-benchmarked worst case (many multi-GB blobs writing concurrently on
+   one spindle), completes individual files sooner (earlier seeding for the
+   rest of a fleet), and showed zero cost. Also fixed en route: the
+   servable-primary pool degenerated to a possibly-offline master when no
+   peer's percent had gossiped yet (caught by
+   `large_blob_swarms_across_two_seeders`); the restriction now applies only
+   when a confirmed-full peer exists. **Still open (low priority):**
+   health-loop chunk-bitmap caching (per-tick `local_bytes` re-reads during a
+   big-blob tail) and the ~2.5-core CPU per daemon during 40 MiB/s transfers.
 2. **known-issues #7** — unclean-shutdown recovery wedge (startup + first
    reconcile under live peer pressure). Has a repro recipe.
 3. **known-issues #8 root cause** — why individual download futures could sit
