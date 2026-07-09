@@ -43,11 +43,12 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` landed (commit)
 - `[x]` **Phase 7 — GUI/OS notifications**: `notify-rust` backend +
   `adw::Toast`; self / remote / recovered copy; peers flyout shows the
   unhealthy duration. Manual visual check on Win + Linux still pending.
-- `[~]` **Phase 8 — soaks**: `seed-soak` bin (fleet | fullsize | clean) built;
-  **fleet soak (3 masters + 25 viewers) PASSED 2026-07-08** after the
-  fleet-scale fixes (#9–#11, #7 — see the soak run log); the full-size content
-  soak's remaining open item is bulk-transfer throughput at ISO scale
-  (reliability layer verified in fullsize #5).
+- `[x]` **Phase 8 — soaks**: `seed-soak` bin (fleet | fullsize | midsize |
+  clean) built; **fleet soak (3M+25V) PASSED 2026-07-08** after the
+  fleet-scale fixes (#9–#11, #7); **fullsize soak (3M+3V, 42 GB/copy) PASSED
+  2026-07-08** on the split-disk config (6/6 byte-identical, converged
+  in-window); throughput question closed by the split-disk measurement
+  campaign (see the soak run log + next-engineering item 1).
 
 ## Decisions log
 
@@ -94,6 +95,8 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` landed (commit)
 | 2026-07-08 | fleet #7 (full 60 min) | same config, + vendored iroh-docs deadlock patches + doc-read timeouts (#7 fix) | `docs/soak-reports/2026-07-08-fleet-7-consistent-harness-races.md` | **Every fleet-scale goal met**: membership 28.0/28 and holding, pct avg 100 mid-churn, RSS max 841 MB, 0 OOM, 0 wedges, **all nodes Healthy at end** — #7 fix verified (no doc-read wedges; prior run had 10/28). Verdict FAIL only on 4 verify lines, **identical on all 28 nodes** (fleet fully byte-consistent with itself): churn deletes resurrected by masters still mid-initial-publish (deletion-as-absence race → new known-issues #12) and the ordered-conflict write inverted by publish lag (#5, now soak-evidenced). Both are documented multi-master semantics the harness asserted naively → harness now gates churn/conflict on all masters Healthy @ 100 % and asserts *causal* conflict ordering. |
 | 2026-07-08 | fleet #8 (full 60 min) | same config, + gated harness | `docs/soak-reports/2026-07-08-fleet-8-PASS.md` | **PASS** (with benign anomalies: transient IPC sample timeouts under initial-sync load, by-design conflict notes). **28/28 byte-identical, all Healthy at end, 55 PeerHealth events, 0 swarm-deadline hits, 0 OOM, 0 wedges**; membership 28.0/28 and pct 100 held through 7 churn rounds + degrade/recover + conflict. The target topology (3 masters + 25 viewers) is validated end-to-end. |
 | 2026-07-08 | fullsize #6 (HDD) | 3M+3V, 41.9 GB/copy, 90 min window, full fix stack | `docs/soak-reports/2026-07-08-fullsize-6-hdd-baseline.md` (reconstructed) | **known-issues #8 verdict: silent-wedge pathology GONE** (continuous progress everywhere; 3 watchdog recycles were slow-transfer resumes under verify congestion) → #8 closable as fixed-by-#7/#11. Throughput unchanged from pre-fix (~1.5 MiB/s/node) because the **single HDD is saturated** (839 % disk time, queue ~9.5, ~21.5 MB/s device ceiling) — the disk, not the engine, is the measurement. Health-loop bitmap re-reads flagged for the tuning list. Harness bug found+fixed: run froze pre-report on an unpreemptable IPC wait (`request_bounded` now JoinHandle-bounded; minidump kept). Next: split-root SSD/HDD A/B. |
+| 2026-07-08 | fullsize #7 (split-disk A/B) | 3M+3V, 41.9 GB/copy: seeder+3 nodes on NVMe SSD, 2 viewers on the HDD | `docs/soak-reports/2026-07-08-fullsize-7-split-disk-PASS.md` | **PASS — 6/6 byte-identical, all Healthy, first fullsize to fully converge in-window.** SSD receivers each pulled the full 42 GB in ~20–35 min (~35–45 MiB/s/node; the degraded viewer caught up 42 GB in ~15 min after resume); the 2 HDD viewers finished in ~75 min at ~20–26 MiB/s combined once the swarm matured. **Bulk-transfer verdict: the engine was never the bottleneck — all prior "1.5 MiB/s/node" numbers were six nodes thrashing one spindle.** Remaining tuning is HDD graceful degradation (IO shaping: large-blob slot class, provider-count-scaled part fan-out, health-loop bitmap caching) + a look at ~2.5-core CPU per daemon during 40 MiB/s transfers. |
+| 2026-07-08 | midsize ceiling | 1M+2V (~3.9 GiB/copy): seeder+viewer on SSD, one LONE viewer on the HDD | `docs/soak-reports/2026-07-08-midsize-ceiling-PASS.md` | **PASS, no anomalies.** SSD viewer: full corpus in <30 s (**>130 MiB/s**). Lone HDD viewer: done at t+126 s (**~35–40 MiB/s uncontended**) — the single-spindle engine ceiling. Confirms the contention-scaling story (1 node ≈ 35–40, 2 ≈ 10–13 each, 6 ≈ 1.5 each MiB/s) and closes the throughput question: per-node performance is disk-class on realistic one-node-per-disk deployments. |
 
 ## Next engineering (from the soaks, ordered)
 
@@ -108,13 +111,18 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` landed (commit)
    gates mutation scenarios on all-masters-Healthy and asserts causal conflict
    ordering. **Follow-up: report the iroh and iroh-docs bugs upstream
    (n0-computer) before any iroh-stack bump.**
-1. **Bulk-transfer throughput at ISO scale** — with reliability fixed (cap +
-   watchdog + balanced seeding), 3–6 GB blobs move correctly but slowly
-   (~1.5 MB/s/node on the shared-disk fleet). Tune: swarm round pacing /
-   backoff, per-part sizing, slot allocation (reserve slots for small files vs
-   ISOs), possibly fewer concurrent ISO swarms per node so each gets real
-   bandwidth. Validate on real separate machines — the single shared disk in
-   the soak understates production throughput.
+1. `[x]` **Bulk-transfer throughput at ISO scale — RESOLVED by measurement
+   (2026-07-08 split-disk campaign).** The engine was never slow: per-node
+   rates are disk-class — **>130 MiB/s on NVMe, ~35–40 MiB/s on an
+   uncontended spinning HDD** (midsize ceiling run); the historic
+   "1.5 MiB/s/node" was six daemons seek-thrashing one spindle (839 % disk
+   time, queue ~9.5). Contention scaling measured: 1 HDD node ≈ 35–40 MiB/s,
+   2 nodes ≈ 10–13 MiB/s each, 6 nodes ≈ 1.5 MiB/s each. Remaining follow-ups
+   (graceful degradation, not rescue): a large-blob slot class (fewer
+   concurrent ISO downloads per node → more sequential writes on spindles),
+   health-loop chunk-bitmap caching (per-tick `local_bytes` re-reads during
+   the ISO tail), and a look at ~2.5-core CPU per daemon during 40 MiB/s
+   transfers.
 2. **known-issues #7** — unclean-shutdown recovery wedge (startup + first
    reconcile under live peer pressure). Has a repro recipe.
 3. **known-issues #8 root cause** — why individual download futures could sit

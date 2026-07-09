@@ -41,6 +41,8 @@ enum Command {
     Fleet(RunArgs),
     /// Full-size content soak: few nodes, real 3–6 GB ISOs (~33 GB/copy).
     Fullsize(RunArgs),
+    /// Mid-size throughput reading (~6–8 GB/copy): rates stabilize in minutes.
+    Midsize(RunArgs),
     /// Kill any daemons recorded in `<root>/pids.txt` and delete the tree.
     Clean {
         #[arg(long)]
@@ -102,6 +104,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Fullsize(mut a) => {
             a.viewers.get_or_insert(3);
             run(a, CorpusSpec::full(), "fullsize").await
+        }
+        Command::Midsize(mut a) => {
+            a.viewers.get_or_insert(1);
+            run(a, CorpusSpec::midsize(), "midsize").await
         }
         Command::Clean { root } => clean(&root),
     }
