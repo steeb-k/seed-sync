@@ -316,6 +316,17 @@ const DOWNLOAD_STALL_ABORT_SECS: u64 = 900;
 /// watchdog's meaning (a capped slot idle 15 min really is wedged).
 const MAX_INFLIGHT_DOWNLOADS: usize = 12;
 
+/// Of the [`MAX_INFLIGHT_DOWNLOADS`] slots, at most this many may hold LARGE
+/// blobs (≥ [`SWARM_MIN_SIZE`]) at once. Many concurrent multi-GB downloads
+/// interleave writes at scattered offsets across several huge files — a
+/// workload that collapses spinning disks into seek thrash (measured: one
+/// lone HDD node syncs at ~35–40 MiB/s, six contending nodes at ~1.5 MiB/s
+/// each; within one node the same physics applies to its own concurrent
+/// ISOs). Two at a time keeps per-file writes mostly sequential and finishes
+/// individual files sooner (better for swarm part-trading too), while the
+/// remaining slots keep small files flowing.
+const MAX_INFLIGHT_LARGE: usize = 2;
+
 fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -759,9 +770,17 @@ async fn swarm_download(
                 // (25 requesters × 16 parts × 400 ms rounds), which is the
                 // request storm behind the provider-side OOM (known-issues
                 // #11). Partial peers stay in the fallback chain so part
-                // trading still works; with no servable member at all (cold
-                // start, master still in grace) the rotation falls back to
-                // everyone, which is exactly the desired part-trading phase.
+                // trading still works.
+                //
+                // The restriction only applies when at least one FULL peer is
+                // actually known: a peer whose percent hasn't gossiped yet
+                // reads 0, and with `full_peers == 0` the pool would
+                // degenerate to just the master — possibly offline —
+                // collapsing every part onto one fallback order and defeating
+                // the swarm split (caught by
+                // `large_blob_swarms_across_two_seeders`). With no
+                // confirmed-full peer the rotation uses everyone: exactly the
+                // desired cold-start part-trading phase.
                 let mut servable: Vec<EndpointId> = peers[..full_peers.min(peers.len())].to_vec();
                 if rotate_master_in {
                     if let Some(m) = master {
@@ -770,7 +789,7 @@ async fn swarm_download(
                         }
                     }
                 }
-                let pool: &[EndpointId] = if servable.is_empty() {
+                let pool: &[EndpointId] = if full_peers == 0 || servable.is_empty() {
                     &candidates
                 } else {
                     &servable
@@ -857,6 +876,9 @@ struct InflightDownload {
     /// Which share kicked it off (so pausing that share can cancel just its
     /// downloads).
     share_id: String,
+    /// Whether this blob counts against the [`MAX_INFLIGHT_LARGE`] class
+    /// (size ≥ [`SWARM_MIN_SIZE`] at queue time).
+    large: bool,
     /// Aborts the detached download task. Aborting drops the download future
     /// (and, for a swarm, its `JoinSet` of part tasks), closing the connections;
     /// already-fetched chunks persist on disk and resume on the next attempt.
@@ -1072,13 +1094,19 @@ impl ReconcileJob {
     fn ensure_download(&self, hash: Hash, size: u64) {
         // Already downloading this blob, or all download slots busy? The next
         // reconcile tick re-offers every still-missing blob, so a full window
-        // is back-pressure, not a drop.
+        // is back-pressure, not a drop. Large blobs additionally contend for
+        // their own smaller class ([`MAX_INFLIGHT_LARGE`]) so a queue of ISOs
+        // can't monopolize the disk with scattered concurrent writes.
+        let large = size >= SWARM_MIN_SIZE;
         {
             let inflight = match self.downloads_inflight.lock() {
                 Ok(g) => g,
                 Err(_) => return,
             };
             if inflight.contains_key(&hash) || inflight.len() >= MAX_INFLIGHT_DOWNLOADS {
+                return;
+            }
+            if large && inflight.values().filter(|d| d.large).count() >= MAX_INFLIGHT_LARGE {
                 return;
             }
         }
@@ -1124,13 +1152,18 @@ impl ReconcileJob {
         let abort = handle.abort_handle();
         match self.downloads_inflight.lock() {
             Ok(mut inflight) => {
-                if inflight.contains_key(&hash) || inflight.len() >= MAX_INFLIGHT_DOWNLOADS {
+                if inflight.contains_key(&hash)
+                    || inflight.len() >= MAX_INFLIGHT_DOWNLOADS
+                    || (large
+                        && inflight.values().filter(|d| d.large).count() >= MAX_INFLIGHT_LARGE)
+                {
                     abort.abort();
                 } else {
                     inflight.insert(
                         hash,
                         InflightDownload {
                             share_id: self.share_id.clone(),
+                            large,
                             abort,
                             started: std::time::Instant::now(),
                         },
