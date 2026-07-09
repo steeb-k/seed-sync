@@ -134,6 +134,43 @@ impl CorpusSpec {
         }
     }
 
+    /// Mid-size mix for quick throughput readings (~6–8 GB per copy): a
+    /// realistic small/mid spread plus a few genuinely large files, so a
+    /// per-node MiB/s figure stabilizes in minutes — enough signal to rate a
+    /// disk or an IO-shaping change without a multi-hour ISO-scale soak.
+    pub fn midsize() -> Self {
+        CorpusSpec {
+            seed: 0x5EED_A11D,
+            buckets: vec![
+                SizeBucket {
+                    count: 300,
+                    min: 1 << 10,
+                    max: 64 << 10,
+                    label: "small",
+                },
+                SizeBucket {
+                    count: 40,
+                    min: 128 << 10,
+                    max: 2 << 20,
+                    label: "mid",
+                },
+                SizeBucket {
+                    count: 10,
+                    min: 4 << 20,
+                    max: 16 << 20,
+                    label: "swarm",
+                },
+                SizeBucket {
+                    count: 5,
+                    min: 512 << 20,
+                    max: 1 << 30,
+                    label: "big",
+                },
+            ],
+            max_dir_depth: 4,
+        }
+    }
+
     /// Total bytes this spec will generate (upper bound: bucket maxima).
     pub fn max_bytes(&self) -> u64 {
         self.buckets.iter().map(|b| b.count as u64 * b.max).sum()
