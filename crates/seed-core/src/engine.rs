@@ -225,6 +225,16 @@ const IGNORE_KEY: &[u8] = b"\x00ignore";
 /// iroh-docs filters 0-byte entries out of queries as deletion markers, so a real
 /// empty file can't ride a normal entry — it gets its own (non-empty) control key.
 const EMPTY_PREFIX: &[u8] = b"\x00e/";
+/// Prefix for delete tombstones: `\x00t/<relpath>` with a non-empty marker value.
+/// A plain iroh-docs deletion reads as *absence*, which is indistinguishable from
+/// "never seen" — so a master that hadn't yet published a path (mid initial seed)
+/// would meet the file on disk, see nothing in the replica, and re-publish it,
+/// resurrecting a concurrent delete fleet-wide (known-issues #12). The tombstone
+/// entry's own record timestamp is the delete time, letting delete-vs-edit resolve
+/// by LWW: a local file NEWER than the tombstone is a legitimate edit-after-delete
+/// and republishes (clearing the tombstone); an older one is deleted. Old readers
+/// skip unknown control keys, so this is wire-compatible.
+const TOMBSTONE_PREFIX: &[u8] = b"\x00t/";
 
 /// Blobs at or above this size are fetched as a **swarm** — the chunk range is
 /// split across several providers and the parts streamed concurrently — provided
@@ -573,13 +583,45 @@ fn insert_remote_lww(out: &mut HashMap<String, RemoteEntry>, path: String, entry
     }
 }
 
+/// The merged replica view: the desired fileset plus the delete tombstones that
+/// currently WIN their path (no live content entry is newer). `tombstones` maps
+/// path → delete time (record micros) so the merge can LWW a tombstone against a
+/// local file's mtime — the known-issues #12 case where the path is absent from
+/// `files` but "absent because deleted" must beat "on disk, so publish it".
+struct RemoteView {
+    files: HashMap<String, RemoteEntry>,
+    tombstones: HashMap<String, u64>,
+}
+
+/// Resolve delete tombstones against the merged content view, in place:
+/// a tombstone strictly NEWER than the path's live entry deletes it from
+/// `files`; otherwise the content survives and the tombstone is dropped (ties
+/// favor content — same anti-data-loss bias as the empty-marker tie-break).
+/// Runs over complete maps, so the outcome is independent of doc stream order
+/// and every member computes the same view (and thus the same fingerprint).
+fn resolve_tombstones(
+    files: &mut HashMap<String, RemoteEntry>,
+    tombstones: &mut HashMap<String, u64>,
+) {
+    tombstones.retain(|path, tts| match files.get(path) {
+        Some(re) if re.ts >= *tts => false, // content newer (or tie): delete loses
+        Some(_) => {
+            files.remove(path);
+            true
+        }
+        None => true,
+    });
+}
+
 /// Read the merged file view from the doc: latest-per-key, with deletion markers
-/// already excluded by the query (so a tombstoned file is simply absent). Normal
-/// keys carry content; `\x00e/<path>` keys mark empty files; other control keys
-/// (e.g. `\x00ignore`) are skipped. A path live under both keyspaces resolves by
-/// LWW via [`insert_remote_lww`].
-async fn read_remote_files(doc: &Doc) -> anyhow::Result<HashMap<String, RemoteEntry>> {
-    let mut out = HashMap::new();
+/// already excluded by the query. Normal keys carry content; `\x00e/<path>` keys
+/// mark empty files; `\x00t/<path>` keys are delete tombstones (resolved against
+/// content by [`resolve_tombstones`]); other control keys (e.g. `\x00ignore`) are
+/// skipped. A path live under both content keyspaces resolves by LWW via
+/// [`insert_remote_lww`].
+async fn read_remote_files(doc: &Doc) -> anyhow::Result<RemoteView> {
+    let mut files = HashMap::new();
+    let mut tombstones: HashMap<String, u64> = HashMap::new();
     let mut s = std::pin::pin!(doc.get_many(Query::single_latest_per_key()).await?);
     while let Some(e) = s.next().await {
         let e = e?;
@@ -588,7 +630,7 @@ async fn read_remote_files(doc: &Doc) -> anyhow::Result<HashMap<String, RemoteEn
             if let Some(rel) = key.strip_prefix(EMPTY_PREFIX) {
                 if let Ok(path) = std::str::from_utf8(rel) {
                     insert_remote_lww(
-                        &mut out,
+                        &mut files,
                         path.to_string(),
                         RemoteEntry {
                             hash: Hash::EMPTY.as_bytes().to_vec(),
@@ -597,6 +639,14 @@ async fn read_remote_files(doc: &Doc) -> anyhow::Result<HashMap<String, RemoteEn
                         },
                     );
                 }
+            } else if let Some(rel) = key.strip_prefix(TOMBSTONE_PREFIX) {
+                if let Ok(path) = std::str::from_utf8(rel) {
+                    let ts = e.timestamp();
+                    tombstones
+                        .entry(path.to_string())
+                        .and_modify(|t| *t = (*t).max(ts))
+                        .or_insert(ts);
+                }
             }
             continue;
         }
@@ -604,7 +654,7 @@ async fn read_remote_files(doc: &Doc) -> anyhow::Result<HashMap<String, RemoteEn
             continue;
         };
         insert_remote_lww(
-            &mut out,
+            &mut files,
             path.to_string(),
             RemoteEntry {
                 hash: e.content_hash().as_bytes().to_vec(),
@@ -613,7 +663,8 @@ async fn read_remote_files(doc: &Doc) -> anyhow::Result<HashMap<String, RemoteEn
             },
         );
     }
-    Ok(out)
+    resolve_tombstones(&mut files, &mut tombstones);
+    Ok(RemoteView { files, tombstones })
 }
 
 /// Read the replicated ignore list (`\x00ignore`), if a master has published one
@@ -1027,6 +1078,11 @@ impl ReconcileJob {
             Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) => size,
             _ => 0,
         };
+        // NOTE: a stale `\x00t/<path>` tombstone is deliberately NOT deleted
+        // when (re)publishing: the fresh content record's newer timestamp wins
+        // the LWW against it (see `read_remote_files`), and `doc.del` is
+        // PREFIX deletion — clearing `\x00t/foo` would also nuke the live
+        // tombstone of a deleted `foobar`.
         if size == 0 {
             // Empty file: mark it in the control keyspace and clear any stale
             // normal entry left from when it had content.
@@ -1051,8 +1107,14 @@ impl ReconcileJob {
         Ok(hash.as_bytes().to_vec())
     }
 
-    /// Tombstone a file (and its empty-marker) in the replica.
+    /// Tombstone a file (and its empty-marker) in the replica, leaving a
+    /// timestamped `\x00t/<path>` marker so a member that never saw this path
+    /// can tell "deleted" from "never seen" (known-issues #12). The marker's
+    /// record timestamp is the delete time for delete-vs-edit LWW.
     async fn tombstone(&self, path: &str) {
+        let mut tk = TOMBSTONE_PREFIX.to_vec();
+        tk.extend_from_slice(path.as_bytes());
+        let _ = self.doc.set_bytes(self.author, tk, vec![1u8]).await;
         let _ = self.doc.del(self.author, path.as_bytes().to_vec()).await;
         let mut ek = EMPTY_PREFIX.to_vec();
         ek.extend_from_slice(path.as_bytes());
@@ -1268,14 +1330,16 @@ impl ReconcileJob {
         };
         let (ignore_set, _bad) = IgnoreSet::compile(&effective_ignore);
 
-        // 2. Merged remote view.
+        // 2. Merged remote view (desired fileset + winning delete tombstones).
         self.set_phase("merge remote view (doc get_many stream)");
-        let remote = tokio::time::timeout(
+        let remote_view = tokio::time::timeout(
             Duration::from_secs(DOC_READ_TIMEOUT_SECS),
             read_remote_files(&self.doc),
         )
         .await
         .map_err(|_| anyhow!("manifest doc read timed out after {DOC_READ_TIMEOUT_SECS}s"))??;
+        let remote = remote_view.files;
+        let tombstones = remote_view.tombstones;
 
         // 3. Local view. Hashing the whole folder is costly, so only do it when the
         //    cheap (path,size,mtime) signature changed since last reconcile;
@@ -1432,7 +1496,29 @@ impl ReconcileJob {
                         index_dels.push(path);
                         changed = true;
                     } else if let Some(abs) = le.abs.as_ref() {
-                        // Master, brand-new local file (or locally edited after a
+                        // Master, local file absent from the replica. Before
+                        // treating it as brand-new, check for a delete
+                        // tombstone (known-issues #12): "absent because
+                        // deleted" must not read as "never seen". LWW decides
+                        // — a file mtime NEWER than the tombstone is a
+                        // legitimate edit/re-creation after the delete and
+                        // republishes; an older one is the deleted copy still
+                        // on our disk (e.g. we hadn't finished our initial
+                        // publish when the delete happened) and is removed.
+                        if let Some(&tts) = tombstones.get(&path) {
+                            if mtime_micros(abs) <= tts {
+                                let _ = std::fs::remove_file(abs);
+                                if let Some(p) = abs.parent() {
+                                    emptied_parents.insert(p.to_path_buf());
+                                }
+                                if b.is_some() {
+                                    index_dels.push(path);
+                                }
+                                changed = true;
+                                continue;
+                            }
+                        }
+                        // Brand-new local file (or locally edited after a
                         // remote delete): publish it. A per-file import failure (the
                         // file got locked between scan and import, an odd entry, etc.)
                         // must NOT abort the whole pass — skip it and retry next tick.
@@ -3430,6 +3516,49 @@ mod tests {
         // Never the 0 (= "unknown") sentinel, even for an empty view.
         let empty: HashMap<String, RemoteEntry> = HashMap::new();
         assert_ne!(manifest_fingerprint(&empty), 0);
+    }
+
+    /// Delete-vs-content resolution (known-issues #12): a tombstone deletes a
+    /// path from the merged view only when strictly newer than the live entry;
+    /// content wins ties (anti-data-loss bias, matching the empty-marker
+    /// tie-break). Surviving tombstones stay available for the merge's
+    /// local-file LWW; losing ones are dropped. Map-based, so stream order
+    /// can't influence the outcome (fingerprint determinism).
+    #[test]
+    fn tombstones_resolve_by_lww_content_wins_ties() {
+        let entry = |ts: u64| RemoteEntry {
+            hash: vec![7u8; 32],
+            size: 10,
+            ts,
+        };
+
+        // Tombstone newer than content → path deleted, tombstone kept.
+        let mut files = HashMap::from([("p".to_string(), entry(100))]);
+        let mut tombs = HashMap::from([("p".to_string(), 200u64)]);
+        resolve_tombstones(&mut files, &mut tombs);
+        assert!(!files.contains_key("p"), "newer delete must win");
+        assert_eq!(tombs.get("p"), Some(&200));
+
+        // Content newer than tombstone → content survives, tombstone dropped.
+        let mut files = HashMap::from([("p".to_string(), entry(300))]);
+        let mut tombs = HashMap::from([("p".to_string(), 200u64)]);
+        resolve_tombstones(&mut files, &mut tombs);
+        assert_eq!(files["p"].ts, 300, "newer content must survive");
+        assert!(tombs.is_empty());
+
+        // Tie → content wins (deterministic anti-data-loss bias).
+        let mut files = HashMap::from([("p".to_string(), entry(200))]);
+        let mut tombs = HashMap::from([("p".to_string(), 200u64)]);
+        resolve_tombstones(&mut files, &mut tombs);
+        assert!(files.contains_key("p"));
+        assert!(tombs.is_empty());
+
+        // Tombstone for a path with no live entry (the #12 "never saw it"
+        // case) → kept, so the merge can veto a local re-publish.
+        let mut files = HashMap::new();
+        let mut tombs = HashMap::from([("gone".to_string(), 50u64)]);
+        resolve_tombstones(&mut files, &mut tombs);
+        assert_eq!(tombs.get("gone"), Some(&50));
     }
 
     /// Cross-master empty↔non-empty flip: when both the content key and the

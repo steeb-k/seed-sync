@@ -377,3 +377,108 @@ async fn no_rescan_thrash_while_out_of_sync() -> anyhow::Result<()> {
     c.shutdown().await?;
     Ok(())
 }
+
+/// Known-issues #12 regression: a delete must survive a master that never saw
+/// the path but holds an identical copy on disk (the delete-vs-still-seeding
+/// race). Master A publishes X and Y, deletes X (timestamped tombstone); master
+/// B then joins with a pre-populated folder holding BOTH files (mtimes older
+/// than the delete). Deletion-as-absence used to make B re-publish X and
+/// resurrect it fleet-wide; the tombstone must now win — and an edit NEWER than
+/// the tombstone must still resurrect the path (LWW in the other direction).
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn delete_survives_unseen_master_copy() -> anyhow::Result<()> {
+    use seed_core::Engine;
+
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let x_bytes = content_for("x.bin", 4096);
+    let y_bytes = content_for("y.bin", 4096);
+
+    // A seeds and publishes X + Y.
+    std::fs::write(a_folder.path().join("x.bin"), &x_bytes)?;
+    std::fs::write(a_folder.path().join("y.bin"), &y_bytes)?;
+    let mut a = Engine::new(a_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), a.wait_online())
+        .await
+        .map_err(|_| anyhow::anyhow!("A endpoint never came online"))?;
+    let created = a.create_share(a_folder.path(), vec![]).await?;
+    let share_id = created.share_id.clone();
+    a.reconcile(&share_id).await?;
+
+    // B's folder holds identical copies — written NOW, so their mtimes are
+    // older than the upcoming delete (the "independently seeded" copy).
+    std::fs::write(b_folder.path().join("x.bin"), &x_bytes)?;
+    std::fs::write(b_folder.path().join("y.bin"), &y_bytes)?;
+
+    // A deletes X strictly later than B's file mtimes → tombstone ts is newer.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    std::fs::remove_file(a_folder.path().join("x.bin"))?;
+    a.reconcile(&share_id).await?; // detects the deletion, writes the tombstone
+
+    // B joins as a co-master and reconciles against the replica.
+    let mut b = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), b.wait_online())
+        .await
+        .map_err(|_| anyhow::anyhow!("B endpoint never came online"))?;
+    let a_addr = a.endpoint_addr();
+    let share_id_b = b
+        .add_share(&created.master_key, b_folder.path(), vec![a_addr])
+        .await?;
+    assert_eq!(share_id_b, share_id);
+
+    // Drive both until B honors the delete: X gone on BOTH, Y intact on both.
+    let deadline = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let _ = a.reconcile(&share_id).await;
+            let _ = b.reconcile(&share_id).await;
+            let x_gone =
+                !a_folder.path().join("x.bin").exists() && !b_folder.path().join("x.bin").exists();
+            let y_ok = std::fs::read(a_folder.path().join("y.bin")).ok().as_deref()
+                == Some(&y_bytes[..])
+                && std::fs::read(b_folder.path().join("y.bin")).ok().as_deref()
+                    == Some(&y_bytes[..]);
+            if x_gone && y_ok {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await;
+    assert!(
+        deadline.is_ok(),
+        "delete did not survive B's unseen copy: A has x.bin={}, B has x.bin={}",
+        a_folder.path().join("x.bin").exists(),
+        b_folder.path().join("x.bin").exists(),
+    );
+    println!("tombstone beat the unseen copy (X deleted on both, Y intact)");
+
+    // Edit-after-delete: B re-creates X with a fresh mtime (newer than the
+    // tombstone) → legitimate resurrection, must propagate back to A.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let x2 = content_for("x.bin-v2", 2048);
+    std::fs::write(b_folder.path().join("x.bin"), &x2)?;
+    let revived = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let _ = a.reconcile(&share_id).await;
+            let _ = b.reconcile(&share_id).await;
+            if std::fs::read(a_folder.path().join("x.bin")).ok().as_deref() == Some(&x2[..]) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await;
+    assert!(
+        revived.is_ok(),
+        "edit-after-delete did not resurrect x.bin on A"
+    );
+    println!("edit-after-delete resurrected X (newer mtime beat the tombstone)");
+
+    a.shutdown().await?;
+    b.shutdown().await?;
+    Ok(())
+}

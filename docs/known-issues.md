@@ -1,22 +1,32 @@
 # Known issues
 
-Open bugs and design caveats in the sync engine, found by audit rather than by a
-failing test. Each entry notes where it lives, what goes wrong, why, and a suggested
-fix. **#1–#4 are now fixed** (see each entry and `production-readiness-plan.md`);
-#5–#6 remain design notes; **#7 (unclean-shutdown recovery wedge) is open**, found
-by the full-size soak.
+Bugs and design caveats in the sync engine, found by audit and by the
+production-readiness soaks. Each entry notes where it lives, what went wrong,
+why, and the fix or disposition.
 
-Scope: healing + multi-master behavior. The cross-member divergence *detection*
-(manifest fingerprint determinism, the 45 s settle window, the false-alarm guard)
-audited clean; the open items below are mostly in the newer **self-heal / deep-verify**
-plumbing added in `5e5e4d8`.
+**Current status (2026-07-08, after the fleet/fullsize soak campaign):**
 
-All references confirmed against HEAD `fc7cd01` (after `5e5e4d8` "self-heal on
-divergence + periodic deep verify"). Cross-OS test-bench issues live separately in
-`cross-os-testing.md` ("Open issues"); this file is for engine/sync logic.
+| # | Issue | Status |
+|---|-------|--------|
+| 1–4 | audit fixes (lock-across-await, lost deep-verify, rescan thrash, empty-marker LWW) | **fixed** |
+| 7 | reconcile/startup wedge under fleet pressure (iroh-docs actor deadlock) | **fixed** (vendored iroh-docs patch + doc-read timeouts; soak-verified) |
+| 8 | silent download wedges at multi-GB scale | **fixed** via #7 + #11 (watchdog retained) |
+| 9 | presence mesh fragmentation at ~28 members | **fixed** (subset rejoin; soak-verified) |
+| 10 | OutOfSync doc-resync storm (O(N²) sessions) | **fixed** (bounded kicks; soak-verified) |
+| 11 | unbounded iroh path-retry queue → OOM abort | **fixed** (vendored iroh patch; soak-verified) |
+| 12 | multi-master delete resurrected by a still-seeding master | **fixed** (timestamped tombstones) |
+| 5 | LWW: local mtime vs doc record timestamp (publish-lag/skew sensitive) | design note, soak-evidenced |
+| 6 | master-side in-place corruption propagates (master = source of truth) | design note (a deep-verify WARN is cheap future work) |
+| 13 | iroh-docs `del` is prefix deletion (prefix-nested filenames collide) | design note (latent, rare, self-healing) |
 
-> For cross-OS / packaging issues see `cross-os-testing.md`. For the divergence design
-> see `divergence-detection-plan.md`.
+Three vendored crates carry the upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
+`vendor/iroh-docs` — see `[patch.crates-io]` in the workspace `Cargo.toml`).
+**Report those bugs upstream before any iroh-stack bump.**
+
+Cross-OS test-bench issues live separately in `cross-os-testing.md` ("Open
+issues"); this file is for engine/sync logic. For the divergence design see
+`divergence-detection-plan.md`; for the soak evidence trail see
+`production-readiness-plan.md` (soak run log) and `docs/soak-reports/`.
 
 ---
 
@@ -401,11 +411,28 @@ allocation backtrace shows the daemon-killing growth is this queue.
 
 ---
 
-## 12. Multi-master delete races a peer's still-pending initial publish (deletion-as-absence)
-**Tier:** observed in soak · **Severity:** medium (unexpected resurrection; multi-master only)
+## 12. Multi-master delete races a peer's still-pending initial publish (deletion-as-absence) — **FIXED**
+**Tier:** observed in soak · **Severity:** medium (unexpected resurrection; multi-master only) · **Status:** fixed (timestamped tombstones)
 **Where:** the reconcile merge's "on disk, absent from replica → publish" branch
 (`crates/seed-core/src/engine.rs`, `(Some(le), None)` master arm) interacting with
 tombstones being iroh-docs *deletions* (empty entries, filtered out of reads).
+
+> **Fixed** per the suggested durable fix: deletes now also write a
+> `\x00t/<path>` control entry whose record timestamp is the delete time.
+> `read_remote_files` resolves tombstones against live content by LWW
+> (map-based, order-insensitive; ties favor content — the same anti-data-loss
+> bias as the empty-marker tie-break), and the merge's "new local file" arm
+> compares a surviving tombstone against the file's mtime: older file →
+> deleted (the #12 race honored); newer file → legitimate edit-after-delete,
+> republished (whose fresher record then beats the tombstone everywhere).
+> Stale tombstones are never `del`-cleared (see #13) — they simply lose the
+> LWW forever. Old readers skip unknown control keys, so the new keyspace is
+> wire-compatible. Unit-tested (`tombstones_resolve_by_lww_content_wins_ties`)
+> + integration-tested (`delete_survives_unseen_master_copy`: the exact
+> soak-observed race, both directions). One semantic to know: restoring a
+> deleted file from a backup **with its old mtime preserved** re-deletes it
+> (the delete is "newer" by LWW); a normal copy/save gets a fresh mtime and
+> resurrects. Original write-up kept below.
 
 **Symptom (fleet soak #7, 3M+25V):** files deleted by churn on one master while
 another master was still working through its initial import/publish of the same
@@ -427,6 +454,31 @@ Until then: the soak harness gates churn on all masters reaching Healthy @
 100 % (steady state), and users should expect that deleting a file while
 another master is still doing its first full sync of the same folder may bring
 it back.
+
+---
+
+## 13. iroh-docs `del` is PREFIX deletion — prefix-nested filenames collide
+**Tier:** note (latent; found during the #12 fix) · **Severity:** low-medium (rare name shapes)
+**Where:** every `doc.del(author, key)` call (`tombstone`, `import_one`'s
+marker cleanup) — iroh-docs 0.101 `Doc::del` "deletes entries that match the
+given author and key **prefix**", i.e. `del("foo.txt")` also clears the
+entries of `foo.txt.bak` (same author) existing at that moment.
+
+**Impact:** deleting a file whose name is a strict prefix of another file's
+name (no separator required: `report` vs `report-final`; a file vs a
+*directory* of the same name can't coexist on disk, so the `/` case is safe)
+transiently clears the longer path's entries too. Viewers delete the longer
+file; the master re-publishes it on its next scan (still on disk, reads as
+new), so it self-heals with a newer record — a transient viewer-side deletion
++ resurrection, not permanent loss. The #12 tombstone fix deliberately avoids
+adding new hazards: republishes do NOT `del` stale `\x00t/` markers (they
+lose LWW instead), because `del("\x00t/foo")` would nuke the live tombstone
+of a deleted `foobar`.
+
+**Fix direction (future):** an exact-key delete needs upstream support (an
+empty entry IS iroh-docs' prefix-tombstone primitive), or app-level keys made
+prefix-free (e.g. length-prefixed / terminator-suffixed path keys — a wire
+format change).
 
 ---
 
