@@ -92,6 +92,13 @@ struct RunArgs {
     /// How many trailing nodes live under `--alt-root`.
     #[arg(long, default_value_t = 2)]
     alt_nodes: usize,
+    /// Run mutation scenarios WITHOUT waiting for all masters to reach
+    /// Healthy @ 100% — deliberately exercises deletes racing still-seeding
+    /// masters (known-issues #12, fixed via timestamped tombstones). The
+    /// ordered-conflict assertion is publish-lag-sensitive ungated (#5), so
+    /// combine with churn only, not --conflict.
+    #[arg(long, default_value_t = false)]
+    no_scenario_gate: bool,
 }
 
 #[tokio::main]
@@ -387,7 +394,7 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
     // and gross publish lag inverts wall-clock LWW expectations (#5). Fleet
     // soak #7 converged 28/28 byte-identical but FAILed verify on exactly
     // those two races. Steady-state mutation is what the product promises.
-    let mut fleet_seeded = false;
+    let mut fleet_seeded = a.no_scenario_gate;
 
     while started.elapsed() < Duration::from_secs(a.duration) {
         tokio::select! {
@@ -454,9 +461,18 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
                 );
             }
         }
-        // Scenario: multi-master churn.
+        // Scenario: multi-master churn. Quiet tail: no round in the final
+        // stretch of the window — a mutation fired at (or after) window close
+        // races the convergence gate through the 45 s divergence settle window
+        // (nodes still applying it read Healthy), and the verify then catches
+        // stragglers mid-application as stale. Observed: round 11 at t+3606 of
+        // a 3600 s window FAILed an otherwise-perfect run on two masters.
+        const CHURN_QUIET_TAIL_SECS: u64 = 120;
         if let Some(churn_secs) = a.churn {
-            if fleet_seeded && last_churn.elapsed() >= Duration::from_secs(churn_secs) {
+            if fleet_seeded
+                && last_churn.elapsed() >= Duration::from_secs(churn_secs)
+                && elapsed + CHURN_QUIET_TAIL_SECS < a.duration
+            {
                 last_churn = Instant::now();
                 let m = (churn_round as usize) % a.masters;
                 match corpus::mutate(&nodes[m].folder, &mut manifest, spec.seed, churn_round, 0.02)
