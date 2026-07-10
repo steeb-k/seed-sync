@@ -36,6 +36,7 @@ use iroh_docs::{
 };
 use rand::seq::SliceRandom;
 use rand::Rng;
+use serde::{Deserialize, Serialize};
 
 /// How long since a peer was last heard from before we consider it offline.
 /// How long since the last sign of life (presence heartbeat, doc sync activity,
@@ -57,8 +58,9 @@ const PEER_ONLINE_TTL_SECS: i64 = 20;
 const PRESENCE_REJOIN_SAMPLE: usize = 3;
 
 /// Tracks the peers seen for one share, fed by the doc's live events + presence
-/// gossip. `total` is every distinct peer seen since the daemon started; `online`
-/// is those heard-from within [`PEER_ONLINE_TTL_SECS`].
+/// gossip, plus every member *remembered* from earlier sessions (`peer_names`
+/// table + doc member-records). `total` counts all known members; `online` is
+/// those heard-from within [`PEER_ONLINE_TTL_SECS`].
 ///
 /// Online is deliberately **heartbeat-based, not a sticky "is a neighbor" flag**:
 /// when a peer's daemon is force-stopped, iroh-gossip does not always deliver a
@@ -69,6 +71,16 @@ const PRESENCE_REJOIN_SAMPLE: usize = 3;
 #[derive(Default)]
 pub(crate) struct PeerRoster {
     peers: HashMap<String, PeerEntry>,
+    /// Last-known identity per member (full endpoint-id string), kept across
+    /// disconnects and daemon restarts (via the `peer_names` table) and learned
+    /// even for members never heard directly (via doc member-records, see
+    /// [`MEMBER_PREFIX`]). Display fallback only: it never drives liveness,
+    /// download providers, or mesh repair, so a long-gone member costs nothing
+    /// but a named offline row in the member list.
+    remembered: HashMap<String, RememberedPeer>,
+    /// Members whose remembered identity changed since the last DB flush
+    /// ([`Engine::presence_broadcasts`] drains this every presence tick).
+    dirty: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -82,6 +94,26 @@ struct PeerEntry {
     /// Peer's manifest fingerprint from its last presence (0 = unknown/not reported).
     manifest_fp: u64,
 }
+
+/// A member's last-known identity (see [`PeerRoster::remembered`]).
+#[derive(Default, Clone)]
+struct RememberedPeer {
+    name: String,
+    master: bool,
+    /// Unix secs of the last evidence this member was alive: heard directly, or
+    /// the timestamp of the doc member-record that named it.
+    last_seen: i64,
+    /// Unix secs this identity was last confirmed. Direct presence advances it
+    /// every beat, so a doc member-record (written in the past by a master) can
+    /// only fill identities we have *not* observed more recently ourselves.
+    updated: i64,
+}
+
+/// How much the persisted `last_seen` of a remembered member may lag its live
+/// value: steady-state presence refreshes it in memory every beat (~3s), and
+/// re-writing sqlite that often per member would be waste — a name/role change
+/// still flushes immediately.
+const REMEMBERED_LAST_SEEN_FLUSH_SECS: i64 = 300;
 
 impl PeerRoster {
     /// Record activity for a peer. `neighbor` distinguishes gossip membership
@@ -99,15 +131,102 @@ impl PeerRoster {
     }
 
     /// Fold a presence broadcast into the roster: refresh name/role/health and
-    /// mark the peer heard-from (online for the TTL).
+    /// mark the peer heard-from (online for the TTL). Also remembers the identity
+    /// (name/role) so the member list keeps naming this member after it
+    /// disconnects or we restart.
     pub(crate) fn note_presence(&mut self, id: &str, p: crate::presence::Presence) {
+        let now = now_secs();
+        let master = matches!(p.role, seed_ipc::Role::Master);
         let e = self.peers.entry(id.to_string()).or_default();
-        e.last_seen = now_secs();
-        e.name = Some(p.name);
+        e.last_seen = now;
+        e.name = Some(p.name.clone());
         e.role = Some(p.role);
         e.seqno = p.seqno;
         e.percent = p.percent;
         e.manifest_fp = p.manifest_fp;
+        let m = self.remembered.entry(id.to_string()).or_default();
+        if m.name != p.name
+            || m.master != master
+            || now - m.last_seen >= REMEMBERED_LAST_SEEN_FLUSH_SECS
+        {
+            self.dirty.insert(id.to_string());
+        }
+        m.name = p.name;
+        m.master = master;
+        m.last_seen = now;
+        m.updated = now;
+    }
+
+    /// Fold the doc's member registry (see [`read_member_records`]) into the
+    /// remembered identities. A record applies only if it is newer than our
+    /// current knowledge of that member (`updated`), so it can never override a
+    /// name we heard directly more recently — it fills in members we've never
+    /// heard (or heard before a rename we were offline for).
+    pub(crate) fn note_member_records(&mut self, recs: &[MemberIdentity]) {
+        for r in recs {
+            let m = self.remembered.entry(r.id.clone()).or_default();
+            if r.ts_secs > m.updated {
+                m.name = r.name.clone();
+                m.master = r.master;
+                m.updated = r.ts_secs;
+                m.last_seen = m.last_seen.max(r.ts_secs);
+                self.dirty.insert(r.id.clone());
+            }
+        }
+    }
+
+    /// Seed the remembered identities from the `peer_names` table (share open):
+    /// the member list names every known member immediately after a restart,
+    /// rendered offline until heard again. Not marked dirty — it just came from
+    /// the DB.
+    pub(crate) fn preload_remembered(&mut self, rows: Vec<crate::db::PeerNameRow>) {
+        for r in rows {
+            self.remembered.entry(r.node_id).or_insert(RememberedPeer {
+                name: r.name,
+                master: r.role_master,
+                last_seen: r.last_seen,
+                updated: r.updated,
+            });
+        }
+    }
+
+    /// Drain the identities changed since the last flush as ready-to-upsert
+    /// `peer_names` rows. Almost always empty.
+    pub(crate) fn drain_dirty_names(&mut self, share_id: &str) -> Vec<crate::db::PeerNameRow> {
+        let mut out = Vec::new();
+        for id in self.dirty.drain() {
+            let Some(m) = self.remembered.get(&id) else {
+                continue;
+            };
+            out.push(crate::db::PeerNameRow {
+                share_id: share_id.to_string(),
+                node_id: id,
+                name: m.name.clone(),
+                role_master: m.master,
+                last_seen: m.last_seen,
+                updated: m.updated,
+            });
+        }
+        out
+    }
+
+    /// Members currently online whose identity we know first-hand (heard via
+    /// presence this session): what a master publishes into the doc member
+    /// registry. Online-only, so a republished name is at most one presence TTL
+    /// stale — an offline member may have renamed itself elsewhere since we last
+    /// heard it, and a fresh doc timestamp on stale data would win LWW over a
+    /// better-informed master's record.
+    pub(crate) fn online_named_peers(&self) -> Vec<(String, String, bool)> {
+        let now = now_secs();
+        self.peers
+            .iter()
+            .filter(|(_, e)| self.is_online(e, now))
+            .filter_map(|(id, e)| {
+                let name = e.name.clone()?;
+                let master = matches!(e.role?, seed_ipc::Role::Master);
+                Some((id.clone(), name, master))
+            })
+            .collect()
     }
 
     fn is_online(&self, e: &PeerEntry, now: i64) -> bool {
@@ -154,6 +273,9 @@ impl PeerRoster {
             .collect()
     }
 
+    /// (online, total). Total is every member *known* — heard this session or
+    /// remembered from earlier ones — so a restart doesn't shrink "2 of 5" to
+    /// "2 of 2" until everyone happens to be heard again.
     fn counts(&self) -> (u32, u32) {
         let now = now_secs();
         let online = self
@@ -161,25 +283,62 @@ impl PeerRoster {
             .values()
             .filter(|e| self.is_online(e, now))
             .count() as u32;
-        (online, self.peers.len() as u32)
+        let remembered_only = self
+            .remembered
+            .keys()
+            .filter(|id| !self.peers.contains_key(*id))
+            .count();
+        (online, (self.peers.len() + remembered_only) as u32)
     }
 
     fn infos(&self) -> Vec<seed_ipc::PeerInfo> {
         let now = now_secs();
-        self.peers
+        let mut out: Vec<seed_ipc::PeerInfo> = self
+            .peers
             .iter()
-            .map(|(id, e)| seed_ipc::PeerInfo {
-                node_id: id.chars().take(16).collect(),
-                name: e.name.clone(),
-                role: e.role.unwrap_or(seed_ipc::Role::Viewer),
-                online: self.is_online(e, now),
-                last_seen: e.last_seen,
-                have_seqno: e.seqno,
-                percent: e.percent,
-                manifest_fp: e.manifest_fp,
-                unhealthy_secs: 0, // filled by Engine::peers from the health tracks
+            .map(|(id, e)| {
+                // A member heard this session but not (yet) via presence — e.g.
+                // discovered through doc-sync — still gets its last-known
+                // identity instead of degrading to a bare endpoint id.
+                let m = self.remembered.get(id);
+                seed_ipc::PeerInfo {
+                    node_id: id.chars().take(16).collect(),
+                    name: e
+                        .name
+                        .clone()
+                        .or_else(|| m.map(|m| m.name.clone()).filter(|n| !n.is_empty())),
+                    role: e
+                        .role
+                        .or_else(|| m.map(|m| role_from_master(m.master)))
+                        .unwrap_or(seed_ipc::Role::Viewer),
+                    online: self.is_online(e, now),
+                    last_seen: e.last_seen.max(m.map(|m| m.last_seen).unwrap_or(0)),
+                    have_seqno: e.seqno,
+                    percent: e.percent,
+                    manifest_fp: e.manifest_fp,
+                    unhealthy_secs: 0, // filled by Engine::peers from the health tracks
+                }
             })
-            .collect()
+            .collect();
+        // Members not heard at all this session (typically: since our restart)
+        // stay listed under their last-known identity, offline.
+        for (id, m) in &self.remembered {
+            if self.peers.contains_key(id) || m.name.is_empty() {
+                continue;
+            }
+            out.push(seed_ipc::PeerInfo {
+                node_id: id.chars().take(16).collect(),
+                name: Some(m.name.clone()),
+                role: role_from_master(m.master),
+                online: false,
+                last_seen: m.last_seen,
+                have_seqno: 0,
+                percent: 0,
+                manifest_fp: 0,
+                unhealthy_secs: 0,
+            });
+        }
+        out
     }
 
     /// Full-fidelity view for the health detector: unlike [`infos`](Self::infos)
@@ -235,6 +394,26 @@ const EMPTY_PREFIX: &[u8] = b"\x00e/";
 /// and republishes (clearing the tombstone); an older one is deleted. Old readers
 /// skip unknown control keys, so this is wire-compatible.
 const TOMBSTONE_PREFIX: &[u8] = b"\x00t/";
+/// Prefix for member-registry records: `\x00m/<CBOR MemberRecord>` with a
+/// non-empty marker value. The record (endpoint id + display name + role) is
+/// encoded **in the key** — entry *content* can't be relied on, because the
+/// engine disables iroh-docs' content auto-downloader per replica and nothing
+/// would fetch the value blob (see the `set_download_policy` note in
+/// `open_share`). Keys ride doc-sync metadata, so a member's last-known name
+/// reaches every peer that syncs the doc, even one that never heard the member's
+/// presence gossip. Masters write records (their own, plus members they hear
+/// live via presence — viewers hold a read-only capability and can't write their
+/// own), and only at the END of a reconcile pass whose replica has proven
+/// contact with share state — a write during a virgin replica's initial sync
+/// can churn the session and re-open the known-issues #12 delete-resurrection
+/// race (see [`ReconcileJob::publish_member_records`]). Every member reads
+/// them. Freshest entry timestamp per endpoint id wins;
+/// superseded keys (renames) are left behind and simply lose the timestamp
+/// comparison — a handful of ~100-byte keys per rename, never deleted (`del` is
+/// prefix deletion, known-issues #13, and another master's record can't be
+/// deleted anyway). Old readers skip unknown control keys, so this is
+/// wire-compatible.
+const MEMBER_PREFIX: &[u8] = b"\x00m/";
 
 /// Blobs at or above this size are fetched as a **swarm** — the chunk range is
 /// split across several providers and the parts streamed concurrently — provided
@@ -686,6 +865,101 @@ async fn read_ignore_list(doc: &Doc, blobs: &FsStore) -> anyhow::Result<Option<V
     Ok(Some(list))
 }
 
+/// Map a remembered `master` flag back to the IPC role enum.
+fn role_from_master(master: bool) -> seed_ipc::Role {
+    if master {
+        seed_ipc::Role::Master
+    } else {
+        seed_ipc::Role::Viewer
+    }
+}
+
+/// Current member-record format version, for forward-compat (readers skip keys
+/// they can't decode, so a future shape bump is wire-safe).
+const MEMBER_RECORD_V: u8 = 1;
+
+/// One member-registry record, CBOR-encoded into a `\x00m/` doc key (see
+/// [`MEMBER_PREFIX`] for why the key, not the value, carries the data).
+///
+/// Trust: like presence, a record's name/role is claimed, not proven — any
+/// master-key holder can write any member's record (the replica signs entries
+/// with the shared namespace key, not per-device). That matches the share trust
+/// model: masters are trusted with the folder's *content*, so trusting them
+/// with display names adds nothing new. File content stays verified.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct MemberRecord {
+    /// Format version.
+    v: u8,
+    /// The member's endpoint id (raw bytes).
+    id: [u8; 32],
+    /// The member's self-chosen display name, as last heard via presence.
+    name: String,
+    /// Whether the member holds a master key (writes) or is a viewer (mirrors).
+    master: bool,
+}
+
+/// Encode a member record into its doc key: `\x00m/` + CBOR. Equal records
+/// encode to equal keys, so republishing an unchanged identity is idempotent.
+fn member_record_key(rec: &MemberRecord) -> Vec<u8> {
+    let mut k = MEMBER_PREFIX.to_vec();
+    // A struct of scalars + String is infallible to serialize.
+    let _ = ciborium::into_writer(rec, &mut k);
+    k
+}
+
+/// Decode a `\x00m/` doc key back into a member record (`None`: not a member
+/// key, or a future format this version can't read).
+fn decode_member_record(key: &[u8]) -> Option<MemberRecord> {
+    let tail = key.strip_prefix(MEMBER_PREFIX)?;
+    ciborium::from_reader(tail).ok()
+}
+
+/// A member identity from the doc's member registry, resolved to the roster's
+/// key form: full endpoint-id string, display name, role, and the doc entry's
+/// timestamp (unix secs) — the freshest record per member.
+pub(crate) struct MemberIdentity {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) master: bool,
+    pub(crate) ts_secs: i64,
+}
+
+/// Read the doc's member registry: the freshest record per endpoint id.
+/// Superseded keys (old names) lose the timestamp comparison and are ignored.
+async fn read_member_records(doc: &Doc) -> anyhow::Result<Vec<MemberIdentity>> {
+    let mut best: HashMap<[u8; 32], (MemberRecord, u64)> = HashMap::new();
+    let mut s = std::pin::pin!(
+        doc.get_many(Query::single_latest_per_key().key_prefix(MEMBER_PREFIX))
+            .await?
+    );
+    while let Some(e) = s.next().await {
+        let e = e?;
+        let Some(rec) = decode_member_record(e.key()) else {
+            continue;
+        };
+        let ts = e.timestamp();
+        match best.get(&rec.id) {
+            Some((_, t)) if *t >= ts => {}
+            _ => {
+                best.insert(rec.id, (rec, ts));
+            }
+        }
+    }
+    Ok(best
+        .into_values()
+        .filter_map(|(rec, ts)| {
+            let id = EndpointId::from_bytes(&rec.id).ok()?;
+            Some(MemberIdentity {
+                id: id.to_string(),
+                name: rec.name,
+                master: rec.master,
+                // Doc record timestamps are wall-clock micros (the LWW clock).
+                ts_secs: (ts / 1_000_000) as i64,
+            })
+        })
+        .collect())
+}
+
 /// Local file mtime as micros since the Unix epoch (for LWW vs. a doc timestamp).
 fn mtime_micros(p: &Path) -> u64 {
     std::fs::metadata(p)
@@ -964,6 +1238,9 @@ pub struct ReconcileOutcome {
     /// This pass did a full hashing scan (forced or signature-triggered). Feeds the
     /// per-share scan counter used by tests/soaks to assert rescan policy.
     did_full_scan: bool,
+    /// The doc member registry as read this pass (self excluded), folded into the
+    /// roster's remembered identities by [`Engine::finish_reconcile`].
+    member_records: Vec<MemberIdentity>,
 }
 
 impl ReconcileOutcome {
@@ -989,6 +1266,9 @@ pub struct ReconcileJob {
     folder: PathBuf,
     is_master: bool,
     configured_ignore: Vec<String>,
+    /// This device's display name at job build, published into the doc member
+    /// registry (masters only) so peers keep a last-known name for us.
+    device_name: String,
     doc: Doc,
     blobs: FsStore,
     author: AuthorId,
@@ -1124,6 +1404,89 @@ impl ReconcileJob {
     /// Live content providers for this job — see [`live_providers_from`].
     fn live_providers(&self) -> (Vec<EndpointId>, usize, Option<EndpointId>) {
         live_providers_from(&self.roster, self.self_id, self.master_id)
+    }
+
+    /// Read the doc member registry (`\x00m/`, see [`MEMBER_PREFIX`]): the
+    /// freshest record per member, own record included (the publish diff needs
+    /// it; the roster fold-in filters it out). Best-effort: the registry is a
+    /// display aid, so trouble here must never fail the file reconcile (a
+    /// wedged doc actor will fail the manifest read right after anyway).
+    async fn read_member_registry(&self) -> Vec<MemberIdentity> {
+        match read_member_records(&self.doc).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!("member-registry read for {} failed: {e:#}", self.share_id);
+                Vec::new()
+            }
+        }
+    }
+
+    /// Publish what the member registry is missing (masters only): our own
+    /// identity, plus members we can hear live right now whose record is absent
+    /// or stale.
+    ///
+    /// MUST only run late in a pass whose replica has proven contact with the
+    /// share's state (see the `replica_seen` gate in [`run`]): a doc write
+    /// while our own *initial* doc-sync is still in flight can abort/restart
+    /// the session (`AbortReason::AlreadySyncing` churn), and a joining master
+    /// whose first merge then runs against a still-virgin replica republishes
+    /// its local copies as brand-new — with fresh LWW timestamps that
+    /// resurrect concurrent deletes fleet-wide (exactly the known-issues #12
+    /// race the tombstones exist to prevent; caught by
+    /// `multi_master::delete_survives_unseen_master_copy`).
+    ///
+    /// [`run`]: ReconcileJob::run
+    async fn publish_member_records(&self, registry: &[MemberIdentity]) {
+        if !self.is_master {
+            return;
+        }
+        let mut desired = vec![(
+            self.self_id.to_string(),
+            MemberRecord {
+                v: MEMBER_RECORD_V,
+                id: *self.self_id.as_bytes(),
+                name: self.device_name.clone(),
+                master: true,
+            },
+        )];
+        let heard = self
+            .roster
+            .lock()
+            .map(|r| r.online_named_peers())
+            .unwrap_or_default();
+        for (id_str, name, master) in heard {
+            let Ok(eid) = id_str.parse::<EndpointId>() else {
+                continue;
+            };
+            desired.push((
+                id_str,
+                MemberRecord {
+                    v: MEMBER_RECORD_V,
+                    id: *eid.as_bytes(),
+                    name,
+                    master,
+                },
+            ));
+        }
+        let have: HashMap<&str, (&str, bool)> = registry
+            .iter()
+            .map(|m| (m.id.as_str(), (m.name.as_str(), m.master)))
+            .collect();
+        for (id_str, rec) in desired {
+            // Only write when the registry disagrees with first-hand
+            // knowledge: rewriting an unchanged record would just bump its
+            // LWW timestamp (and doc churn) for nothing.
+            if have.get(id_str.as_str()) == Some(&(rec.name.as_str(), rec.master)) {
+                continue;
+            }
+            if let Err(e) = self
+                .doc
+                .set_bytes(self.author, member_record_key(&rec), vec![1u8])
+                .await
+            {
+                tracing::debug!("member-registry publish for {id_str} failed: {e:#}");
+            }
+        }
     }
 
     /// Bytes of `hash` already present on disk, including a partially-downloaded
@@ -1314,6 +1677,10 @@ impl ReconcileJob {
         )
         .await
         .map_err(|_| anyhow!("ignore-list doc read timed out after {DOC_READ_TIMEOUT_SECS}s"))??;
+        // Evidence of a non-virgin replica for the member-registry publish gate:
+        // an ignore entry can only exist if we've synced someone's state (or
+        // published our own on an earlier pass).
+        let replica_had_ignore = live_ignore.is_some();
         let effective_ignore = if self.is_master {
             if live_ignore.as_deref() != Some(self.configured_ignore.as_slice()) {
                 let mut cbor = Vec::new();
@@ -1329,6 +1696,21 @@ impl ReconcileJob {
             live_ignore.unwrap_or_else(|| self.configured_ignore.clone())
         };
         let (ignore_set, _bad) = IgnoreSet::compile(&effective_ignore);
+
+        // 1.5. Member registry (`\x00m/`): read the replicated last-known member
+        //      identities for the roster fold-in (any role). READ ONLY here —
+        //      publishing waits until the end of the pass, gated on the replica
+        //      having proven contact with share state (see `replica_seen`
+        //      below). Best-effort inside, but timeout-bounded like the other
+        //      doc reads so a wedged docs actor is caught by the phase
+        //      watchdog, not waited on forever.
+        self.set_phase("member registry (doc read)");
+        let member_records = tokio::time::timeout(
+            Duration::from_secs(DOC_READ_TIMEOUT_SECS),
+            self.read_member_registry(),
+        )
+        .await
+        .unwrap_or_default();
 
         // 2. Merged remote view (desired fileset + winning delete tombstones).
         self.set_phase("merge remote view (doc get_many stream)");
@@ -1738,6 +2120,34 @@ impl ReconcileJob {
         self.set_phase("finalize (settle signature)");
         let new_quick_sig = scan::quick_signature(&self.folder, &ignore_set, &skipped_set);
 
+        // Member-registry publish, LAST and gated: only once the replica has
+        // proven contact with the share's state (synced files, tombstones, an
+        // ignore entry, or existing member records). A virgin replica means our
+        // initial doc-sync may still be in flight, and a doc write can churn
+        // that session — see [`publish_member_records`] for the failure this
+        // prevents. Genesis costs one pass of delay: the creator's own ignore
+        // entry satisfies the gate from pass 2 on.
+        //
+        // [`publish_member_records`]: ReconcileJob::publish_member_records
+        let replica_seen = replica_had_ignore
+            || !remote.is_empty()
+            || !tombstones.is_empty()
+            || !member_records.is_empty();
+        if replica_seen {
+            self.set_phase("member registry (publish)");
+            let _ = tokio::time::timeout(
+                Duration::from_secs(DOC_READ_TIMEOUT_SECS),
+                self.publish_member_records(&member_records),
+            )
+            .await;
+        }
+
+        // The roster fold-in never includes our own record — `Engine::peers`
+        // synthesizes the "This device" row from the live device name.
+        let mut member_records = member_records;
+        let self_str = self.self_id.to_string();
+        member_records.retain(|m| m.id != self_str);
+
         Ok(ReconcileOutcome {
             changed,
             health,
@@ -1749,6 +2159,7 @@ impl ReconcileJob {
             manifest_fp: manifest_fingerprint(&remote),
             forced_scan: self.force_scan,
             did_full_scan: do_scan,
+            member_records,
         })
     }
 }
@@ -2203,6 +2614,17 @@ impl Engine {
         // Subscribe (keeps live sync alive + feeds the peer roster) and register
         // the namespace for serving + connect to any bootstrap peers.
         let roster = Arc::new(StdMutex::new(PeerRoster::default()));
+        // Seed the roster with the members remembered from earlier sessions, so
+        // the list names everyone (offline) right away instead of showing bare
+        // endpoint ids — or nothing — until each member is heard again.
+        match self.db.load_peer_names(&key.share_id_hex()) {
+            Ok(rows) => {
+                if let Ok(mut r) = roster.lock() {
+                    r.preload_remembered(rows);
+                }
+            }
+            Err(e) => tracing::debug!("load remembered peer names: {e:#}"),
+        }
         spawn_event_task(&doc, roster.clone()).await?;
 
         // Presence: a per-share gossip topic carrying each member's name + health.
@@ -2624,7 +3046,13 @@ impl Engine {
     /// Build this tick's presence broadcasts — one per share with a live presence
     /// channel. Call under the engine lock (cheap: clones the gossip sender +
     /// pre-encodes); send the results off-lock via [`PresenceBroadcast::send`].
+    ///
+    /// Piggybacked here (both hosts call this every ~3s, for every share
+    /// including paused ones): flush remembered-identity changes to the
+    /// `peer_names` table. Almost always a no-op; when not, a handful of tiny
+    /// WAL upserts.
     pub fn presence_broadcasts(&self) -> Vec<crate::presence::PresenceBroadcast> {
+        self.flush_peer_names();
         let name = self.device_name();
         let ts = now_secs();
         let mut out = Vec::new();
@@ -2655,6 +3083,23 @@ impl Engine {
             ));
         }
         out
+    }
+
+    /// Persist remembered-identity changes (see [`PeerRoster::drain_dirty_names`])
+    /// to the `peer_names` table, so last-known member names survive a daemon
+    /// restart. Change-driven: no dirty identities, no DB writes.
+    fn flush_peer_names(&self) {
+        for (share_id, s) in &self.shares {
+            let rows = match s.roster.lock() {
+                Ok(mut r) => r.drain_dirty_names(share_id),
+                Err(_) => continue,
+            };
+            for row in rows {
+                if let Err(e) = self.db.upsert_peer_name(&row) {
+                    tracing::debug!("persist peer name for {}: {e:#}", row.node_id);
+                }
+            }
+        }
     }
 
     /// Build this tick's gossip re-join requests — one per share whose presence
@@ -2972,6 +3417,7 @@ impl Engine {
         let downloads_inflight = self.downloads_inflight.clone();
         let author = self.author;
         let progress = self.progress.clone();
+        let device_name = self.device_name();
         let base = self.db.get_index(share_id).unwrap_or_default();
         let Some(state) = self.shares.get_mut(share_id) else {
             return Ok(None);
@@ -2991,6 +3437,7 @@ impl Engine {
             folder: state.folder.clone(),
             is_master,
             configured_ignore: state.ignore.clone(),
+            device_name,
             doc: state.doc.clone(),
             blobs,
             author,
@@ -3040,6 +3487,13 @@ impl Engine {
         state.publishing = false;
         state.health = out.health;
         state.skipped = out.skipped;
+        // Replicated last-known member identities read this pass → remembered
+        // names (persisted to `peer_names` on the next presence tick's flush).
+        if !out.member_records.is_empty() {
+            if let Ok(mut r) = state.roster.lock() {
+                r.note_member_records(&out.member_records);
+            }
+        }
         state.manifest_fp = out.manifest_fp;
         state.last_quick_sig = out.new_quick_sig;
         let _ = self.db.set_quick_sig(share_id, out.new_quick_sig);
@@ -3460,6 +3914,171 @@ mod tests {
             select_rejoin_targets(&mut rng, all.clone(), &heard),
             vec![all[27]]
         );
+    }
+
+    fn presence(name: &str, role: seed_ipc::Role) -> crate::presence::Presence {
+        crate::presence::Presence {
+            v: crate::presence::PRESENCE_V,
+            name: name.into(),
+            role,
+            seqno: 0,
+            percent: 100,
+            ts: 0,
+            from: None,
+            manifest_fp: 0,
+        }
+    }
+
+    #[test]
+    fn member_record_key_roundtrips() {
+        let rec = MemberRecord {
+            v: MEMBER_RECORD_V,
+            id: *eid(7).as_bytes(),
+            name: "Laptop".into(),
+            master: true,
+        };
+        let key = member_record_key(&rec);
+        assert!(key.starts_with(MEMBER_PREFIX));
+        assert_eq!(decode_member_record(&key), Some(rec.clone()));
+        // Identical identity → identical key, so republishing is idempotent.
+        assert_eq!(key, member_record_key(&rec));
+        // Non-member control keys and garbage tails are skipped, not errors.
+        assert_eq!(decode_member_record(b"\x00t/some/file"), None);
+        assert_eq!(decode_member_record(b"\x00m/not-cbor\xff"), None);
+    }
+
+    /// The core of the feature: a member's name survives its disconnect (entry
+    /// ages out but keeps the name), and — via the drain/preload cycle that the
+    /// `peer_names` table persists — a daemon restart, where it renders as a
+    /// named offline row instead of vanishing or degrading to an endpoint id.
+    #[test]
+    fn roster_remembers_identity_across_disconnect_and_restart() {
+        let id = eid(1).to_string();
+        let mut roster = PeerRoster::default();
+        roster.note_presence(&id, presence("Laptop", seed_ipc::Role::Master));
+        let infos = roster.infos();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].name.as_deref(), Some("Laptop"));
+        assert!(infos[0].online);
+
+        // Disconnect (NeighborDown force-ages the entry): offline, still named.
+        roster.note(&id, Some(false));
+        let infos = roster.infos();
+        assert!(!infos[0].online);
+        assert_eq!(infos[0].name.as_deref(), Some("Laptop"));
+
+        // "Restart": a fresh roster preloaded from the drained rows lists the
+        // member offline under its last-known identity, and counts it.
+        let rows = roster.drain_dirty_names("share1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "Laptop");
+        assert!(rows[0].role_master);
+        assert_eq!(rows[0].share_id, "share1");
+        // Drained means drained: nothing left to flush.
+        assert!(roster.drain_dirty_names("share1").is_empty());
+
+        let mut fresh = PeerRoster::default();
+        fresh.preload_remembered(rows);
+        let infos = fresh.infos();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].name.as_deref(), Some("Laptop"));
+        assert!(matches!(infos[0].role, seed_ipc::Role::Master));
+        assert!(!infos[0].online);
+        assert_eq!(fresh.counts(), (0, 1));
+        // Preloaded identities are not dirty (they just came from the DB).
+        assert!(fresh.drain_dirty_names("share1").is_empty());
+
+        // The member comes back online: the live entry takes over seamlessly
+        // (one row, not a duplicate).
+        fresh.note_presence(&id, presence("Laptop", seed_ipc::Role::Master));
+        let infos = fresh.infos();
+        assert_eq!(infos.len(), 1);
+        assert!(infos[0].online);
+        assert_eq!(fresh.counts(), (1, 1));
+    }
+
+    /// A peer discovered via doc-sync only (no presence heard yet — the
+    /// asymmetric-gossip case) must fall back to its remembered identity
+    /// instead of showing a bare endpoint id.
+    #[test]
+    fn doc_discovered_peer_falls_back_to_remembered_name() {
+        let id = eid(2).to_string();
+        let mut roster = PeerRoster::default();
+        roster.preload_remembered(vec![crate::db::PeerNameRow {
+            share_id: "s".into(),
+            node_id: id.clone(),
+            name: "NAS".into(),
+            role_master: false,
+            last_seen: 50,
+            updated: 50,
+        }]);
+        // Doc live event (InsertRemote): liveness without identity.
+        roster.note(&id, None);
+        let infos = roster.infos();
+        assert_eq!(infos.len(), 1);
+        assert!(infos[0].online);
+        assert_eq!(infos[0].name.as_deref(), Some("NAS"));
+        assert!(matches!(infos[0].role, seed_ipc::Role::Viewer));
+    }
+
+    /// Doc member-records fill identities we lack, but never override fresher
+    /// first-hand knowledge (presence advances `updated` every beat).
+    #[test]
+    fn member_records_fill_but_never_override_fresher_knowledge() {
+        let id = eid(3).to_string();
+        let mut roster = PeerRoster::default();
+
+        // Unknown member: the doc record names it.
+        roster.note_member_records(&[MemberIdentity {
+            id: id.clone(),
+            name: "Desktop".into(),
+            master: true,
+            ts_secs: 100,
+        }]);
+        let infos = roster.infos();
+        assert_eq!(infos[0].name.as_deref(), Some("Desktop"));
+        assert_eq!(infos[0].last_seen, 100);
+
+        // A record older than what we already applied is ignored.
+        roster.note_member_records(&[MemberIdentity {
+            id: id.clone(),
+            name: "Stale".into(),
+            master: false,
+            ts_secs: 90,
+        }]);
+        assert_eq!(roster.infos()[0].name.as_deref(), Some("Desktop"));
+
+        // Direct presence beats any doc record written before it...
+        roster.note_presence(&id, presence("Desktop (live)", seed_ipc::Role::Master));
+        roster.note_member_records(&[MemberIdentity {
+            id: id.clone(),
+            name: "Desktop".into(),
+            master: true,
+            ts_secs: now_secs() - 1,
+        }]);
+        assert_eq!(roster.infos()[0].name.as_deref(), Some("Desktop (live)"));
+
+        // ...and the live name also wins the display merge outright while the
+        // peer is in the session roster.
+        assert!(roster.infos()[0].online);
+    }
+
+    /// Masters publish only members they hear *online right now* — republishing
+    /// an offline member's name with a fresh LWW timestamp could beat a
+    /// better-informed master's record.
+    #[test]
+    fn online_named_peers_excludes_offline_and_nameless() {
+        let named = eid(4).to_string();
+        let aged = eid(5).to_string();
+        let nameless = eid(6).to_string();
+        let mut roster = PeerRoster::default();
+        roster.note_presence(&named, presence("A", seed_ipc::Role::Viewer));
+        roster.note_presence(&aged, presence("B", seed_ipc::Role::Viewer));
+        roster.note(&aged, Some(false)); // NeighborDown: force-aged offline
+        roster.note(&nameless, None); // doc-sync discovery, no identity
+        let out = roster.online_named_peers();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], (named, "A".to_string(), false));
     }
 
     fn re(hash: &[u8], size: u64) -> RemoteEntry {

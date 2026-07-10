@@ -18,6 +18,8 @@ why, and the fix or disposition.
 | 5 | LWW: local mtime vs doc record timestamp (publish-lag/skew sensitive) | design note, soak-evidenced |
 | 6 | master-side in-place corruption propagates (master = source of truth) | design note (a deep-verify WARN is cheap future work) |
 | 13 | iroh-docs `del` is prefix deletion (prefix-nested filenames collide) | design note (latent, rare, self-healing) |
+| 14 | replicated ignore-list *content* never reaches peers (silent local fallback) | **open** (found 2026-07-10 during member-registry work) |
+| 15 | doc writes during a virgin replica's initial sync churn the session (can re-open #12) | latent (member registry gated; ignore publish still exposed) |
 
 Three vendored crates carry the upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
 `vendor/iroh-docs` — see `[patch.crates-io]` in the workspace `Cargo.toml`).
@@ -525,3 +527,59 @@ multi-master share it means one corrupted master can overwrite good copies on th
 others (LWW decides). Inherent, not a clean bug — but worth at least a WARN when a
 deep-verify finds a content-hash change with an unchanged (size, mtime), so silent
 corruption isn't silently propagated.
+
+---
+
+## 14. Replicated ignore-list *content* never reaches peers (silent fallback)
+**Tier:** confirmed · **Severity:** low–medium (viewer may not honor a master's ignores)
+**Where:** `crates/seed-core/src/engine.rs` — `read_ignore_list` vs. the
+`set_download_policy(DownloadPolicy::NothingExcept(vec![]))` set in `open_share`
+
+**Issue:** the `\x00ignore` entry stores its CBOR list as blob *content*
+(`set_bytes`), but every replica disables iroh-docs' content auto-downloader
+(so file blobs can be fetched engine-driven, peers-first), and nothing else
+ever fetches the ignore blob. On a peer, the entry's metadata syncs but
+`blobs.has(hash)` stays false forever, so `read_ignore_list` returns `None`
+and the reconcile silently falls back to the locally-configured list. A viewer
+with local copies of paths a master ignores can therefore delete them (the
+mirror treats not-in-replica as deleted) instead of leaving them alone.
+
+**Why it survived:** the fallback is silent and the common case (no custom
+ignores, or ignores configured identically on both sides) behaves the same.
+
+**Disposition:** open. Found while designing the `\x00m/` member registry,
+which dodged the same trap by encoding its payload **in the doc key** (content
+is a 1-byte marker) — see `docs/member-registry.md`. Candidate fixes: ride the
+key the same way, have the reconcile `ensure_download` the ignore hash, or use
+a docs download policy of "everything under `\x00`".
+
+---
+
+## 15. Doc writes during a virgin replica's initial sync can churn the session (latent)
+**Tier:** confirmed mechanism, latent exposure · **Severity:** medium when hit (delete resurrection)
+**Where:** any `doc.set_bytes` early in a `ReconcileJob` pass on a just-joined
+share — today the master ignore-list publish (`run` step 1); the member
+registry had it and was fixed
+
+**Issue:** a local doc write while a share's *initial* doc-sync is still in
+flight can churn/restart the sync session (`AbortReason::AlreadySyncing`-style
+interplay). If a joining **master**'s first merge then runs against a
+still-virgin replica, it republishes its local copies as brand-new entries
+whose fresh LWW timestamps beat existing delete tombstones — the exact
+resurrection race #12's tombstones exist to prevent, now re-opened from the
+other side.
+
+**Evidence:** reproduced deterministically while building the member registry
+(2026-07-10): publishing a member record at step 1.5 of a joining co-master's
+first pass flipped `multi_master::delete_survives_unseen_master_copy` from
+~10s green to a reproducible 120s timeout (2/2 runs); disabling the write
+restored baseline (A/B on identical trees). Fixed for member records by
+publishing only at the END of a pass gated on the replica having proven
+contact with share state (`replica_seen` in `ReconcileJob::run`).
+
+**Remaining exposure:** a joining master whose *configured ignore list*
+differs from the replicated one publishes `\x00ignore` at step 1 of its first
+pass — same write-during-initial-sync window. Not observed in practice
+(configured lists usually match or are empty), inferred from the same
+mechanism, not separately reproduced. Candidate fix: gate the ignore publish
+on `replica_seen` the same way (one-pass delay, same as member records).

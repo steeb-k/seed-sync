@@ -85,6 +85,7 @@ Architecture / engine internals:
 - `iroh-1.0-api-notes.md` — verified iroh 1.0 stack API reference (versions + exact calls).
 - `distributed-downloads.md` — how blob *content* is fetched between peers; swarming large files.
 - `divergence-detection-plan.md` — cross-member divergence detection, self-heal, deep-verify (implemented).
+- `member-registry.md` — replicated last-known member names (`\x00m/` doc records + `peer_names` cache) so the member list survives disconnects/restarts (implemented).
 - `production-readiness-plan.md` — the active push: known-issues fixes, peer-health tracking + notifications, multi-master test suite + soaks. **Check here for current status.**
 - `usability-findings.md` — audit findings from the production-readiness push (non-engine-logic).
 - `known-issues.md` — open bugs & design caveats found by audit (not yet fixed). **Check here first when something's wrong.**
