@@ -1677,7 +1677,12 @@ where
 #[derive(Clone)]
 struct RelayUi {
     net: Net,
-    window: adw::ApplicationWindow,
+    /// The "Relay servers" dialog itself. Nested dialogs (Add relay) are made
+    /// transient for THIS, not the main window: on Linux the window manager
+    /// stacks a transient above its parent, so parenting the Add dialog to the
+    /// main window (a sibling of this dialog) let it open *behind* this one with
+    /// no way to reach it. Parenting to the dialog gives a proper parent chain.
+    dialog: adw::MessageDialog,
     list: gtk::ListBox,
     policy: gtk::DropDown,
     policy_box: gtk::Box,
@@ -1737,7 +1742,7 @@ fn show_relays_dialog(window: &adw::ApplicationWindow, net: &Net, settings: Rela
 
     let ui = RelayUi {
         net: net.clone(),
-        window: window.clone(),
+        dialog: dialog.clone(),
         list,
         policy,
         policy_box,
@@ -1902,7 +1907,7 @@ fn show_add_relay_dialog(ui: &RelayUi) {
     fields.append(&test_status);
 
     let dialog = adw::MessageDialog::builder()
-        .transient_for(&ui.window)
+        .transient_for(&ui.dialog)
         .heading("Add a relay server")
         .body(
             "The address of your own iroh relay. If it requires an access \
