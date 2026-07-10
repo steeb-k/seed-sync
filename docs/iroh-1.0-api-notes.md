@@ -50,6 +50,47 @@ remote peers, mDNS for same-segment ones. **Android caveat:** inbound multicast
 is dropped unless the app holds a `WifiManager.MulticastLock` (acquired in
 `EngineService`, needs the `CHANGE_WIFI_MULTICAST_STATE` permission).
 
+### Custom relays (verified 2026-07-10 against a live self-hosted relay)
+The `N0` preset supplies the public n0 relay map. A user's own relay (with an
+optional access token) replaces it via `RelayMode::Custom`; live map edits need
+no rebind. Lives in `crates/seed-core/src/relays.rs` + `node.rs`.
+```rust
+use iroh::{RelayConfig, RelayMap, RelayMode, RelayUrl};
+let url: RelayUrl = "https://relay.example.com:8443".parse()?;
+let mut cfg = RelayConfig::from(url);          // cfg.quic: Some(port 7842) by default
+cfg = cfg.with_auth_token(token);              // sent as `Authorization: Bearer <token>`
+                                               // on the relay handshake (native targets)
+let ep = Endpoint::builder(presets::N0)
+    .relay_mode(RelayMode::Custom(RelayMap::from_iter(configs)))  // replaces the defaults
+    .bind().await?;
+// Live edits (no rebind); insert before remove so the map is never empty:
+ep.insert_relay(url.clone(), std::sync::Arc::new(cfg)).await;
+ep.remove_relay(&url).await;
+ep.home_relay_status();                        // Watcher; .get() -> Vec<RelayStatus>
+                                               //   (s.is_connected(), s.url())
+iroh::endpoint::default_relay_mode().relay_map().relays()  // the public set
+                                               // (semver-exempt; re-verify on bumps)
+```
+- Token constraint: header-safe, i.e. non-empty printable ASCII without spaces
+  (we validate 0x21–0x7e up front).
+- A token-protected relay rejects token-less clients with "relay denied our
+  authentication"; the endpoint just never comes online through it.
+- The token gates **only the relay connection** (the WS path carrying relayed
+  traffic + hole-punch coordination). The relay's QUIC address-discovery
+  service (UDP 7842) and HTTPS latency endpoint are unauthenticated by design
+  (verified against iroh-relay 1.0.0 source + a live token-protected relay), so
+  token-less clients still get STUN-like public-address discovery. Net-report
+  `relay_latency` entries only appear for probes that got an answer — usable to
+  distinguish "server up, relay connection refused" from "server unreachable".
+- `builder.path_selector(Arc<dyn PathSelector>)` (feature
+  **`unstable-custom-transports`**) customizes path choice — installed once at
+  bind, can't be swapped later, so our `PreferMyRelaySelector` reads a shared
+  live set instead. Types under `iroh::endpoint::transports`:
+  `PathSelector`, `PathSelection(Context/Data)`, `FourTuple`.
+- Dev-only feature **`unstable-net-report`**: `ep.net_report()` Watcher; `Qad*`
+  entries in `report.relay_latency` prove the relay's QUIC address-discovery
+  (UDP 7842) works. Used by `examples/relay_probe.rs`.
+
 ## Router
 ```rust
 use iroh::protocol::Router;

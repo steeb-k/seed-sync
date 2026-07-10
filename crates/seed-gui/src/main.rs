@@ -28,7 +28,8 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 use seed_ipc::transport::{self, oneshot_request, read_frame, write_frame};
 use seed_ipc::{
-    Frame, IpcEvent, IpcRequest, IpcResponse, Message, PeerInfo, Role, ShareStatus, ShareSummary,
+    Frame, IpcEvent, IpcRequest, IpcResponse, Message, PeerInfo, PeerPath, RelayPolicy,
+    RelayServer, RelaySettings, Role, ShareStatus, ShareSummary,
 };
 use tokio::runtime::Handle;
 
@@ -53,6 +54,8 @@ enum UiMsg {
     },
     /// This device's current display name (from the daemon), cached in the GUI.
     DeviceName(String),
+    /// The daemon's custom relay configuration — opens the "Relay servers" dialog.
+    Relays(RelaySettings),
     Throughput {
         down: u64,
         up: u64,
@@ -627,11 +630,13 @@ fn build_ui(
     let pause_all_btn = flat_button("Pause all syncing");
     let setname_btn = flat_button("Set device name…");
     let nodeaddr_btn = flat_button("Show this device's address…");
+    let relays_btn = flat_button("Relay servers…");
     let quit_btn = flat_button("Quit");
     gear_box.append(&pause_all_btn);
     gear_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     gear_box.append(&setname_btn);
     gear_box.append(&nodeaddr_btn);
+    gear_box.append(&relays_btn);
     gear_box.append(&quit_btn);
     gear_popover.set_child(Some(&gear_box));
     gear_btn.set_popover(Some(&gear_popover));
@@ -834,6 +839,20 @@ fn build_ui(
         });
     }
     {
+        let net = net.clone();
+        let pop = gear_popover.clone();
+        // The dialog opens from the pump's `UiMsg::Relays` arm once the current
+        // settings arrive, so it always shows what the daemon actually has.
+        relays_btn.connect_clicked(move |_| {
+            pop.popdown();
+            net.send(IpcRequest::GetRelays, |res| match res {
+                Ok(IpcResponse::Relays(s)) => Some(UiMsg::Relays(s)),
+                Ok(IpcResponse::Err(e)) => Some(UiMsg::Toast(format!("relay settings: {e}"))),
+                _ => Some(UiMsg::Toast("could not load relay settings".into())),
+            });
+        });
+    }
+    {
         let toggle = toggle_pause_all.clone();
         let pop = gear_popover.clone();
         pause_all_btn.connect_clicked(move |_| {
@@ -956,6 +975,7 @@ fn build_ui(
                         }
                     }
                     UiMsg::DeviceName(name) => *device_name.borrow_mut() = name,
+                    UiMsg::Relays(settings) => show_relays_dialog(&window, &net, settings),
                     UiMsg::Throughput { down, up } => {
                         down_lbl.set_text(&format!("↓ {}", fmt_speed(down)));
                         up_lbl.set_text(&format!("↑ {}", fmt_speed(up)));
@@ -1629,6 +1649,326 @@ fn show_set_name_dialog(
     dialog.present();
 }
 
+/// Fire one IPC request and hand the response to `done` on the GTK main
+/// thread. For dialog-local results (test outcomes, saves) that must update
+/// the dialog's own widgets — the global pump can't reach those.
+fn oneshot_local<F>(net: &Net, req: IpcRequest, done: F)
+where
+    F: FnOnce(anyhow::Result<IpcResponse>) + 'static,
+{
+    let (tx, rx) = async_channel::bounded(1);
+    let socket = net.socket.clone();
+    net.handle.spawn(async move {
+        let res = oneshot_request(&socket, req)
+            .await
+            .map_err(anyhow::Error::from);
+        let _ = tx.send(res).await;
+    });
+    glib::spawn_future_local(async move {
+        if let Ok(res) = rx.recv().await {
+            done(res);
+        }
+    });
+}
+
+/// Everything the "Relay servers" dialog's handlers need, cheaply cloneable
+/// (GTK widgets are refcounted). Bundled so the rebuild/apply helpers can be
+/// plain functions instead of a web of nested closures.
+#[derive(Clone)]
+struct RelayUi {
+    net: Net,
+    window: adw::ApplicationWindow,
+    list: gtk::ListBox,
+    policy: gtk::DropDown,
+    policy_box: gtk::Box,
+    status: gtk::Label,
+    state: Rc<RefCell<RelaySettings>>,
+}
+
+/// Gear-menu dialog to manage this device's custom relay servers. Changes are
+/// applied immediately (validate → persist → live endpoint update in the
+/// daemon); the local `state` is only updated once the daemon accepts.
+fn show_relays_dialog(window: &adw::ApplicationWindow, net: &Net, settings: RelaySettings) {
+    let dialog = adw::MessageDialog::new(
+        Some(window),
+        Some("Relay servers"),
+        Some(
+            "Your own iroh relay servers. When configured, this device prefers \
+             them over the public relays for relayed traffic and NAT traversal. \
+             Relay settings are per-device: every member that should use a \
+             relay configures it on their own device.",
+        ),
+    );
+    dialog.add_response("close", "Close");
+    dialog.set_close_response("close");
+
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("boxed-list");
+    content.append(&list);
+
+    let add_btn = gtk::Button::with_label("Add relay server…");
+    content.append(&add_btn);
+
+    let policy_box = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    policy_box.append(
+        &gtk::Label::builder()
+            .label("If my relays are unreachable")
+            .halign(gtk::Align::Start)
+            .css_classes(["caption-heading"])
+            .build(),
+    );
+    let policy = gtk::DropDown::from_strings(&[
+        "Fall back to the public relays",
+        "Use only my relays (never fall back)",
+    ]);
+    policy_box.append(&policy);
+    content.append(&policy_box);
+
+    let status = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    content.append(&status);
+
+    dialog.set_extra_child(Some(&content));
+
+    let ui = RelayUi {
+        net: net.clone(),
+        window: window.clone(),
+        list,
+        policy,
+        policy_box,
+        status,
+        state: Rc::new(RefCell::new(settings)),
+    };
+    rebuild_relay_list(&ui);
+    {
+        let ui = ui.clone();
+        add_btn.connect_clicked(move |_| show_add_relay_dialog(&ui));
+    }
+    {
+        let ui = ui.clone();
+        ui.policy.clone().connect_selected_notify(move |p| {
+            let mode = if p.selected() == 1 {
+                RelayPolicy::Only
+            } else {
+                RelayPolicy::Preferred
+            };
+            // `rebuild_relay_list` re-selects the current mode, which also
+            // lands here; only a real change goes to the daemon.
+            if mode != ui.state.borrow().mode {
+                let mut next = ui.state.borrow().clone();
+                next.mode = mode;
+                apply_relay_settings(&ui, next);
+            }
+        });
+    }
+    dialog.present();
+}
+
+/// (Re)fill the relay list rows and sync the policy widgets from `ui.state`.
+fn rebuild_relay_list(ui: &RelayUi) {
+    while let Some(child) = ui.list.first_child() {
+        ui.list.remove(&child);
+    }
+    let settings = ui.state.borrow().clone();
+    if settings.servers.is_empty() {
+        let row = adw::ActionRow::builder()
+            .title("No custom relays — using the public iroh relays")
+            .build();
+        row.set_use_markup(false);
+        row.add_css_class("dim-label");
+        ui.list.append(&row);
+    }
+    for server in &settings.servers {
+        let row = adw::ActionRow::builder()
+            .title(&server.url)
+            .subtitle(if server.token.is_some() {
+                "Access token set"
+            } else {
+                "No access token"
+            })
+            .build();
+        row.set_use_markup(false);
+
+        let test = gtk::Button::builder()
+            .icon_name("network-transmit-receive-symbolic")
+            .tooltip_text("Test connection")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .build();
+        {
+            let ui = ui.clone();
+            let server = server.clone();
+            test.connect_clicked(move |_| test_relay(&ui, &server));
+        }
+        row.add_suffix(&test);
+
+        let remove = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .tooltip_text("Remove this relay")
+            .css_classes(["flat"])
+            .valign(gtk::Align::Center)
+            .build();
+        {
+            let ui = ui.clone();
+            let url = server.url.clone();
+            remove.connect_clicked(move |_| {
+                let mut next = ui.state.borrow().clone();
+                next.servers.retain(|r| r.url != url);
+                apply_relay_settings(&ui, next);
+            });
+        }
+        row.add_suffix(&remove);
+        ui.list.append(&row);
+    }
+    // Policy only matters once a custom relay exists.
+    ui.policy_box.set_visible(!settings.servers.is_empty());
+    ui.policy.set_selected(match settings.mode {
+        RelayPolicy::Preferred => 0,
+        RelayPolicy::Only => 1,
+    });
+}
+
+/// Send the new settings to the daemon; only a daemon "Ok" commits them to the
+/// dialog's local state (a rejected URL/token leaves the shown list untouched).
+fn apply_relay_settings(ui: &RelayUi, next: RelaySettings) {
+    ui.status.set_text("Applying…");
+    let ui = ui.clone();
+    oneshot_local(
+        &ui.net.clone(),
+        IpcRequest::SetRelays {
+            settings: next.clone(),
+        },
+        move |res| match res {
+            Ok(IpcResponse::Ok) => {
+                *ui.state.borrow_mut() = next;
+                rebuild_relay_list(&ui);
+                ui.status.set_text("Relay settings applied.");
+            }
+            Ok(IpcResponse::Err(e)) => ui.status.set_text(&format!("Not applied: {e}")),
+            _ => ui
+                .status
+                .set_text("Not applied: the daemon could not be reached."),
+        },
+    );
+}
+
+/// Probe one configured relay and report into the dialog's status line.
+fn test_relay(ui: &RelayUi, server: &RelayServer) {
+    ui.status.set_text(&format!("Testing {}…", server.url));
+    let status = ui.status.clone();
+    let url = server.url.clone();
+    oneshot_local(
+        &ui.net,
+        IpcRequest::TestRelay {
+            url: server.url.clone(),
+            token: server.token.clone(),
+        },
+        move |res| match res {
+            Ok(IpcResponse::RelayTest { ok, detail }) => {
+                status.set_text(&format!("{} {url}: {detail}", if ok { "✓" } else { "✗" }));
+            }
+            Ok(IpcResponse::Err(e)) => status.set_text(&format!("✗ {url}: {e}")),
+            _ => status.set_text("✗ the daemon could not be reached."),
+        },
+    );
+}
+
+/// Dialog collecting a relay URL + optional access token, with its own
+/// pre-save "Test connection" probe. Adding replaces any entry with the same URL.
+fn show_add_relay_dialog(ui: &RelayUi) {
+    let fields = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let url = gtk::Entry::builder()
+        .placeholder_text("https://relay.example.com:8443")
+        .activates_default(true)
+        .build();
+    let token = gtk::Entry::builder()
+        .placeholder_text("Access token (optional)")
+        .activates_default(true)
+        .build();
+    let test = gtk::Button::with_label("Test connection");
+    let test_status = gtk::Label::builder()
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .css_classes(["caption", "dim-label"])
+        .build();
+    fields.append(&url);
+    fields.append(&token);
+    fields.append(&test);
+    fields.append(&test_status);
+
+    let dialog = adw::MessageDialog::builder()
+        .transient_for(&ui.window)
+        .heading("Add a relay server")
+        .body(
+            "The address of your own iroh relay. If it requires an access \
+             token, paste it below.",
+        )
+        .extra_child(&fields)
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("add", "Add");
+    dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("add"));
+    dialog.set_close_response("cancel");
+
+    {
+        let net = ui.net.clone();
+        let url = url.clone();
+        let token = token.clone();
+        let test_status = test_status.clone();
+        test.connect_clicked(move |_| {
+            let u = url.text().trim().to_string();
+            if u.is_empty() {
+                test_status.set_text("Enter a relay URL first.");
+                return;
+            }
+            let t = token.text().trim().to_string();
+            test_status.set_text("Testing…");
+            let test_status = test_status.clone();
+            oneshot_local(
+                &net,
+                IpcRequest::TestRelay {
+                    url: u,
+                    token: if t.is_empty() { None } else { Some(t) },
+                },
+                move |res| match res {
+                    Ok(IpcResponse::RelayTest { ok, detail }) => {
+                        test_status.set_text(&format!("{} {detail}", if ok { "✓" } else { "✗" }));
+                    }
+                    Ok(IpcResponse::Err(e)) => test_status.set_text(&format!("✗ {e}")),
+                    _ => test_status.set_text("✗ the daemon could not be reached."),
+                },
+            );
+        });
+    }
+    {
+        let ui = ui.clone();
+        dialog.connect_response(None, move |_, resp| {
+            if resp != "add" {
+                return;
+            }
+            let u = url.text().trim().to_string();
+            if u.is_empty() {
+                return;
+            }
+            let t = token.text().trim().to_string();
+            let mut next = ui.state.borrow().clone();
+            next.servers.retain(|r| r.url != u);
+            next.servers.push(RelayServer {
+                url: u,
+                token: if t.is_empty() { None } else { Some(t) },
+            });
+            apply_relay_settings(&ui, next);
+        });
+    }
+    dialog.present();
+}
+
 /// Dialog to review the folder + edit ignore patterns, then create the share.
 fn show_create_dialog(
     window: &adw::ApplicationWindow,
@@ -2144,9 +2484,27 @@ fn update_peers_panel(list: &gtk::ListBox, peers: &[PeerInfo]) {
         let name_lbl = gtk::Label::builder()
             .label(&label_text)
             .halign(gtk::Align::Start)
-            .hexpand(true)
             .ellipsize(gtk::pango::EllipsizeMode::End)
             .build();
+        // Name plus, when known, how we reach this member (direct vs relay)
+        // on a smaller second line.
+        let name_col = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        name_col.set_hexpand(true);
+        name_col.set_valign(gtk::Align::Center);
+        name_col.append(&name_lbl);
+        if let Some(path) = &p.path {
+            let path_text = match path {
+                PeerPath::Direct => "Direct connection".to_string(),
+                PeerPath::Relay(host) => format!("Via relay ({host})"),
+            };
+            let path_lbl = gtk::Label::builder()
+                .label(&path_text)
+                .halign(gtk::Align::Start)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
+                .css_classes(["caption", "dim-label"])
+                .build();
+            name_col.append(&path_lbl);
+        }
 
         let role = gtk::Label::builder()
             .label(role_str(p.role))
@@ -2174,7 +2532,7 @@ fn update_peers_panel(list: &gtk::ListBox, peers: &[PeerInfo]) {
         actions.set_halign(gtk::Align::End);
 
         row.append(&dot);
-        row.append(&name_lbl);
+        row.append(&name_col);
         if let Some(u) = &unhealthy {
             row.append(u);
         }

@@ -28,6 +28,9 @@
 /signing-example/
 /artifact-signing-metadata.json
 
+# Claude Code local state (agent worktrees, session settings)
+/.claude/
+
 # Editor / OS
 .idea/
 .vscode/
