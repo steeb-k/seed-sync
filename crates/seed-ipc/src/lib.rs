@@ -104,8 +104,19 @@ pub enum IpcRequest {
     },
     /// Upgrade this connection to also receive server-pushed [`IpcEvent`]s.
     Subscribe,
-    GetSettings,
-    SetSettings(Settings),
+    /// This device's custom relay configuration (empty = iroh defaults).
+    GetRelays,
+    /// Replace the custom relay configuration. The daemon validates, persists,
+    /// and applies it to the live endpoint (no restart needed).
+    SetRelays {
+        settings: RelaySettings,
+    },
+    /// Probe a relay server (URL + optional access token) by connecting to it
+    /// from a throwaway endpoint. Does not touch the saved settings.
+    TestRelay {
+        url: String,
+        token: Option<String>,
+    },
     /// Open long-term-health episodes for a share's members (poll counterpart
     /// of [`IpcEvent::PeerHealth`], for the CLI / soak / GUI detail views).
     GetPeerHealth {
@@ -131,7 +142,13 @@ pub enum IpcResponse {
     Peers(Vec<PeerInfo>),
     PeerHealth(Vec<PeerHealthInfo>),
     DeviceName(String),
-    Settings(Settings),
+    Relays(RelaySettings),
+    /// Result of [`IpcRequest::TestRelay`]: whether the probe endpoint came
+    /// online through the relay, plus a human-readable detail line.
+    RelayTest {
+        ok: bool,
+        detail: String,
+    },
     NodeAddr(String),
     Ok,
     Err(String),
@@ -230,6 +247,16 @@ pub struct ShareSummary {
     pub retrying: u32,
 }
 
+/// How this device currently reaches a member, snapshotted from the iroh
+/// endpoint's active transport addresses when the peer list is served.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PeerPath {
+    /// An active peer-to-peer path (hole-punched or same-LAN) carries traffic.
+    Direct,
+    /// Traffic is relayed via the given relay host.
+    Relay(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     /// Short form of the iroh node id.
@@ -254,22 +281,46 @@ pub struct PeerInfo {
     /// gaps (pause-not-reset); drives the "unhealthy 12h+" notifications.
     #[serde(default)]
     pub unhealthy_secs: i64,
+    /// How this device reaches the member right now; `None` when unknown
+    /// (offline, this device itself, or no recent iroh connection).
+    #[serde(default)]
+    pub path: Option<PeerPath>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Settings {
-    /// Use iroh default relays + optional self-hosted relay URL for NAT fallback.
-    pub use_relays: bool,
-    pub custom_relay_url: Option<String>,
+/// One user-configured custom relay server (a self-hosted iroh relay).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayServer {
+    /// `https://host[:port]` of the relay.
+    pub url: String,
+    /// Optional access token, sent as `Authorization: Bearer <token>` when
+    /// connecting. Stored locally on this device only.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            use_relays: true,
-            custom_relay_url: None,
-        }
-    }
+/// How custom relays combine with the public iroh relays.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayPolicy {
+    /// Use the custom relays; fall back to the public relays only while none
+    /// of the custom ones is reachable.
+    #[default]
+    Preferred,
+    /// Use the custom relays exclusively — never contact the public relays.
+    Only,
+}
+
+/// This device's custom relay configuration. Empty `servers` = iroh defaults.
+///
+/// Per-device and deliberately NOT synced between share members: a relay with
+/// a token rejects clients that don't have it, so every member that should use
+/// the relay configures it locally.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelaySettings {
+    #[serde(default)]
+    pub servers: Vec<RelayServer>,
+    #[serde(default)]
+    pub mode: RelayPolicy,
 }
 
 /// Errors at the framing/codec layer.
@@ -311,6 +362,28 @@ mod tests {
         let back = decode(&bytes).unwrap();
         assert_eq!(back.id, 7);
         matches!(back.body, Message::Request(IpcRequest::AddShare { .. }));
+    }
+
+    #[test]
+    fn roundtrip_relays() {
+        let settings = RelaySettings {
+            servers: vec![RelayServer {
+                url: "https://relay.example.com:8443".into(),
+                token: Some("s3cret".into()),
+            }],
+            mode: RelayPolicy::Only,
+        };
+        let frame = Frame {
+            id: 11,
+            body: Message::Request(IpcRequest::SetRelays {
+                settings: settings.clone(),
+            }),
+        };
+        let back = decode(&encode(&frame).unwrap()).unwrap();
+        match back.body {
+            Message::Request(IpcRequest::SetRelays { settings: s }) => assert_eq!(s, settings),
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

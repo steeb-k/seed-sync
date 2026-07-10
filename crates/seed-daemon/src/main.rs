@@ -683,10 +683,34 @@ async fn handle_request(daemon: &Daemon, req: IpcRequest) -> anyhow::Result<IpcR
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
             IpcResponse::Ok
         }
-        IpcRequest::SetSettings(_) => IpcResponse::Ok,
+        IpcRequest::GetRelays => {
+            let engine = daemon.engine.lock().await;
+            IpcResponse::Relays(engine.relay_settings())
+        }
+        IpcRequest::SetRelays { settings } => {
+            let engine = daemon.engine.lock().await;
+            engine.set_relay_settings(settings).await?;
+            IpcResponse::Ok
+        }
+        IpcRequest::TestRelay { url, token } => {
+            // Binds its own throwaway endpoint — no engine lock, so a slow
+            // probe never stalls the reconcile loop or other requests.
+            let outcome = seed_core::relays::probe_relay(
+                &url,
+                token.as_deref(),
+                std::time::Duration::from_secs(12),
+            )
+            .await;
+            IpcResponse::RelayTest {
+                ok: outcome.ok,
+                detail: outcome.detail,
+            }
+        }
         IpcRequest::GetPeers { share_id } => {
             let engine = daemon.engine.lock().await;
-            IpcResponse::Peers(engine.peers(&share_id)?)
+            let mut peers = engine.peers(&share_id)?;
+            engine.annotate_peer_paths(&share_id, &mut peers).await;
+            IpcResponse::Peers(peers)
         }
         IpcRequest::GetPeerHealth { share_id } => {
             let engine = daemon.engine.lock().await;
@@ -709,7 +733,6 @@ async fn handle_request(daemon: &Daemon, req: IpcRequest) -> anyhow::Result<IpcR
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
             IpcResponse::Ok
         }
-        IpcRequest::GetSettings => IpcResponse::Settings(seed_ipc::Settings::default()),
         IpcRequest::Subscribe => IpcResponse::Ok, // handled before dispatch
     })
 }

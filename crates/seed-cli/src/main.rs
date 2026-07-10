@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use seed_ipc::transport::{self, read_frame, write_frame};
-use seed_ipc::{Frame, IpcRequest, IpcResponse, Message};
+use seed_ipc::{Frame, IpcRequest, IpcResponse, Message, RelayPolicy, RelayServer};
 
 #[derive(Parser)]
 #[command(name = "seed-cli", version, about)]
@@ -70,6 +70,34 @@ enum Command {
         #[arg(long)]
         name: String,
     },
+    /// Show this device's custom relay servers.
+    Relays,
+    /// Add (or replace, by URL) a custom relay server. Applies live.
+    RelayAdd {
+        #[arg(long)]
+        url: String,
+        /// Access token, sent as `Authorization: Bearer <token>`.
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Remove a custom relay server by URL. Applies live.
+    RelayRemove {
+        #[arg(long)]
+        url: String,
+    },
+    /// Set the fallback policy: `preferred` (fall back to the public relays
+    /// while no custom relay is reachable) or `only` (never fall back).
+    RelayMode {
+        #[arg(long)]
+        mode: String,
+    },
+    /// Probe a relay server from the daemon (does not touch saved settings).
+    RelayTest {
+        #[arg(long)]
+        url: String,
+        #[arg(long)]
+        token: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -98,11 +126,43 @@ async fn main() -> anyhow::Result<()> {
         Command::PeerHealth { share } => IpcRequest::GetPeerHealth { share_id: share },
         Command::DeviceName => IpcRequest::GetDeviceName,
         Command::SetName { name } => IpcRequest::SetDeviceName { name },
+        Command::Relays => IpcRequest::GetRelays,
+        Command::RelayTest { url, token } => IpcRequest::TestRelay { url, token },
+        // The add/remove/mode edits are read-modify-write on the full settings.
+        Command::RelayAdd { url, token } => {
+            let mut settings = fetch_relays(&cli.socket).await?;
+            settings.servers.retain(|r| r.url != url);
+            settings.servers.push(RelayServer { url, token });
+            IpcRequest::SetRelays { settings }
+        }
+        Command::RelayRemove { url } => {
+            let mut settings = fetch_relays(&cli.socket).await?;
+            settings.servers.retain(|r| r.url != url);
+            IpcRequest::SetRelays { settings }
+        }
+        Command::RelayMode { mode } => {
+            let mut settings = fetch_relays(&cli.socket).await?;
+            settings.mode = match mode.as_str() {
+                "preferred" => RelayPolicy::Preferred,
+                "only" => RelayPolicy::Only,
+                other => anyhow::bail!("mode must be 'preferred' or 'only', got {other:?}"),
+            };
+            IpcRequest::SetRelays { settings }
+        }
     };
 
     let resp = request(&cli.socket, req).await?;
     print_response(&resp);
     Ok(())
+}
+
+/// Fetch the current relay settings (for the read-modify-write subcommands).
+async fn fetch_relays(socket: &std::path::Path) -> anyhow::Result<seed_ipc::RelaySettings> {
+    match request(socket, IpcRequest::GetRelays).await? {
+        IpcResponse::Relays(s) => Ok(s),
+        IpcResponse::Err(e) => anyhow::bail!("get relays: {e}"),
+        other => anyhow::bail!("unexpected response: {other:?}"),
+    }
 }
 
 /// Send one request and wait for its correlated response.
@@ -175,14 +235,20 @@ fn print_response(resp: &IpcResponse) {
                 println!("(no peers)");
             }
             for p in peers {
+                let path = match &p.path {
+                    Some(seed_ipc::PeerPath::Direct) => "  path=direct".to_string(),
+                    Some(seed_ipc::PeerPath::Relay(host)) => format!("  path=relay({host})"),
+                    None => String::new(),
+                };
                 println!(
-                    "{}  name={}  {:?}  online={}  seqno={}  {}%",
+                    "{}  name={}  {:?}  online={}  seqno={}  {}%{}",
                     p.node_id,
                     p.name.as_deref().unwrap_or("-"),
                     p.role,
                     p.online,
                     p.have_seqno,
-                    p.percent
+                    p.percent,
+                    path
                 );
             }
         }
@@ -207,11 +273,31 @@ fn print_response(resp: &IpcResponse) {
             }
         }
         IpcResponse::DeviceName(n) => println!("{n}"),
+        IpcResponse::Relays(s) => {
+            if s.servers.is_empty() {
+                println!("(no custom relays — using the public iroh relays)");
+            }
+            for r in &s.servers {
+                println!(
+                    "{}  token={}",
+                    r.url,
+                    if r.token.is_some() { "set" } else { "-" }
+                );
+            }
+            if !s.servers.is_empty() {
+                println!("mode: {:?}", s.mode);
+            }
+        }
+        IpcResponse::RelayTest { ok, detail } => {
+            println!("{}: {detail}", if *ok { "ok" } else { "failed" });
+            if !ok {
+                std::process::exit(1);
+            }
+        }
         IpcResponse::Ok => println!("ok"),
         IpcResponse::Err(e) => {
             eprintln!("error: {e}");
             std::process::exit(1);
         }
-        other => println!("{other:?}"),
     }
 }

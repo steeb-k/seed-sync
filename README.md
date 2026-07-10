@@ -97,6 +97,23 @@ Sources are in `android/`; see `android-app.md` for the design and
   last-writer-wins, so one of the two concurrent edits is dropped. Conflict-copy
   preservation (à la Syncthing) is planned future work.
 
+## Custom relay servers
+
+By default, peers that can't hole-punch a direct connection fall back to the
+public [number 0](https://iroh.computer) relays. You can point SEED Sync at
+your **own iroh relay** instead: settings gear → *Relay servers…* (or
+`seed-cli relay-add --url https://relay.example.com:8443 [--token …]`). Each
+relay takes an optional access token, sent as `Authorization: Bearer` when
+connecting; a *Test connection* button probes the relay before you save. The
+token gates only the relay *connection* (relayed traffic + hole-punch
+coordination) — the relay's public-address discovery service stays open to
+token-less peers, so direct connections may keep working even when the token
+is missing or wrong; the test result spells out which case you're in.
+Choose whether to fall back to the public relays while your relays are
+unreachable, or to use your relays exclusively. Changes apply live — no daemon
+restart. Relay settings are per-device and are not shared with other members:
+every device that should use your relay configures it (and the token) itself.
+
 ## License
 
 GPL-3.0-or-later.

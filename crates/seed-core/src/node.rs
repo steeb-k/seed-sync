@@ -6,6 +6,7 @@
 //! stores are filesystem-backed so synced content survives restarts.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use iroh::{protocol::Router, Endpoint, SecretKey};
@@ -29,6 +30,10 @@ pub struct IrohNode {
     pub blobs_dir: PathBuf,
     pub gossip: Gossip,
     pub docs: Docs,
+    /// Live handle to the relay URLs the path selector prefers (the user's own
+    /// relays). Updated by [`Engine::set_relay_settings`](crate::Engine::set_relay_settings)
+    /// — the selector itself can't be swapped after bind.
+    pub preferred_relays: crate::relays::PreferredRelays,
     router: Router,
 }
 
@@ -36,7 +41,7 @@ impl IrohNode {
     /// Bootstrap the node, creating the data dir layout if needed:
     /// `node.key`, `blobs/`, `docs.redb`. The blob store lives under `data_dir`.
     pub async fn spawn(data_dir: &Path) -> anyhow::Result<Self> {
-        Self::spawn_with_blobs(data_dir, &data_dir.join("blobs")).await
+        Self::spawn_with_blobs(data_dir, &data_dir.join("blobs"), &Default::default()).await
     }
 
     /// Like [`spawn`](Self::spawn) but with the blob store rooted at an explicit
@@ -44,7 +49,11 @@ impl IrohNode {
     /// while placing `blobs/` on the same shared-storage volume as the synced
     /// folders, so the engine's zero-copy reference export (rename/hardlink)
     /// stays on one volume and never falls back to a full copy.
-    pub async fn spawn_with_blobs(data_dir: &Path, blobs_dir: &Path) -> anyhow::Result<Self> {
+    pub async fn spawn_with_blobs(
+        data_dir: &Path,
+        blobs_dir: &Path,
+        relay_settings: &crate::relays::RelaySettings,
+    ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("create data dir {}", data_dir.display()))?;
 
@@ -61,6 +70,21 @@ impl IrohNode {
         // usable IPv4/IPv6 (or where multicast is unavailable) — degrade to "no
         // LAN discovery" with a warning rather than failing endpoint startup.
         let mut builder = Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key);
+
+        // Custom relay servers (see `crate::relays`). The path selector is
+        // installed unconditionally — with no preferred relays it behaves like
+        // iroh's default — because it can't be swapped after bind, while the
+        // preferred set and the relay map can both change at runtime.
+        let preferred_relays = crate::relays::PreferredRelays::default();
+        builder = builder.path_selector(Arc::new(crate::relays::PreferMyRelaySelector::new(
+            preferred_relays.clone(),
+        )));
+        if let Some(mode) = crate::relays::relay_mode(relay_settings) {
+            if let Ok(urls) = crate::relays::relay_urls(relay_settings) {
+                preferred_relays.set(urls.into_iter().collect());
+            }
+            builder = builder.relay_mode(mode);
+        }
         match iroh_mdns_address_lookup::MdnsAddressLookup::builder().build(endpoint_id) {
             Ok(mdns) => builder = builder.address_lookup(mdns),
             Err(e) => tracing::warn!("local-network (mDNS) discovery unavailable: {e}"),
@@ -95,6 +119,7 @@ impl IrohNode {
             blobs_dir,
             gossip,
             docs,
+            preferred_relays,
             router,
         })
     }

@@ -14,8 +14,9 @@
 //! propagate and a viewer's own edits are reverted — strict, hard-overwrite
 //! mirror).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -178,6 +179,7 @@ impl PeerRoster {
                 percent: e.percent,
                 manifest_fp: e.manifest_fp,
                 unhealthy_secs: 0, // filled by Engine::peers from the health tracks
+                path: None,        // filled by Engine::annotate_peer_paths
             })
             .collect()
     }
@@ -1914,6 +1916,15 @@ pub struct Engine {
     /// Open degraded-member episodes, mirroring the `peer_health` table. Keyed
     /// `(share_id, full node id)`, `""` = this device. See [`crate::health`].
     health_tracks: crate::health::Tracks,
+    /// This device's custom relay settings, cached from
+    /// `settings["relay_settings"]` and shared with the fallback watchdog task.
+    relay_settings: Arc<StdMutex<crate::relays::RelaySettings>>,
+    /// Whether the watchdog has added the public relays to the live map because
+    /// no custom relay was reachable (see [`crate::relays::relay_watchdog`]).
+    relay_fallback: Arc<AtomicBool>,
+    /// The watchdog task, aborted on [`Engine::shutdown`] so tests that build
+    /// many engines don't accumulate tickers.
+    relay_watchdog: tokio::task::AbortHandle,
 }
 
 /// A deferred kick of one share's doc live-sync, built under the engine lock (cheap:
@@ -1968,9 +1979,23 @@ impl Engine {
     /// stays under `data_dir`). Used on Android to co-locate `blobs/` with the
     /// synced folders on shared storage; see [`IrohNode::spawn_with_blobs`].
     pub async fn new_with_blobs(data_dir: &Path, blobs_dir: &Path) -> anyhow::Result<Self> {
-        let node = IrohNode::spawn_with_blobs(data_dir, blobs_dir).await?;
-        let author = node.docs_api().author_default().await?;
+        // The relay settings live in state.db and feed endpoint construction,
+        // so the DB opens before the node spawns (creating the data dir, which
+        // the node used to do).
+        std::fs::create_dir_all(data_dir)
+            .with_context(|| format!("create data dir {}", data_dir.display()))?;
         let db = crate::db::Db::open(&data_dir.join("state.db"))?;
+        let relay_settings = crate::relays::load_relay_settings(&db);
+        let node = IrohNode::spawn_with_blobs(data_dir, blobs_dir, &relay_settings).await?;
+        let author = node.docs_api().author_default().await?;
+        let relay_settings = Arc::new(StdMutex::new(relay_settings));
+        let relay_fallback = Arc::new(AtomicBool::new(false));
+        let relay_watchdog = tokio::spawn(crate::relays::relay_watchdog(
+            node.endpoint.clone(),
+            relay_settings.clone(),
+            relay_fallback.clone(),
+        ))
+        .abort_handle();
         let device_name = db
             .get_setting("device_name")?
             .filter(|s| !s.trim().is_empty())
@@ -1990,6 +2015,9 @@ impl Engine {
             sync_suspended: StdMutex::new(false),
             health_policy: crate::health::HealthPolicy::from_env(),
             health_tracks,
+            relay_settings,
+            relay_fallback,
+            relay_watchdog,
         };
         engine.reload_shares().await?;
         Ok(engine)
@@ -2017,6 +2045,73 @@ impl Engine {
             *n = resolved.clone();
         }
         Ok(resolved)
+    }
+
+    /// This device's custom relay configuration (empty = iroh defaults).
+    pub fn relay_settings(&self) -> crate::relays::RelaySettings {
+        self.relay_settings
+            .lock()
+            .expect("relay settings poisoned")
+            .clone()
+    }
+
+    /// Replace the custom relay configuration, persist it, and apply it to the
+    /// **live** endpoint: the relay map is diffed in place and the path
+    /// selector's preferred set updated, so no daemon restart is needed. The
+    /// endpoint re-picks its home relay from the new map within a net-report
+    /// cycle (~30s); existing connections migrate rather than drop.
+    pub async fn set_relay_settings(
+        &self,
+        settings: crate::relays::RelaySettings,
+    ) -> anyhow::Result<()> {
+        use crate::relays;
+
+        // Validate fully before touching disk or the endpoint.
+        let custom = relays::relay_configs(&settings)?;
+        relays::save_relay_settings(&self.db, &settings)?;
+
+        let endpoint = &self.node.endpoint;
+        let custom_urls: BTreeSet<iroh::RelayUrl> = custom.iter().map(|c| c.url.clone()).collect();
+        self.node.preferred_relays.set(custom_urls.clone());
+
+        // Desired steady-state map: the custom relays, or the defaults when
+        // none are configured. Fallback (if warranted) re-engages via the
+        // watchdog rather than being preserved across a settings change.
+        let desired: Vec<Arc<iroh::RelayConfig>> = if custom.is_empty() {
+            relays::default_relay_configs()
+        } else {
+            custom.into_iter().map(Arc::new).collect()
+        };
+        let desired_urls: BTreeSet<iroh::RelayUrl> =
+            desired.iter().map(|c| c.url.clone()).collect();
+
+        // Insert first, then remove strays, so the map is never empty.
+        for cfg in desired {
+            endpoint.insert_relay(cfg.url.clone(), cfg).await;
+        }
+        let old_settings = std::mem::replace(
+            &mut *self.relay_settings.lock().expect("relay settings poisoned"),
+            settings,
+        );
+        let mut stale: BTreeSet<iroh::RelayUrl> = relays::default_relay_configs()
+            .iter()
+            .map(|c| c.url.clone())
+            .collect();
+        if let Ok(urls) = relays::relay_urls(&old_settings) {
+            stale.extend(urls);
+        }
+        for url in stale.difference(&desired_urls) {
+            endpoint.remove_relay(url).await;
+        }
+        self.relay_fallback.store(false, Ordering::Relaxed);
+
+        let current = self.relay_settings.lock().expect("relay settings poisoned");
+        tracing::info!(
+            "relay settings updated: {} custom relay(s), mode {:?}",
+            current.servers.len(),
+            current.mode
+        );
+        Ok(())
     }
 
     /// Whether the global "pause all activity" switch is set.
@@ -2401,6 +2496,7 @@ impl Engine {
                 .get(&(share_id.to_string(), String::new()))
                 .map(|r| crate::health::accrued(r, now))
                 .unwrap_or(0),
+            path: None,
         }];
         out.extend(state.roster.lock().map(|r| r.infos()).unwrap_or_default());
         // Health episodes are keyed by the FULL endpoint id; `infos()` shows the
@@ -2415,6 +2511,59 @@ impl Engine {
                 .unwrap_or(0);
         }
         Ok(out)
+    }
+
+    /// Annotate a [`Engine::peers`] result with how this device currently
+    /// reaches each online member: a direct (hole-punched / LAN) path, or via
+    /// which relay. Reads the endpoint's per-remote transport snapshot, which
+    /// is async — kept separate from `peers()` so membership queries stay sync.
+    /// Members without a recent iroh connection keep `path: None`.
+    pub async fn annotate_peer_paths(&self, share_id: &str, peers: &mut [seed_ipc::PeerInfo]) {
+        let Some(state) = self.shares.get(share_id) else {
+            return;
+        };
+        // `PeerInfo::node_id` is the 16-char short form; the endpoint wants the
+        // full id. Recover it from the roster keys by prefix.
+        let full_ids: Vec<String> = state
+            .roster
+            .lock()
+            .map(|r| r.peer_ids())
+            .unwrap_or_default();
+        for p in peers.iter_mut() {
+            if !p.online || p.node_id == "This device" {
+                continue;
+            }
+            let Some(full) = full_ids.iter().find(|f| f.starts_with(&p.node_id)) else {
+                continue;
+            };
+            let Ok(id) = full.parse::<EndpointId>() else {
+                continue;
+            };
+            let Some(info) = self.node.endpoint.remote_info(id).await else {
+                continue;
+            };
+            let mut relay: Option<String> = None;
+            let mut direct = false;
+            for a in info.addrs() {
+                if !matches!(a.usage(), iroh::endpoint::TransportAddrUsage::Active) {
+                    continue;
+                }
+                match a.addr() {
+                    iroh::TransportAddr::Ip(_) => direct = true,
+                    iroh::TransportAddr::Relay(url) => {
+                        relay = Some(url.host_str().unwrap_or(url.as_str()).to_string());
+                    }
+                    _ => {}
+                }
+            }
+            // A direct path outranks a coexisting relay path (iroh's selector
+            // always prefers it, so that's where the traffic actually flows).
+            p.path = if direct {
+                Some(seed_ipc::PeerPath::Direct)
+            } else {
+                relay.map(seed_ipc::PeerPath::Relay)
+            };
+        }
     }
 
     /// Replace the long-term health thresholds (tests/soaks shrink hours to
@@ -3341,6 +3490,7 @@ impl Engine {
 
     /// Endpoint address for a peer to dial (used by tests to bootstrap).
     pub async fn shutdown(self) -> anyhow::Result<()> {
+        self.relay_watchdog.abort();
         self.node.shutdown().await
     }
 }
