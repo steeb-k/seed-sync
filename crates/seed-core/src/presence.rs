@@ -5,7 +5,11 @@
 //!
 //! Why gossip and not iroh-docs entries: viewers hold a read-only doc capability
 //! and cannot write doc entries, so presence can't ride the replica. Gossip is
-//! ephemeral and any member may broadcast on the topic.
+//! ephemeral and any member may broadcast on the topic. The *durable* half of a
+//! member's identity (last-known name + role) additionally rides the replica as
+//! master-written `\x00m/` member-records (see `engine`'s `MEMBER_PREFIX` and
+//! `docs/member-registry.md`), so the member list keeps naming members that are
+//! offline or that this node has never heard gossip from.
 //!
 //! Delivery: a single broadcast is best-effort, but the swarm's one-shot bootstrap
 //! is a fragile star (the creator subscribes with an empty bootstrap; leaves dial

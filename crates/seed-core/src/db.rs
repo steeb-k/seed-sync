@@ -58,6 +58,27 @@ pub struct PeerHealthRow {
     pub last_seen: i64,
 }
 
+/// One remembered member identity: the last-known display name (and role) of a
+/// share member, keyed by its *full* endpoint-id string. Persisted so the member
+/// list keeps showing "who this was" across peer disconnects and daemon restarts
+/// instead of falling back to a bare endpoint id. Rows are only ever superseded
+/// (never expire): share membership is small and a stale name still beats a key
+/// address.
+#[derive(Debug, Clone, Default)]
+pub struct PeerNameRow {
+    pub share_id: String,
+    pub node_id: String,
+    pub name: String,
+    pub role_master: bool,
+    /// Unix secs of the last evidence this member was alive (heard directly, or
+    /// the timestamp of the doc member-record that named it).
+    pub last_seen: i64,
+    /// Unix secs this identity (name/role) was last confirmed. A doc
+    /// member-record only supersedes a newer direct observation if its own
+    /// timestamp is newer — see `PeerRoster::note_member_records`.
+    pub updated: i64,
+}
+
 /// `Connection` is `Send` but not `Sync`; wrap it so the `Db` (and thus the
 /// `Engine`) is `Sync`, which the daemon needs to share the engine across tasks.
 pub struct Db {
@@ -99,6 +120,15 @@ impl Db {
                  last_notified_at INTEGER NOT NULL DEFAULT 0,
                  last_percent     INTEGER NOT NULL DEFAULT 0,
                  last_seen        INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (share_id, node_id)
+             );
+             CREATE TABLE IF NOT EXISTS peer_names (
+                 share_id    TEXT NOT NULL,
+                 node_id     TEXT NOT NULL,
+                 name        TEXT NOT NULL,
+                 role_master INTEGER NOT NULL DEFAULT 0,
+                 last_seen   INTEGER NOT NULL DEFAULT 0,
+                 updated     INTEGER NOT NULL DEFAULT 0,
                  PRIMARY KEY (share_id, node_id)
              );",
         )?;
@@ -187,12 +217,56 @@ impl Db {
         Ok(())
     }
 
-    /// Remove a share row (and its per-path sync index + peer-health episodes).
+    /// Remove a share row (and its per-path sync index, peer-health episodes,
+    /// and remembered member names).
     pub fn remove_share(&self, share_id: &str) -> anyhow::Result<()> {
         let conn = self.lock();
         conn.execute("DELETE FROM shares WHERE share_id=?1", [share_id])?;
         conn.execute("DELETE FROM sync_index WHERE share_id=?1", [share_id])?;
         conn.execute("DELETE FROM peer_health WHERE share_id=?1", [share_id])?;
+        conn.execute("DELETE FROM peer_names WHERE share_id=?1", [share_id])?;
+        Ok(())
+    }
+
+    /// Load the remembered member identities of one share (for prepopulating a
+    /// fresh roster on share open, so the member list names offline members
+    /// immediately after a restart).
+    pub fn load_peer_names(&self, share_id: &str) -> anyhow::Result<Vec<PeerNameRow>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT share_id, node_id, name, role_master, last_seen, updated
+             FROM peer_names WHERE share_id=?1",
+        )?;
+        let rows = stmt.query_map([share_id], |row| {
+            Ok(PeerNameRow {
+                share_id: row.get(0)?,
+                node_id: row.get(1)?,
+                name: row.get(2)?,
+                role_master: row.get::<_, i64>(3)? != 0,
+                last_seen: row.get(4)?,
+                updated: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Insert or update one remembered member identity.
+    pub fn upsert_peer_name(&self, r: &PeerNameRow) -> anyhow::Result<()> {
+        self.lock().execute(
+            "INSERT INTO peer_names (share_id, node_id, name, role_master, last_seen, updated)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(share_id, node_id) DO UPDATE SET
+                 name=excluded.name, role_master=excluded.role_master,
+                 last_seen=excluded.last_seen, updated=excluded.updated",
+            rusqlite::params![
+                r.share_id,
+                r.node_id,
+                r.name,
+                r.role_master as i64,
+                r.last_seen,
+                r.updated,
+            ],
+        )?;
         Ok(())
     }
 
@@ -407,6 +481,52 @@ mod tests {
         let rest = db.load_peer_health().unwrap();
         assert_eq!(rest.len(), 1);
         assert_eq!(rest[0].share_id, "s2");
+    }
+
+    #[test]
+    fn peer_names_roundtrip_and_share_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("state.db")).unwrap();
+        let row = PeerNameRow {
+            share_id: "s1".into(),
+            node_id: "peerA".into(),
+            name: "Laptop".into(),
+            role_master: true,
+            last_seen: 1000,
+            updated: 1000,
+        };
+        db.upsert_peer_name(&row).unwrap();
+        db.upsert_peer_name(&PeerNameRow {
+            share_id: "s2".into(),
+            ..row.clone()
+        })
+        .unwrap();
+
+        // Per-share load sees only its own rows.
+        let s1 = db.load_peer_names("s1").unwrap();
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s1[0].name, "Laptop");
+        assert!(s1[0].role_master);
+        assert_eq!((s1[0].last_seen, s1[0].updated), (1000, 1000));
+
+        // Upsert supersedes in place.
+        db.upsert_peer_name(&PeerNameRow {
+            name: "Laptop (renamed)".into(),
+            role_master: false,
+            updated: 2000,
+            ..row.clone()
+        })
+        .unwrap();
+        let s1 = db.load_peer_names("s1").unwrap();
+        assert_eq!(s1.len(), 1);
+        assert_eq!(s1[0].name, "Laptop (renamed)");
+        assert!(!s1[0].role_master);
+        assert_eq!(s1[0].updated, 2000);
+
+        // Removing a share drops its rows, leaving other shares'.
+        db.remove_share("s1").unwrap();
+        assert!(db.load_peer_names("s1").unwrap().is_empty());
+        assert_eq!(db.load_peer_names("s2").unwrap().len(), 1);
     }
 
     #[test]
