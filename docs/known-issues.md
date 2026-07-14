@@ -22,6 +22,7 @@ why, and the fix or disposition.
 | 15 | doc writes during a virgin replica's initial sync churn the session (can re-open #12) | latent (member registry gated; ignore publish still exposed) |
 | 16 | cold-join bootstrap is a single creator endpoint id — any master *should* be able to bootstrap, none can | **fixed** (share-key pkarr rendezvous + remembered members in the dial set) |
 | 17 | a fully-partitioned node reports `Healthy 100%` (health of an empty peer set) | **fixed** (`ShareStatus::NoPeers`) |
+| 18 | a locked OS keystore silently demotes a master to viewer — which then **reverts the user's edits** | **fixed** (held inert + auto-retry; found 2026-07-14 in the field) |
 
 Three vendored crates carry the upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
 `vendor/iroh-docs` — see `[patch.crates-io]` in the workspace `Cargo.toml`).
@@ -746,3 +747,73 @@ Android status dot + label, and the soak harness's anomaly detector.
 a lone creator stays `Healthy`; a partitioned master reports `NoPeers`. Verified by
 falsification — with the check disabled, the partitioned master reports `Healthy`, which
 is the original symptom exactly.
+
+---
+
+## 18. A locked OS keystore silently demoted a master to viewer — which then reverted the user's edits
+**Tier:** confirmed (reproduced in the field, then synthetically) · **Severity:** high
+(**silent data loss**: the user's own writes to their own master share were overwritten)
+**Status:** **fixed** (2026-07-14)
+**Where:** `reload_shares` (`crates/seed-core/src/engine.rs`), `crates/seed-core/src/secrets.rs`
+
+**Symptom (field, 2026-07-14):** a share whose files would not sync. The device showed
+**itself** as a *Viewer* despite being a master, every member reported `Healthy 100%`,
+and the folder held different bytes from the rest of the pool. Files replaced on that
+box reverted to the pool's older copies.
+
+**Root cause.** Master shares keep their seed in the OS keystore. On startup,
+`reload_shares` loaded it to restore write capability — and if the keystore read
+**failed**, it logged a WARN and *carried on with the stored seedless key*, which is by
+definition a **viewer** key:
+
+```
+WARN master seed for 4741b9bf… unavailable from keystore;
+     running read-only: Secret Service: unlock prompt was dismissed
+INFO reloaded 1 share(s)
+```
+
+The DB row still said `role_master = 1`; only the loaded key disagreed. The trigger is a
+plain startup race: the `systemd --user` daemon starts at boot, **before** the login
+keyring is unlocked, the unlock prompt is dismissed, and the share runs read-only for the
+rest of the process's life.
+
+**Why this was data loss and not a graceful degradation.** A viewer does not merely
+decline to publish — it treats the replica as authoritative and **reverts local edits**
+(`Viewer: replica wins, always`). `materialize()` does that by calling `self_heal_file`,
+which *fetches the old bytes from a peer* and writes them over the local file. So a user
+editing files in what they believed was their own master share had those edits pulled
+back down from the pool and silently destroyed, while every screen read `Healthy`. The
+one WARN announcing it went to a log nobody reads.
+
+The write path was already defended against exactly this keystore flakiness
+(`store_seed_bounded`: bounded, with a DB fallback, because "under the Windows LocalSystem
+service (session 0) the Credential Manager API can hang indefinitely"). The read path had
+neither a bound nor a fallback. `docs/linux-packaging.md` even described the mitigation as
+if it covered both directions — it covers one, which is why this went unnoticed.
+
+**Fixed:**
+- **A master that cannot load its write key is held INERT** — not opened at all, never
+  reconciled, so it cannot touch the user's files. Read-only is not a safe fallback for a
+  master; holding it inert is the only degradation that cannot lose data.
+- **The fault is visible.** New `ShareStatus::KeyLocked`, surfaced in the GUI ("⚠ Write
+  key locked — unlock your login keyring" — naming the *cure*, since nothing about "my
+  files stopped syncing" would lead anyone to think about their keyring), the CLI, and
+  Android. The share is still listed: one that quietly vanishes is its own kind of lie.
+- **It recovers in place.** `Engine::retry_locked_keys` re-asks the keystore every
+  `KEY_RETRY_SECS` (first attempt on the very next tick, since the keyring usually
+  unlocks seconds after the daemon races the graphical login) and opens the share the
+  moment the key is available — **no daemon restart**. A fault only a maintainer knows how
+  to clear is, in practice, not recoverable.
+- **The read is bounded** (`load_seed_bounded`: `spawn_blocking` + 5s timeout), mirroring
+  the write path, so a wedged keystore can no longer stall daemon startup.
+
+**Tests:** `crates/seed-core/tests/keystore.rs` (`--ignored`). The data-loss test needs a
+**live peer** and that is not incidental: the revert works by fetching from a peer, so a
+one-node test passes against the buggy code and proves nothing (the first attempt did
+exactly that). With a peer online, the old behavior is caught red-handed — the user's
+`"my new content"` comes back as `"original"`.
+
+**Note.** This one bug produced the entire cluster of confusing symptoms — the
+self-reported "Viewer", the unsyncable files, `Healthy 100%` everywhere. It was
+*not* a corrupted share. Confirmed by the reporter: with the master not demoted, the same
+operation synced exactly as expected.

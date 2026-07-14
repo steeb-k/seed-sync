@@ -1296,6 +1296,9 @@ fn status_text(s: &ShareSummary) -> String {
         ShareStatus::Paused => "Paused".into(),
         ShareStatus::OutOfSync => "⚠ Out of sync — members disagree".into(),
         ShareStatus::NoPeers => "⚠ No members reachable".into(),
+        // Name the cure, not just the fault: nothing about "my share stopped syncing"
+        // would lead a user to think about their login keyring.
+        ShareStatus::KeyLocked => "⚠ Write key locked — unlock your login keyring".into(),
     }
 }
 

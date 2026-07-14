@@ -567,6 +567,39 @@ async fn store_seed_bounded(share_id: &str, seed: [u8; 32]) -> anyhow::Result<()
     }
 }
 
+/// Read a master seed from the OS keystore without letting it block or hang the
+/// caller. The mirror of [`store_seed_bounded`], and needed for the same reason: the
+/// keystore call is synchronous, and under the Windows LocalSystem service (session 0)
+/// the Credential Manager API can hang indefinitely. The startup path used to call
+/// `secrets::load_seed` directly on the runtime, so a wedged keystore could stall
+/// daemon startup rather than merely fail it.
+async fn load_seed_bounded(share_id: &str) -> anyhow::Result<[u8; 32]> {
+    let share_id = share_id.to_owned();
+    let handle = tokio::task::spawn_blocking(move || crate::secrets::load_seed(&share_id));
+    match tokio::time::timeout(std::time::Duration::from_secs(5), handle).await {
+        Ok(Ok(inner)) => inner,
+        Ok(Err(join_err)) => Err(anyhow!("keystore task failed: {join_err}")),
+        Err(_) => Err(anyhow!("keystore read timed out after 5s")),
+    }
+}
+
+/// A master share whose write key the OS keystore would not give us. Held inert (see
+/// [`Engine::locked`]) rather than opened read-only, and retried.
+struct LockedShare {
+    record: crate::db::ShareRecord,
+    /// Unix seconds of the last keystore retry; throttles it to one per
+    /// [`KEY_RETRY_SECS`].
+    last_retry: i64,
+    /// Why the key is unavailable, for the UI and the log (e.g. "unlock prompt was
+    /// dismissed").
+    reason: String,
+}
+
+/// How often a locked master share re-asks the OS keystore for its write key. The
+/// keyring typically unlocks on graphical login, minutes to hours after a headless
+/// boot, so this must keep trying for the life of the process — but cheaply.
+const KEY_RETRY_SECS: i64 = 30;
+
 /// Try to delete a blob's orphaned owned `data/<hash>.data` file after a reference
 /// export. Returns `true` when it's gone (reclaimed now, or already moved/absent)
 /// and `false` when it's still locked and should be retried on a later pass.
@@ -2352,6 +2385,19 @@ pub struct Engine {
     node: IrohNode,
     author: AuthorId,
     shares: HashMap<String, ShareState>,
+    /// Master shares whose write key could not be loaded from the OS keystore, held
+    /// **inert**: not opened, never reconciled, so they cannot touch the user's files.
+    ///
+    /// The old behavior was to open them read-only, which is not a degradation but a
+    /// data-loss bug: a viewer treats the replica as authoritative and *reverts local
+    /// edits*, so a user writing to what they believed was their own master share had
+    /// those writes silently rolled back while every screen said Healthy. Seen in the
+    /// field when a `systemd --user` daemon started at boot, before the login keyring
+    /// was unlocked ("Secret Service: unlock prompt was dismissed").
+    ///
+    /// Retried by [`Engine::retry_locked_keys`], so unlocking the keyring restores the
+    /// share without a daemon restart.
+    locked: HashMap<String, LockedShare>,
     db: crate::db::Db,
     /// Live import progress (`done_bytes`, `total_bytes`) for shares currently
     /// being published off-lock, keyed by share id. Shared with each in-flight
@@ -2479,6 +2525,7 @@ impl Engine {
             node,
             author,
             shares: HashMap::new(),
+            locked: HashMap::new(),
             db,
             progress: Arc::new(StdMutex::new(HashMap::new())),
             downloads_inflight: Arc::new(StdMutex::new(HashMap::new())),
@@ -2651,10 +2698,20 @@ impl Engine {
                     continue;
                 }
             };
-            // Master shares keep their seed in the OS keystore; load it to
-            // restore write capability. If it's unavailable, run read-only.
+            // Master shares keep their seed in the OS keystore; load it to restore
+            // write capability.
+            //
+            // If it's unavailable, the share is held INERT — not opened at all — and
+            // retried by `retry_locked_keys`. It emphatically must not be opened
+            // read-only, which is what this used to do. Read-only is not a safe
+            // fallback for a master: a viewer treats the replica as authoritative and
+            // *reverts local edits*, so a user writing to what they believe is their
+            // own master share would have those writes silently rolled back, with
+            // nothing but one WARN to say so. Seen in the field on a `systemd --user`
+            // daemon that started at boot, before the login keyring was unlocked
+            // ("Secret Service: unlock prompt was dismissed").
             if rec.role_master && rec.seed_in_keyring {
-                match crate::secrets::load_seed(&rec.share_id) {
+                match load_seed_bounded(&rec.share_id).await {
                     Ok(seed) => {
                         // Preserve the creating node's endpoint id carried in the
                         // stored (seedless) key: a master added from someone else's
@@ -2665,10 +2722,28 @@ impl Engine {
                         let eid = key.endpoint_id().unwrap_or(self.node.endpoint_id_bytes());
                         key = ShareKey::from_master_seed(seed).with_endpoint_id(eid);
                     }
-                    Err(e) => tracing::warn!(
-                        "master seed for {} unavailable from keystore; running read-only: {e}",
-                        rec.share_id
-                    ),
+                    Err(e) => {
+                        let share_id = rec.share_id.clone();
+                        tracing::error!(
+                            "master seed for {share_id} unavailable from keystore; holding the \
+                             share INERT (not syncing) until the key is available — unlock your \
+                             login keyring: {e:#}"
+                        );
+                        self.locked.insert(
+                            share_id,
+                            LockedShare {
+                                record: rec,
+                                // 0, not `now`: retry on the very first tick rather than
+                                // sitting locked for a throttle interval. The keyring
+                                // often unlocks seconds after the daemon starts (the
+                                // daemon races the graphical login), and that is the
+                                // single most likely moment to recover.
+                                last_retry: 0,
+                                reason: format!("{e:#}"),
+                            },
+                        );
+                        continue;
+                    }
                 }
             }
             let quick_sig = rec.quick_sig;
@@ -2990,6 +3065,32 @@ impl Engine {
                     retrying,
                 }
             })
+            // Shares held inert because their write key is locked in the OS keystore are
+            // NOT in `self.shares` — they were never opened. They must still be listed:
+            // a share that silently vanishes from the UI is its own kind of lie, and the
+            // user needs to see *why* it isn't syncing (and that the cure is to unlock
+            // their keyring, which nothing else would ever suggest).
+            .chain(self.locked.values().map(|l| {
+                let folder = PathBuf::from(&l.record.folder);
+                seed_ipc::ShareSummary {
+                    share_id: l.record.share_id.clone(),
+                    name: folder
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| l.record.share_id.clone()),
+                    folder: l.record.folder.clone(),
+                    role: seed_ipc::Role::Master,
+                    status: seed_ipc::ShareStatus::KeyLocked,
+                    percent: 0,
+                    online: 1,
+                    total: 1,
+                    paused: l.record.paused,
+                    indexed_bytes: 0,
+                    index_total: 0,
+                    last_updated: 0,
+                    retrying: 0,
+                }
+            }))
             .collect()
     }
 
@@ -3652,6 +3753,100 @@ impl Engine {
             });
         }
         out
+    }
+
+    /// Re-ask the OS keystore for the write key of every share held inert by
+    /// [`Engine::locked`], and open any whose key has become available.
+    ///
+    /// This is what makes the failure recoverable *in place*. The keyring is typically
+    /// unlocked at graphical login — seconds to hours after a headless boot — so the
+    /// daemon must notice that itself. Without this, the only cure is restarting the
+    /// daemon, which nothing about the symptom would ever suggest: "my files aren't
+    /// syncing" does not lead anyone to "your keyring was locked when the service
+    /// started". A fault that only a maintainer knows how to clear is, in practice,
+    /// not recoverable at all.
+    ///
+    /// Returns a [`DocResync`] per recovered share so the caller starts live-sync off
+    /// the engine lock, exactly like [`Engine::add_share_open`].
+    pub async fn retry_locked_keys(&mut self) -> Vec<DocResync> {
+        if self.locked.is_empty() {
+            return Vec::new();
+        }
+        let now = now_secs();
+        let due: Vec<String> = self
+            .locked
+            .iter()
+            .filter(|(_, l)| now - l.last_retry >= KEY_RETRY_SECS)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        let mut out = Vec::new();
+        for id in due {
+            let Some(l) = self.locked.get_mut(&id) else {
+                continue;
+            };
+            l.last_retry = now;
+            let seed = match load_seed_bounded(&id).await {
+                Ok(seed) => seed,
+                Err(e) => {
+                    // Still locked. Debug, not warn: on a box whose keyring is never
+                    // unlocked this would otherwise log every 30s forever, and the loud
+                    // ERROR was already emitted once at startup.
+                    tracing::debug!("master seed for {id} still unavailable: {e:#}");
+                    continue;
+                }
+            };
+
+            let locked = self.locked.remove(&id).expect("present: checked above");
+            let rec = locked.record;
+            let key = match ShareKey::decode(&rec.key) {
+                Ok(k) => {
+                    let eid = k.endpoint_id().unwrap_or(self.node.endpoint_id_bytes());
+                    ShareKey::from_master_seed(seed).with_endpoint_id(eid)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "recovered seed for {id} but its stored key is unreadable: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            match self
+                .open_share(
+                    &key,
+                    &PathBuf::from(&rec.folder),
+                    vec![],
+                    rec.ignore,
+                    rec.last_seqno,
+                    rec.paused,
+                )
+                .await
+            {
+                Ok((mut state, boot)) => {
+                    tracing::info!(
+                        "master seed for {id} recovered from keystore; share is syncing again"
+                    );
+                    state.last_quick_sig = rec.quick_sig;
+                    let doc = state.doc.clone();
+                    self.shares.insert(id.clone(), state);
+                    out.push(DocResync {
+                        share_id: id,
+                        doc,
+                        peers: boot,
+                    });
+                }
+                Err(e) => {
+                    tracing::error!("recovered seed for {id} but opening the share failed: {e:#}");
+                }
+            }
+        }
+        out
+    }
+
+    /// Why a share is being held inert (the keystore error), if it is.
+    pub fn locked_reason(&self, share_id: &str) -> Option<&str> {
+        self.locked.get(share_id).map(|l| l.reason.as_str())
     }
 
     /// Reveal the keys for a share. Returns the master key only when this node

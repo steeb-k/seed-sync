@@ -423,6 +423,18 @@ async fn presence_loop(daemon: Daemon) {
             for dial in dials {
                 tokio::spawn(dial.run());
             }
+
+            // Master shares whose write key was locked in the OS keystore at startup
+            // (a login keyring not yet unlocked) are held inert. Re-ask for the key so
+            // unlocking the keyring resumes the share on its own — the alternative is
+            // that the user must restart the daemon, which nothing about the symptom
+            // would ever suggest. Internally throttled; a no-op when nothing is locked.
+            let recovered = { daemon.engine.lock().await.retry_locked_keys().await };
+            for resync in recovered {
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(30), resync.run()).await;
+                });
+            }
             let verified = { daemon.engine.lock().await.periodic_deep_verify() };
             if !verified.is_empty() {
                 tracing::info!(

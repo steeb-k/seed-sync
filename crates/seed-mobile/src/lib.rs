@@ -87,6 +87,7 @@ pub enum ShareStatus {
     Error,
     OutOfSync,
     NoPeers,
+    KeyLocked,
 }
 
 impl From<seed_ipc::ShareStatus> for ShareStatus {
@@ -98,6 +99,7 @@ impl From<seed_ipc::ShareStatus> for ShareStatus {
             seed_ipc::ShareStatus::Paused => ShareStatus::Paused,
             seed_ipc::ShareStatus::OutOfSync => ShareStatus::OutOfSync,
             seed_ipc::ShareStatus::NoPeers => ShareStatus::NoPeers,
+            seed_ipc::ShareStatus::KeyLocked => ShareStatus::KeyLocked,
         }
     }
 }
@@ -536,6 +538,15 @@ async fn reconcile_loop(inner: Arc<Inner>) {
             let dials = { inner.engine.lock().await.rendezvous_dials() };
             for dial in dials {
                 tokio::spawn(dial.run());
+            }
+
+            // Recover master shares held inert by a locked keystore. Android has no
+            // keyring backend (seeds live in the DB), so this is a no-op there today —
+            // but seed-mobile is the same engine, and a future Android Keystore backend
+            // would need exactly this retry.
+            let recovered = { inner.engine.lock().await.retry_locked_keys().await };
+            for resync in recovered {
+                tokio::spawn(resync.run());
             }
         }
 

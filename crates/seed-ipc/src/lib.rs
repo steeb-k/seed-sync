@@ -233,6 +233,17 @@ pub enum ShareStatus {
     /// Not reported for a share this device created that nobody has joined yet: being
     /// alone there is the expected steady state, not a partition.
     NoPeers,
+    /// This is a **master** share, but its write key could not be loaded from the OS
+    /// keystore (a locked login keyring, a dismissed unlock prompt, an unavailable
+    /// Secret Service). The share is held **inert** — not synced in either direction —
+    /// until the key is available, and retried automatically.
+    ///
+    /// It is deliberately not "quietly read-only". Read-only is not a safe fallback
+    /// for a master: a viewer treats the replica as authoritative and *reverts local
+    /// edits*, so running a keyless master as a viewer silently destroys the user's own
+    /// writes in their own share while every screen reports Healthy. Holding it inert
+    /// is the only degradation that cannot lose data.
+    KeyLocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
