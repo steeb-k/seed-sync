@@ -41,6 +41,64 @@ three caches (`gschemas.compiled`, pixbuf `loaders.cache`, icon-theme cache).
 Smoke test: run `dist\SeedSync\bin\seed-daemon.exe run` in one terminal and
 `dist\SeedSync\bin\seed-gui.exe` in another; the window should appear and connect.
 
+## 1b. Windows on ARM (ARM64), cross-built from x86_64
+
+```pwsh
+pwsh -File scripts\build-msi.ps1 -Arch arm64   # -> seed-sync-<ver>-windows-arm64.msi
+```
+
+The ARM64 build is split across **two ABIs**, which looks odd and isn't negotiable:
+
+| | target | why |
+|---|---|---|
+| daemon, CLI | `aarch64-pc-windows-msvc` | no GTK dependency at all — they just cross-compile |
+| GUI | `aarch64-pc-windows-gnullvm` | must match the ABI of the only ARM64 GTK that exists |
+
+**Where ARM64 GTK comes from.** gvsbuild — the source of our x86_64 `C:\gtk` — is x64-only, and
+vcpkg's `gtk` port explicitly excludes the platform (`"supports": "… & !(arm64 & windows)"`). The
+only prebuilt GTK4 + libadwaita for Windows on ARM is **MSYS2's CLANGARM64** repo, and those are
+mingw-ABI, which forces the GUI onto the `gnullvm` target. The mixed ABI costs nothing: the GUI and
+the daemon are separate processes that only meet over IPC, so no ABI boundary is ever crossed
+inside a process.
+
+`scripts\fetch-gtk-msys2.ps1` resolves the dependency closure straight from the MSYS2 package
+database and unpacks the `.pkg.tar.zst` archives — no MSYS2 or pacman install required, which is
+what keeps the whole thing cross-buildable on the x86_64 box.
+
+One-time setup:
+```pwsh
+rustup target add aarch64-pc-windows-msvc aarch64-pc-windows-gnullvm
+# VS installer: "MSVC v143 - VS 2022 C++ ARM64/ARM64EC build tools" + the ARM64 Windows SDK
+# llvm-mingw (ucrt-x86_64) from https://github.com/mstorsjo/llvm-mingw/releases -> C:\llvm-mingw-*
+pwsh -File scripts\fetch-gtk-msys2.ps1                                  # -> C:\gtk-arm64
+pwsh -File scripts\fetch-gtk-msys2.ps1 -Env ucrt64 -Root C:\gtk-msys2-x64
+```
+That second fetch is the **host-tools mirror**, and it is not optional. The GTK helper tools in the
+ARM64 tree (`glib-compile-schemas`, `gdk-pixbuf-query-loaders`, `gtk4-update-icon-cache`) are ARM64
+binaries and cannot run on the build host — and `gdk-pixbuf-query-loaders` in particular
+`dlopen()`s each loader, so it can only ever query loaders of its own architecture. Their output is
+architecture-independent, so we run the **x86_64 build of the very same MSYS2 packages** to generate
+it; the bundler asserts the two trees' loader sets match before trusting the cache.
+
+Gotchas, all of which cost real time to find:
+- **`ring` needs `clang` on `PATH`** for either aarch64 target — the only dependency that does. The
+  two passes need *different* clangs: LLVM's (which finds the MSVC/SDK headers) for the msvc pass,
+  llvm-mingw's (which brings a mingw sysroot) for the gnullvm pass. `build-arm64.ps1` sets `PATH`
+  per pass; one shared ordering breaks one of them with `'assert.h' file not found`.
+- **`winresource` emits an x64 resource object when cross-compiling to ARM64** — it passes no
+  `--target` to `windres` for aarch64, so an unprefixed `windres` defaults to x86-64 and the link
+  dies with `machine type x64 conflicts with arm64`. `crates/seed-gui/build.rs` pins
+  `aarch64-w64-mingw32-windres` when the *target* is aarch64.
+- **Don't copy `*.dll` wholesale out of the MSYS2 tree.** Unlike gvsbuild's purpose-built GTK
+  prefix, MSYS2's `bin\` is a shared prefix for every package in the closure — a blanket copy ships
+  `libpython3.14.dll` and friends. The bundler walks the import tables from our binaries (plus the
+  pixbuf loaders, which GTK `dlopen`s rather than imports) and copies only that closure.
+
+Since the ARM64 bundle can't be launched on the build host, `scripts\verify-bundle.ps1` reads the PE
+header of every binary in it and checks that they are all ARM64 and that every imported DLL is
+either bundled or a system DLL. It runs automatically at the end of every bundle, for both
+architectures.
+
 ## 2. The Windows service
 
 The daemon is one binary; `service` mode is entered by the SCM, and

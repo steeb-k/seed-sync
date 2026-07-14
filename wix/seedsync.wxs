@@ -55,7 +55,7 @@
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch SEED Sync" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <Property Id="WixShellExecTarget" Value="[#seed_gui.exe]" />
-    <CustomAction Id="LaunchApplication" BinaryRef="Wix4UtilCA_X64"
+    <CustomAction Id="LaunchApplication" BinaryRef="$(UtilCA)"
                   DllEntry="WixShellExec" Impersonate="yes" Return="ignore" />
     <UI>
       <!-- DialogRef resolves the dialog symbol from the UI extension so the
@@ -166,14 +166,14 @@
          removal, so the task survives version bumps). Deferred + no-impersonate
          => runs in the elevated install context. Return="ignore" so a task
          failure never blocks the install/uninstall. -->
-    <CustomAction Id="RegisterUpdateTask" BinaryRef="Wix4UtilCA_X64"
+    <CustomAction Id="RegisterUpdateTask" BinaryRef="$(UtilCA)"
                   DllEntry="WixQuietExec64" Execute="deferred"
                   Impersonate="no" Return="ignore" />
     <SetProperty Id="RegisterUpdateTask" Sequence="execute" Before="RegisterUpdateTask"
                  Condition="NOT REMOVE"
                  Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File &quot;[#UpdateScript]&quot; -RegisterTask" />
 
-    <CustomAction Id="UnregisterUpdateTask" BinaryRef="Wix4UtilCA_X64"
+    <CustomAction Id="UnregisterUpdateTask" BinaryRef="$(UtilCA)"
                   DllEntry="WixQuietExec64" Execute="deferred"
                   Impersonate="no" Return="ignore" />
     <SetProperty Id="UnregisterUpdateTask" Sequence="execute" Before="UnregisterUpdateTask"

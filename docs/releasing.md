@@ -56,8 +56,13 @@ az login   # your user must hold the Azure Artifact Signing signer role
 # Microsoft.ArtifactSigning.Client NuGet)
 pwsh -File scripts\build-msi.ps1 -SkipBuild
 # -> target\wix\seed-sync-<ver>-windows-x86_64.msi
+pwsh -File scripts\build-msi.ps1 -Arch arm64
+# -> target\wix\seed-sync-<ver>-windows-arm64.msi   (cross-built here; see windows-packaging.md)
 # verify: signtool verify /pa target\wix\seed-sync-<ver>-windows-x86_64.msi
 ```
+Ship **both** Windows MSIs or neither: the updater picks its asset from the machine's OS
+architecture and will not fall back across architectures, so a release carrying only the x86_64 MSI
+leaves every ARM64 install sitting on its current version.
 
 The whole bundle → sign exes → wix → sign-MSI chain runs locally; `-SkipBuild`
 reuses an existing `target\release\*.exe`. Local signing uses your interactive
@@ -125,6 +130,7 @@ downloads list and the minimum OS / Linux deps:
 - **Linux x86_64** — `seed-sync-<ver>-linux-x86_64.tar.gz`
 - **macOS universal** (Apple Silicon + Intel) — `seed-sync-<ver>-macos-universal.tar.gz`
 - **Windows x86_64** (signed MSI) — `seed-sync-<ver>-windows-x86_64.msi`
+- **Windows ARM64** (signed MSI) — `seed-sync-<ver>-windows-arm64.msi`
 - **Android** (universal APK) — `seed-sync-<ver>-android-universal.apk`
 
 ### System requirements
