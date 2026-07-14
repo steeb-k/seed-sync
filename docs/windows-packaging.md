@@ -46,6 +46,18 @@ Smoke test: run `dist\SeedSync\bin\seed-daemon.exe run` in one terminal and
 The daemon is one binary; `service` mode is entered by the SCM, and
 install/uninstall/start/stop are subcommands (see `crates/seed-daemon/src/service.rs`).
 
+> **Updating cycles the service *and* the tray.** The MSI's `ServiceControl`
+> (`Stop="both"` / `Start="install"`) restarts `SeedSyncDaemon` on upgrade, but nothing
+> restarted the per-user tray GUI: it kept running the **old** `seed-gui.exe`, and while
+> running it holds a **lock on the very file msiexec is replacing** — which can demote a
+> clean upgrade into a reboot-pending `3010`. `seed-sync-update.ps1` now stops the tray
+> *before* `msiexec`, verifies the service is actually `Running` afterwards
+> (`Assert-DaemonRunning`), and relaunches the tray `--hidden`. Because the daily update
+> task runs as **SYSTEM**, it cannot `Start-Process` the GUI directly — that would land it
+> in session 0 with no visible tray — so `Restart-Tray` hands it to the interactive user
+> via a one-shot scheduled task (and just launches it directly when a human runs the
+> updater by hand).
+
 ```pwsh
 # from an elevated prompt:
 seed-daemon.exe install      # registers "SeedSyncDaemon" (auto-start, LocalSystem)

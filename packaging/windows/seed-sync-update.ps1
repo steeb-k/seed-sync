@@ -82,6 +82,79 @@ function Unregister-UpdateTask {
     }
 }
 
+# ── Service / tray cycling ───────────────────────────────────────────────────
+# The MSI's ServiceControl (Stop="both" / Start="install") cycles SeedSyncDaemon,
+# but nothing cycles the per-user tray GUI: it keeps running the OLD seed-gui.exe
+# after an upgrade, and while it is running it holds a lock on the file msiexec is
+# trying to replace (which can turn a clean upgrade into a reboot-pending 3010).
+# So: stop the tray BEFORE msiexec, restart it after.
+$GuiProcName = 'seed-gui'
+
+function Stop-Tray {
+    $procs = @(Get-Process -Name $GuiProcName -ErrorAction SilentlyContinue)
+    if (-not $procs) { return $false }
+    Write-Log "stopping the tray GUI ($($procs.Count) process(es)) so the MSI can replace seed-gui.exe"
+    $procs | Stop-Process -Force -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 50 -and (Get-Process -Name $GuiProcName -ErrorAction SilentlyContinue); $i++) {
+        Start-Sleep -Milliseconds 100
+    }
+    return $true
+}
+
+function Restart-Tray {
+    $exe = Join-Path $BinDir 'seed-gui.exe'
+    if (-not (Test-Path $exe)) { Write-Log "seed-gui.exe not found; skipping tray relaunch"; return }
+
+    # When the daily scheduled task runs us we are SYSTEM, so Start-Process would
+    # land the GUI in session 0 — invisible, no tray. Hand it to the interactive
+    # user via a one-shot task instead. Run interactively (a user invoking
+    # `seed-sync-update.ps1` by hand) and we can just launch it.
+    if (-not [Security.Principal.WindowsIdentity]::GetCurrent().IsSystem) {
+        Start-Process -FilePath $exe -ArgumentList '--hidden' | Out-Null
+        Write-Log "relaunched the tray GUI (hidden)"
+        return
+    }
+
+    $console = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+    if (-not $console) {
+        Write-Log "no interactive user logged on; the tray will start at next login"
+        return
+    }
+
+    $task = 'SeedSyncTrayRelaunch'
+    try {
+        $action    = New-ScheduledTaskAction -Execute $exe -Argument '--hidden'
+        $principal = New-ScheduledTaskPrincipal -UserId $console -LogonType Interactive -RunLevel Limited
+        Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Force | Out-Null
+        Start-ScheduledTask -TaskName $task
+        Start-Sleep -Seconds 2
+        Write-Log "relaunched the tray GUI (hidden) as $console"
+    } catch {
+        Write-Log "WARNING: could not relaunch the tray GUI: $($_.Exception.Message)"
+    } finally {
+        Unregister-ScheduledTask -TaskName $task -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
+
+# The MSI should have restarted the service; make sure it actually did. A stale
+# or stopped daemon still looks healthy in the GUI while the node is silently
+# absent from every peer.
+function Assert-DaemonRunning {
+    $svc = Get-Service -Name 'SeedSyncDaemon' -ErrorAction SilentlyContinue
+    if (-not $svc) { Write-Log "WARNING: service SeedSyncDaemon not found after upgrade"; return }
+    if ($svc.Status -ne 'Running') {
+        Write-Log "service is $($svc.Status) after the upgrade; starting it"
+        try {
+            Start-Service -Name 'SeedSyncDaemon'
+            (Get-Service -Name 'SeedSyncDaemon').WaitForStatus('Running', (New-TimeSpan -Seconds 20))
+        } catch {
+            Write-Log "WARNING: could not start SeedSyncDaemon: $($_.Exception.Message)"
+            return
+        }
+    }
+    Write-Log "daemon service running"
+}
+
 # ── Update logic ─────────────────────────────────────────────────────────────
 function Get-InstalledVersion {
     if (-not (Test-Path $DaemonExe)) { return $null }
@@ -122,6 +195,8 @@ function Invoke-Update {
     Write-Log "downloading $($asset.name)"
     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmp -UseBasicParsing -Headers @{ 'User-Agent' = 'seed-sync-update' }
 
+    $guiWasRunning = Stop-Tray
+
     $msiLog = Join-Path $DataDir 'update-msi.log'
     Write-Log "applying $tmp (msiexec /qn)"
     $p = Start-Process -FilePath 'msiexec.exe' `
@@ -133,6 +208,12 @@ function Invoke-Update {
     } else {
         Write-Log "msiexec failed (exit $($p.ExitCode)); see $msiLog"
     }
+
+    # Unconditional: on success this is the point of the exercise, and on failure
+    # we still killed the tray, so the user must not be left without a GUI.
+    Assert-DaemonRunning
+    if ($guiWasRunning) { Restart-Tray }
+
     Remove-Item $tmp -ErrorAction SilentlyContinue
 }
 
