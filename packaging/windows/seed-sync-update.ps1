@@ -33,8 +33,26 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $Repo      = if ($env:SEED_BINARIES_REPO) { $env:SEED_BINARIES_REPO } else { 'steeb-k/seed-sync-binaries' }
-$AssetGlob = '*windows-x86_64.msi'
 $TaskName  = 'SeedSyncUpdate'
+
+# Which MSI to pull. Keyed off the OS architecture, NOT the installed build's, so a
+# Windows-on-ARM machine that installed the x86_64 MSI (which it will happily run under
+# emulation) migrates itself to the native ARM64 build; the two MSIs share an
+# UpgradeCode, which makes that a normal major upgrade.
+#
+# RuntimeInformation reports the OS architecture even from an emulated process, which
+# PROCESSOR_ARCHITECTURE does not; the env vars are only a fallback.
+function Get-OsArch {
+    try {
+        $a = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+        if ($a) { return $a }
+    } catch { }
+    if ($env:PROCESSOR_ARCHITEW6432) { return $env:PROCESSOR_ARCHITEW6432 }
+    return $env:PROCESSOR_ARCHITECTURE
+}
+
+$OsArch    = Get-OsArch
+$AssetGlob = if ($OsArch -match 'Arm64') { '*windows-arm64.msi' } else { '*windows-x86_64.msi' }
 $BinDir    = $PSScriptRoot
 $DaemonExe = Join-Path $BinDir 'seed-daemon.exe'
 $ScriptPath = $PSCommandPath
@@ -189,7 +207,14 @@ function Invoke-Update {
     if ($CheckOnly) { return }
 
     $asset = $rel.assets | Where-Object { $_.name -like $AssetGlob } | Select-Object -First 1
-    if (-not $asset) { Write-Log "release $tag has no $AssetGlob asset"; return }
+    if (-not $asset) {
+        # Deliberately no fallback to another architecture's MSI: swapping a machine
+        # between the native and the emulated build behind the user's back is a major
+        # upgrade either way, and a release that is simply missing an asset is a
+        # packaging mistake we would rather see in the log than paper over.
+        Write-Log "release $tag has no $AssetGlob asset; staying on $installed"
+        return
+    }
 
     $tmp = Join-Path ([IO.Path]::GetTempPath()) ("seed-sync-{0}.msi" -f $latest)
     Write-Log "downloading $($asset.name)"

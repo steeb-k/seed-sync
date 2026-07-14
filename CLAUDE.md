@@ -60,6 +60,28 @@ environment looks off, `scripts/run-linux.sh` self-checks and points at
 
 ## Conventions & gotchas
 
+- **The Windows ARM64 build is two ABIs in one bundle, and that is not a mistake to tidy up.**
+  gvsbuild is x64-only and vcpkg's `gtk` port explicitly excludes arm64-windows, so the only
+  prebuilt GTK4 + libadwaita for Windows on ARM is **MSYS2's CLANGARM64** — which is mingw-ABI. So
+  the **GUI** builds for `aarch64-pc-windows-gnullvm` while the **daemon + CLI** (no GTK dependency
+  at all) stay on `aarch64-pc-windows-msvc`. Nothing is compromised: they are separate processes
+  that only meet over IPC, so no ABI boundary is ever crossed inside a process. Everything
+  cross-compiles from the x86_64 box (`scripts/build-arm64.ps1`, `fetch-gtk-msys2.ps1`,
+  `build-msi.ps1 -Arch arm64`). Four traps: (1) `ring` needs `clang` on `PATH` for either aarch64
+  target — and the two passes need *different* clangs (LLVM's finds the MSVC/SDK headers;
+  llvm-mingw's brings a mingw sysroot), so `build-arm64.ps1` sets `PATH` per pass — one shared
+  ordering fails with `'assert.h' file not found`; (2) `winresource` passes no `--target` to
+  `windres` for aarch64, so an unprefixed `windres` emits an **x64** object and the link dies with
+  "machine type x64 conflicts with arm64" — `seed-gui/build.rs` pins `aarch64-w64-mingw32-windres`
+  when the *target* is aarch64; (3) MSYS2's `bin\` is a shared prefix for the whole dependency
+  closure, not a curated GTK tree, so a blanket `*.dll` copy ships `libpython3.14.dll` — the bundler
+  copies only the **import closure** of our binaries plus the pixbuf loaders (which GTK `dlopen`s
+  rather than imports); (4) the ARM64 tree's GTK helper tools can't run on the build host, so the
+  schemas/pixbuf caches are generated with the **x86_64 build of the same MSYS2 packages**
+  (`fetch-gtk-msys2.ps1 -Env ucrt64`) — the bundler asserts the two loader sets match first. Since
+  none of it can be launched here, `scripts/verify-bundle.ps1` reads every PE header to prove the
+  bundle is single-architecture with no unresolvable imports; it runs on both arches. The updater
+  picks its MSI by **OS** arch and never falls back across architectures.
 - **iroh ecosystem crates are pinned and bumped *together*.** `iroh`,
   `iroh-blobs`, `iroh-gossip`, `iroh-docs`, `iroh-tickets`,
   `iroh-mdns-address-lookup`, `bao-tree` all share `iroh-base`; mixing minors
