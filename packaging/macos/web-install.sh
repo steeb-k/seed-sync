@@ -105,11 +105,20 @@ case "$ACTION" in
   *) die "unknown action '$ACTION' (use install | update | remove)" ;;
 esac
 
-# Update/remove of an existing install: delegate to the installed wrapper.
+# Existing install: prefer the installed wrapper, but do NOT delegate an update
+# BLINDLY. A broken updater (e.g. the `set -o pipefail` bug in <=0.6.3, where
+# `latest_version` returned non-zero and silently killed `--update`) would just re-run
+# its own breakage, and `exec`-delegating to it from this one-liner left no way to
+# recover. Try it, and on failure fall through to the self-contained download+install
+# below, which replaces the wrapper itself and so repairs the updater. Remove has no
+# such failure mode, so it still delegates directly.
 if have seed-sync; then
   case "$ACTION" in
-    install_or_update) exec seed-sync --update ;;
-    remove)            exec seed-sync --uninstall ;;
+    remove) exec seed-sync --uninstall ;;
+    install_or_update)
+      if seed-sync --update; then exit 0; fi
+      say "the installed updater failed — repairing with a fresh install..."
+      ;;
   esac
 fi
 [ "$ACTION" = remove ] && die "S.E.E.D. is not installed"

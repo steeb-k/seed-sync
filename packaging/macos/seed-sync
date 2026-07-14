@@ -118,8 +118,16 @@ restart_runtime() {
 # Latest release tag's version (no download). Empty if unreachable.
 latest_version() {
   have curl || die "curl is required"
-  curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-    | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/'
+  # Capture then parse — never `curl | grep -m1`. Under `set -o pipefail`, `grep -m1`
+  # closes the pipe after the first match while curl is still streaming the (large)
+  # JSON, so curl exits non-zero and pipefail fails the pipeline even though the right
+  # answer already went through. That made this print the correct version but return
+  # non-zero, tripping `--status`'s `|| echo '?'` and silently killing `--update`
+  # (`latest="$(latest_version)"` dies under `set -e`), which broke auto-update.
+  local json line
+  json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null)" || return 1
+  line="$(grep -m1 '"tag_name"' <<<"$json")" || return 1
+  sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/' <<<"$line"
 }
 
 # Download + extract the latest release; echo the extracted tree root (the dir
@@ -128,7 +136,10 @@ fetch_latest_tree() {
   have curl || die "curl is required"
   local json url root
   json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest")" || die "cannot reach $REPO releases API"
-  url="$(printf '%s' "$json" | grep -oE "\"browser_download_url\": *\"$ASSET_RE\"" | sed -E 's/.*"(https[^"]+)".*/\1/' | head -n1)"
+  # `grep -m1 -oE` on the captured JSON via here-string: matches the asset URL and
+  # stops at the first hit, with no `| head -n1` to close the pipe early (which under
+  # pipefail would fail the pipeline the same way the old `latest_version` did).
+  url="$(grep -m1 -oE "$ASSET_RE" <<<"$json")" || true
   [ -n "$url" ] || die "latest release has no macos-$HOST (or -universal) tarball"
   WORKDIR="$(mktemp -d)"
   curl -fsSL -o "$WORKDIR/pkg.tgz" "$url" || die "download failed"

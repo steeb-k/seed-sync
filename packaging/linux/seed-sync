@@ -73,8 +73,20 @@ start_gui_hidden() {
 # Latest release tag's version (no download). Empty if unreachable.
 latest_version() {
   have curl || die "curl is required"
-  curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-    | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/'
+  # Capture the response, THEN parse it — never `curl | grep -m1`. Under
+  # `set -o pipefail`, `grep -m1` closes the pipe after the first match while curl is
+  # still streaming the (now large, four-asset) JSON, so curl exits non-zero with a
+  # write error and pipefail fails the whole pipeline *even though the right answer
+  # already went through*. That made this function print the correct version but
+  # return non-zero, which (a) tripped the `|| echo '?'` in `--status` and (b) — far
+  # worse — silently killed `--update`, whose `latest="$(latest_version)"` dies under
+  # `set -e` on a non-zero assignment, before it logs a thing. That is why the daily
+  # auto-update timer stopped working. Here-strings feed grep/sed from a shell string,
+  # not a process, so an early-exiting matcher can't SIGPIPE a producer.
+  local json line
+  json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null)" || return 1
+  line="$(grep -m1 '"tag_name"' <<<"$json")" || return 1
+  sed -E 's/.*"tag_name": *"v?([^"]+)".*/\1/' <<<"$line"
 }
 
 # Download + extract the latest release; echo the extracted tree root.
@@ -82,7 +94,12 @@ fetch_latest_tree() {
   have curl || die "curl is required"
   local json url root
   json="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest")" || die "cannot reach $REPO releases API"
-  url="$(printf '%s' "$json" | grep -oE "\"browser_download_url\": *\"$ASSET_RE\"" | sed -E 's/.*"(https[^"]+)".*/\1/' | head -n1)"
+  # `grep -m1 -oE` on the captured JSON via here-string: matches the asset URL
+  # directly and stops at the first hit. NOT `... | head -n1`, which would close the
+  # pipe early and (under pipefail) fail the pipeline the same way the old
+  # `latest_version` did — a bug this line would have hit the moment `latest_version`
+  # was fixed and `--update` actually reached here.
+  url="$(grep -m1 -oE "$ASSET_RE" <<<"$json")" || true
   [ -n "$url" ] || die "latest release has no linux-x86_64.tar.gz asset"
   WORKDIR="$(mktemp -d)"
   curl -fsSL -o "$WORKDIR/pkg.tgz" "$url" || die "download failed"
