@@ -238,6 +238,23 @@ on the arm64 slice (use `lipo -thin x86_64` first to check the Intel slice).
 
 ## Caveats / gotchas
 
+- **`launchctl bootout` is ASYNCHRONOUS — an update must wait for the daemon to
+  actually die.** It returns before launchd has reaped the job, and the daemon is
+  `KeepAlive`. The original updater booted the daemon out, immediately replaced the
+  `.app` underneath the still-live process, and then `bootstrap`ed the replacement —
+  which fails with launchd error 37 ("Operation already in progress") while the old
+  job lingers. Under the wrapper's `set -e` that aborted `cmd_update` outright,
+  leaving new files on disk and a **stale daemon** still serving the old binary. The
+  symptom is nasty because it looks fine: the GUI connects and reports healthy while
+  the node is silently absent from every peer, and only a manual
+  `launchctl kickstart -k` fixes it. `seed-sync` now has `stop_wait` (poll until the
+  process is really gone, escalating to SIGKILL) and `restart_runtime` (bring the
+  daemon back, **verify** a live pid, fall back to `kickstart -k`). Quitting and
+  relaunching the GUI does NOT help — the stale process is the daemon.
+- **The tray GUI must be cycled on update too**, on every OS. It keeps running the
+  old binary otherwise. `restart_runtime` relaunches it `--hidden` if it was running
+  — keyed off the *process* as well as the agent, since a GUI started by hand from
+  the Dock has no agent loaded and would otherwise be killed and never come back.
 - **Re-sign AFTER every mutation.** `install_name_tool` and `lipo` both invalidate the ad-hoc
   signature; Apple Silicon refuses to run an invalidly-signed Mach-O. Always `codesign --force -s -`
   last, inside-out (dylibs/loaders first, then the binaries, then seal the `.app`).

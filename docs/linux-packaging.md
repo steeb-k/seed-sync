@@ -142,6 +142,16 @@ Self-replacement of `seed-sync` is safe: `apply_tree` writes the new file to a t
 `mv`'s it into place, so the running shell keeps its open fd to the old inode for that run.
 
 ## Caveats / gotchas for maintainers
+- **An update must cycle the tray GUI, not just the daemon.** `seed-sync --update`
+  restarts `seed-daemon.service`, but the GUI is a plain user process — left alone it
+  keeps running the **old binary** against the new daemon indefinitely. `apply_tree`
+  now stops `seed-gui` before the swap and relaunches it `--hidden` afterwards.
+- **Relaunching the GUI must escape the update unit's cgroup.** The daily update runs
+  from `seed-sync-update.service` (`Type=oneshot`); systemd tears down that unit's
+  cgroup when it finishes, killing any plain background fork with it. `start_gui_hidden`
+  uses `systemd-run --user` (transient unit) and only falls back to `setsid`. It also
+  no-ops when no `DISPLAY`/`WAYLAND_DISPLAY` is visible, rather than spawning a GUI
+  that immediately dies.
 - **ABI portability.** The tarball is dynamically linked against the build host's glibc + GTK.
   Build on **Ubuntu 24.04** — not 22.04, because the GUI requires **GTK 4.10+** (the `v4_10`
   feature) and 22.04 only ships GTK 4.6, which fails the build. Targets therefore need **GTK 4.10+ /

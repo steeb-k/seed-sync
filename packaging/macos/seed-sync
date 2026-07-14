@@ -62,6 +62,59 @@ agent_load() {
   fi
 }
 
+# Wait (max ~10s) for a process to actually be gone, escalating if it lingers.
+# `launchctl bootout` is ASYNCHRONOUS — it returns before launchd has reaped the
+# job. The daemon is KeepAlive and can be mid-network-IO, so without this we
+# would swap the .app out from under a live process and then fail to bootstrap
+# the replacement ("Operation already in progress"), leaving a stale daemon.
+stop_wait() {
+  local name="$1" i=0
+  while pgrep -x "$name" >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -ge 100 ] && break
+    [ "$i" = 50 ] && { pkill -x "$name" >/dev/null 2>&1 || true; }
+    sleep 0.1
+  done
+  if pgrep -x "$name" >/dev/null 2>&1; then
+    pkill -9 -x "$name" >/dev/null 2>&1 || true
+    sleep 0.3
+  fi
+  ! pgrep -x "$name" >/dev/null 2>&1
+}
+
+# Bring the daemon back and VERIFY it, then relaunch the tray GUI hidden if it
+# was running before. Called after the new files are in place. An update that
+# swaps the binaries but leaves the OLD daemon process running looks fine (the
+# GUI connects, the app reports healthy) while the node is silently absent from
+# every peer — so a failure to come back up is loud, not best-effort.
+restart_runtime() {
+  log "starting daemon"
+  agent_load daemon || true
+  local i=0
+  while ! pgrep -x seed-daemon >/dev/null 2>&1; do
+    i=$((i + 1))
+    [ "$i" -ge 50 ] && break
+    # bootstrap can lose a race with the outgoing job; kickstart is the hammer.
+    [ "$i" = 20 ] && { launchctl kickstart -k "$DOMAIN/$APP_ID.daemon" >/dev/null 2>&1 || true; }
+    sleep 0.1
+  done
+  if pgrep -x seed-daemon >/dev/null 2>&1; then
+    log "daemon running (pid $(pgrep -x seed-daemon | head -n1))"
+  else
+    log "WARNING: daemon did not come back up. Start it with:"
+    log "  launchctl kickstart -k $DOMAIN/$APP_ID.daemon"
+  fi
+
+  [ "$WAS_GUI" = 1 ] || return 0
+  log "relaunching GUI (hidden)"
+  # Prefer the agent; if there is none (installed --no-gui-autostart) start the
+  # binary directly, detached so it outlives this script.
+  if [ -f "$AGENTS/$APP_ID.gui.plist" ] && agent_load gui; then
+    return 0
+  fi
+  ( "$MACOS/seed-gui" --hidden >/dev/null 2>&1 & ) || true
+}
+
 # Latest release tag's version (no download). Empty if unreachable.
 latest_version() {
   have curl || die "curl is required"
@@ -87,17 +140,26 @@ fetch_latest_tree() {
 
 # Place files from a release tree ($1): copy the .app to ~/Applications, refresh
 # PATH symlinks + the real seed-sync, write the launch agents. Stops the daemon +
-# GUI first; the caller re-loads. WAS_DAEMON/WAS_GUI record what to restart.
+# GUI first; the caller re-loads (see restart_runtime). WAS_DAEMON/WAS_GUI record
+# what to bring back.
 WAS_DAEMON=0; WAS_GUI=0
 apply_tree() {
   local src="$1"
   [ -d "$src/$APP_NAME" ] || die "release tree '$src' has no $APP_NAME"
 
   agent_loaded daemon && WAS_DAEMON=1
-  agent_loaded gui && WAS_GUI=1
-  [ "$WAS_DAEMON" = 1 ] && { log "stopping daemon"; agent_unload daemon; }
-  [ "$WAS_GUI" = 1 ] && agent_unload gui
+  # The GUI counts as "was running" if its agent is loaded OR the user started it
+  # by hand from the Dock/Launchpad — either way we killed it, so we owe them a
+  # relaunch. (Keying off the agent alone left hand-started GUIs dead.)
+  if agent_loaded gui || pgrep -x seed-gui >/dev/null 2>&1; then WAS_GUI=1; fi
+
+  log "stopping daemon + GUI"
+  agent_unload gui
   pkill -x seed-gui >/dev/null 2>&1 || true
+  stop_wait seed-gui || log "WARNING: seed-gui would not exit"
+  agent_unload daemon
+  # Must be gone BEFORE we replace the .app underneath it — see stop_wait.
+  stop_wait seed-daemon || log "WARNING: seed-daemon would not exit"
 
   mkdir -p "$HOME/Applications" "$LOG_DIR" "$BIN_DIR" "$AGENTS"
 
@@ -171,8 +233,7 @@ cmd_update() {
 
   local tree; tree="$(fetch_latest_tree)"
   apply_tree "$tree"
-  agent_load daemon
-  [ "$WAS_GUI" = 1 ] && agent_load gui
+  restart_runtime
   log "updated to $latest"
 }
 
