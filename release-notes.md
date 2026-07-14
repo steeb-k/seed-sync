@@ -1,10 +1,28 @@
-**S.E.E.D. (SEED Sync) v0.6.2** — P2P mirrored-folder sync.
+**S.E.E.D. (SEED Sync) v0.6.3** — P2P mirrored-folder sync.
 
-This release fixes three bugs that could each, on their own, stop a share from syncing —
-and one of them could **silently overwrite your edits**. Updating is strongly recommended.
-The Windows ARM64 build is now a **full release**, no longer a pre-release.
+Supersedes 0.6.2 (which was withdrawn). It carries everything from that release, plus two
+fixes to how membership and sync status are *reported* — including one regression
+introduced by 0.6.2 itself.
 
-### Fixes
+The Windows ARM64 build is a **full release**, no longer a pre-release.
+
+### Fixed in 0.6.3
+
+**A new share no longer reports "Out of sync — members disagree" while it is still
+syncing.** Divergence is detected by comparing each member's file manifest — but a member
+that is still completing its *initial* sync holds a partial manifest by definition, so
+every device in a freshly-created share accused the others of disagreeing, within a minute
+of joining and long before the first sync had finished. A member that is **behind** is not
+a member that has **diverged**: the first resolves itself, the second needs you. Only
+fully-synced members are now compared, and a disagreement must be *stable* — one that is
+still changing is simply propagation in progress.
+
+**A device no longer counts itself as an extra member.** In 0.6.2, the device that created
+a share could list one more member than actually existed (other devices saw the correct
+count). Harmless to syncing, but confusing — and it was a regression in 0.6.2's new
+bootstrap code.
+
+### Fixed in 0.6.2 (included here)
 
 **A locked login keyring no longer demotes a master to read-only — or reverts your files.**
 Master shares keep their write key in the OS keystore. If that key could not be read at
@@ -27,12 +45,11 @@ own key, so a joiner finds whichever master is up. Restarts are also more robust
 now remembers and re-dials every member it has seen, instead of only the creator.
 
 > **Update your existing devices first.** The new bootstrap only works once the *masters*
-> are running 0.6.2 — they are the ones doing the advertising.
+> are running 0.6.2+ — they are the ones doing the advertising.
 
 **A device that can reach nobody now says so.** It used to report `Healthy 100%` — because
-it agreed with every peer it could hear, and it could hear none. That is what hid the
-bootstrap bug above for over a week. Such a share now reads **"No members reachable"**, in
-the app and in the tray.
+it agreed with every peer it could hear, and it could hear none. Such a share now reads
+**"No members reachable"**, in the app and in the tray.
 
 **Linux: the tray icon now appears reliably.** At login the app could start before the
 desktop's tray service was ready, fail once, and never retry — so the icon was missing
@@ -40,10 +57,10 @@ until the app was restarted by hand. It now waits for the tray and registers as 
 it's available.
 
 ### Downloads
-- **Linux x86_64** — `seed-sync-0.6.2-linux-x86_64.tar.gz`
-- **Windows x86_64** (signed MSI) — `seed-sync-0.6.2-windows-x86_64.msi`
-- **Windows ARM64** (signed MSI) — `seed-sync-0.6.2-windows-arm64.msi`
-- **Android** (universal APK) — `seed-sync-0.6.2-android-universal.apk`
+- **Linux x86_64** — `seed-sync-0.6.3-linux-x86_64.tar.gz`
+- **Windows x86_64** (signed MSI) — `seed-sync-0.6.3-windows-x86_64.msi`
+- **Windows ARM64** (signed MSI) — `seed-sync-0.6.3-windows-arm64.msi`
+- **Android** (universal APK) — `seed-sync-0.6.3-android-universal.apk`
 
 ### System requirements
 
