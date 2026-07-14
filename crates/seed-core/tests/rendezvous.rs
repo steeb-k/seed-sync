@@ -100,6 +100,90 @@ async fn a_viewer_key_is_enough_to_resolve() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A master that resolves **its own** rendezvous record must not end up as its own peer.
+///
+/// The record is last-writer-wins across every master, so the address a node resolves is
+/// quite often the one it published itself. Dialing yourself is not merely a no-op:
+/// `SyncFinished` fires on failed syncs too, so the doc-event task notes *us* as a peer
+/// and the member list grows a phantom that no other node can see. Reported from the
+/// field as "this computer sees four members; the other two see three".
+#[tokio::test]
+#[ignore = "opens real iroh endpoints and requires internet; run with --ignored"]
+async fn a_master_resolving_its_own_record_does_not_become_its_own_peer() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+    std::fs::write(a_folder.path().join("f.txt"), b"content")?;
+
+    let mut a = Engine::new(a_data.path()).await?;
+    let created = a.create_share(a_folder.path(), vec![]).await?;
+    let share_id = created.share_id.clone();
+    let a_addr = a.endpoint_addr();
+
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while a.endpoint_addr().addrs.is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("A never got a dialable address"))?;
+
+    // B joins and syncs, so A *knows* a member exists...
+    {
+        let mut b = Engine::new(b_data.path()).await?;
+        b.add_share(&created.master_key, b_folder.path(), vec![a_addr])
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let _ = a.reconcile(&share_id).await;
+                let _ = b.reconcile(&share_id).await;
+                if b_folder.path().join("f.txt").exists() {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("B never synced"))?;
+        b.shutdown().await?;
+    }
+    // ...and then goes away, which makes A isolated: it knows a member but can reach
+    // none. That is precisely the state that triggers a rendezvous lookup.
+
+    // A publishes, so A is unambiguously the most recent writer of the record — i.e. A
+    // is guaranteed to resolve *itself*.
+    for job in a.rendezvous_publishes() {
+        job.run().await;
+    }
+
+    // Force the lookup to be due, then run it.
+    for job in a.rendezvous_dials() {
+        job.run().await;
+    }
+    // Give any (erroneous) self-sync event time to land in the roster.
+    for _ in 0..5 {
+        let _ = a.reconcile(&share_id).await;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+
+    let self_id = a.endpoint_addr().id.to_string();
+    let peers = a.peers(&share_id)?;
+    let phantom = peers
+        .iter()
+        .skip(1) // entry 0 is the synthetic "This device" row
+        .find(|p| self_id.starts_with(&p.node_id));
+    assert!(
+        phantom.is_none(),
+        "this device was recorded as its own peer — a phantom member that no other node \
+         can see. Peers: {:?}",
+        peers.iter().map(|p| &p.node_id).collect::<Vec<_>>()
+    );
+
+    a.shutdown().await?;
+    Ok(())
+}
+
 /// **Known-issues #16, reproduced and fixed.**
 ///
 /// A joiner is handed a key whose baked-in creator endpoint id is dead — the exact

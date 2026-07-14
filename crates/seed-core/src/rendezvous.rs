@@ -224,6 +224,20 @@ impl RendezvousDial {
                 }
             };
 
+        // The record is last-writer-wins across ALL masters, and we are a master too if
+        // we hold the seed — so the address we just resolved is quite often our own.
+        // Dialing ourselves is not merely useless: `SyncFinished` fires on failed syncs,
+        // so it registers this device as its own peer and the member list grows a
+        // phantom that no other node can see.
+        if addr.id == self.endpoint.id() {
+            tracing::debug!(
+                "rendezvous: share {} resolved to ourselves (we published last); \
+                 nothing to dial",
+                self.share_id
+            );
+            return;
+        }
+
         tracing::info!(
             "rendezvous: share {} has no reachable member; bootstrapping from master {}",
             self.share_id,

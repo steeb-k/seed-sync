@@ -289,6 +289,29 @@ impl PeerRoster {
             .collect()
     }
 
+    /// Manifest fingerprints of online peers that report themselves **fully synced**
+    /// (`percent >= 100`), excluding `0` (unknown / not yet reported).
+    ///
+    /// This — not [`Self::online_manifest_fps`] — is what divergence detection must
+    /// compare against. Divergence means "we hold different filesets", but a member
+    /// that is still completing its *initial* sync legitimately holds a different
+    /// fileset: its replica is mid-flight and its manifest is a partial view of the
+    /// share. Comparing against it turns normal joining into a fleet-wide
+    /// "members disagree" alarm — which is exactly what happened when three devices
+    /// joined a fresh share and every one of them reported OutOfSync before the first
+    /// sync had even finished.
+    ///
+    /// A peer that is still catching up is *behind*, not *diverged*, and the two must
+    /// not be conflated: one resolves itself, the other needs a human.
+    fn settled_manifest_fps(&self) -> Vec<u64> {
+        let now = now_secs();
+        self.peers
+            .values()
+            .filter(|e| self.is_online(e, now) && e.manifest_fp != 0 && e.percent >= 100)
+            .map(|e| e.manifest_fp)
+            .collect()
+    }
+
     /// (online, total). Total is every member *known* — heard this session or
     /// remembered from earlier ones — so a restart doesn't shrink "2 of 5" to
     /// "2 of 2" until everyone happens to be heard again.
@@ -2268,6 +2291,11 @@ struct ShareState {
     /// persists past [`DIVERGENCE_SETTLE_SECS`] is reported (so normal propagation
     /// lag doesn't false-alarm).
     diverged_since: Option<i64>,
+    /// Fingerprint of the *current* disagreement (our manifest fp + the settled peers'
+    /// fps). While a share is still converging this changes every pass, which restarts
+    /// the settle clock — so only a disagreement that stays *the same* for the whole
+    /// window is reported. Meaningless while `diverged_since` is `None`.
+    divergence_sig: u64,
     /// Whether we've already logged a WARN for the current divergence episode, to
     /// avoid repeating it every tick. Cleared when agreement returns.
     diverged_alerted: bool,
@@ -2879,7 +2907,7 @@ impl Engine {
                 bootstrap.extend(ids.into_iter().map(iroh::EndpointAddr::new));
             }
         }
-        spawn_event_task(&doc, roster.clone()).await?;
+        spawn_event_task(&doc, roster.clone(), self_id).await?;
 
         // Presence: a per-share gossip topic carrying each member's name + health.
         // Bootstrap it with the same peers as the doc (the master endpoint id + any
@@ -2938,6 +2966,7 @@ impl Engine {
                 skipped: Vec::new(),
                 manifest_fp: 0,
                 diverged_since: None,
+                divergence_sig: 0,
                 diverged_alerted: false,
                 // Stagger the first periodic deep verify a full interval out, so a
                 // restart doesn't re-hash every share immediately.
@@ -4053,19 +4082,49 @@ impl Engine {
             let _ = self.db.set_seqno(share_id, state.last_seqno);
         }
 
-        // Cross-member divergence: compare our manifest fingerprint with online
-        // peers'. Persistent disagreement (past the settle window) is reported as
-        // "out of sync"; transient disagreement during normal propagation clears
-        // before the window and never alarms.
+        // Cross-member divergence: compare our manifest fingerprint with those of peers
+        // that are **settled**. Two guards, both learned the hard way when three devices
+        // joined a fresh share and every one of them cried "members disagree" within a
+        // minute, long before the first sync had finished:
+        //
+        // 1. Only compare *fully-synced* members, and only when we are fully synced
+        //    ourselves. A member mid-initial-sync holds a partial manifest by
+        //    definition — it is *behind*, not *diverged*. Those are different
+        //    conditions with different cures (one waits, one needs a human), and
+        //    conflating them makes the alarm meaningless exactly when a share is new.
+        //
+        // 2. The disagreement must be *stable*, not merely present. While a master is
+        //    still importing, its manifest legitimately grows every pass, so peers
+        //    trail it — a disagreement that keeps *changing* is propagation in
+        //    progress, not divergence. So the settle clock restarts whenever the shape
+        //    of the disagreement changes, and only an unchanging disagreement can age
+        //    past the window. That is what "persistent" was always supposed to mean.
         let peer_fps = state
             .roster
             .lock()
-            .map(|r| r.online_manifest_fps())
+            .map(|r| r.settled_manifest_fps())
             .unwrap_or_default();
-        let disagrees = peer_fps.iter().any(|fp| *fp != state.manifest_fp);
+        let self_settled = state.health >= 100;
+        let disagrees = self_settled && peer_fps.iter().any(|fp| *fp != state.manifest_fp);
         if disagrees {
-            if state.diverged_since.is_none() {
+            // Fingerprint the disagreement itself (our fp + the peers' fps). While
+            // anything is still moving this changes, and the clock restarts.
+            let sig = {
+                let mut fps: Vec<u64> = peer_fps.clone();
+                fps.sort_unstable();
+                let mut h = blake3::Hasher::new();
+                h.update(b"seed-sync/divergence-sig/v1");
+                h.update(&state.manifest_fp.to_le_bytes());
+                for fp in &fps {
+                    h.update(&fp.to_le_bytes());
+                }
+                u64::from_le_bytes(h.finalize().as_bytes()[..8].try_into().unwrap())
+            };
+            if state.diverged_since.is_none() || state.divergence_sig != sig {
+                state.divergence_sig = sig;
                 state.diverged_since = Some(now_secs());
+                state.diverged_alerted = false;
+                state.diverged_deep_verified = false;
             }
             let elapsed = now_secs() - state.diverged_since.unwrap_or_else(now_secs);
             if elapsed >= DIVERGENCE_SETTLE_SECS {
@@ -4101,6 +4160,7 @@ impl Engine {
                 tracing::info!("share {share_id}: manifest back in sync with peers");
             }
             state.diverged_since = None;
+            state.divergence_sig = 0;
             state.diverged_alerted = false;
             state.diverged_deep_verified = false;
         }
@@ -4343,18 +4403,37 @@ impl Engine {
 /// Subscribe to a doc's live events in a background task. This keeps the
 /// live-sync session active and feeds the peer roster (neighbor up/down, remote
 /// inserts, sync completions).
-async fn spawn_event_task(doc: &Doc, roster: Arc<StdMutex<PeerRoster>>) -> anyhow::Result<()> {
+async fn spawn_event_task(
+    doc: &Doc,
+    roster: Arc<StdMutex<PeerRoster>>,
+    self_id: EndpointId,
+) -> anyhow::Result<()> {
     let mut events = doc.subscribe().await?;
+    let self_id = self_id.to_string();
     tokio::spawn(async move {
         while let Some(ev) = events.next().await {
             if let Ok(e) = &ev {
-                if let Ok(mut r) = roster.lock() {
-                    match e {
-                        LiveEvent::NeighborUp(pk) => r.note(&pk.to_string(), Some(true)),
-                        LiveEvent::NeighborDown(pk) => r.note(&pk.to_string(), Some(false)),
-                        LiveEvent::InsertRemote { from, .. } => r.note(&from.to_string(), None),
-                        LiveEvent::SyncFinished(se) => r.note(&se.peer.to_string(), None),
-                        _ => {}
+                // Never record OURSELVES as a peer. The roster is the member list, and
+                // this device is counted separately (`Engine::peers` leads with "This
+                // device", and the counts add one for it) — so a self entry here shows
+                // up as a phantom extra member that no other node can see.
+                //
+                // It is reachable: `SyncFinished` fires on *failed* syncs too, so any
+                // path that dials our own endpoint id notes us as a peer. Guarding at
+                // the roster kills the whole class, not just the one caller that did it.
+                let peer = match e {
+                    LiveEvent::NeighborUp(pk) | LiveEvent::NeighborDown(pk) => pk.to_string(),
+                    LiveEvent::InsertRemote { from, .. } => from.to_string(),
+                    LiveEvent::SyncFinished(se) => se.peer.to_string(),
+                    _ => String::new(),
+                };
+                if !peer.is_empty() && peer != self_id {
+                    if let Ok(mut r) = roster.lock() {
+                        match e {
+                            LiveEvent::NeighborUp(_) => r.note(&peer, Some(true)),
+                            LiveEvent::NeighborDown(_) => r.note(&peer, Some(false)),
+                            _ => r.note(&peer, None),
+                        }
                     }
                 }
             }
@@ -4468,6 +4547,49 @@ mod tests {
             from: None,
             manifest_fp: 0,
         }
+    }
+
+    /// Divergence detection must ignore members that are still catching up.
+    ///
+    /// A peer mid-initial-sync holds a partial manifest by definition, so its
+    /// fingerprint disagrees with everyone's — and comparing against it turned a
+    /// perfectly normal join into a fleet-wide "members disagree" alarm within a
+    /// minute, on every node, before the first sync had even finished. A member that
+    /// is *behind* is not a member that has *diverged*: the first fixes itself, the
+    /// second needs a human, and an alarm that cannot tell them apart is noise.
+    #[test]
+    fn divergence_ignores_peers_that_are_still_syncing() {
+        let syncing = eid(1).to_string();
+        let settled = eid(2).to_string();
+        let mut roster = PeerRoster::default();
+
+        let mut p = presence("Joining", seed_ipc::Role::Master);
+        p.percent = 42; // still pulling content down
+        p.manifest_fp = 0xAAAA; // partial view of the share
+        roster.note_presence(&syncing, p);
+
+        let mut q = presence("Settled", seed_ipc::Role::Master);
+        q.percent = 100;
+        q.manifest_fp = 0xBBBB;
+        roster.note_presence(&settled, q);
+
+        // The Healthy gate still sees everyone online, including the joiner.
+        let online = roster.online_manifest_fps();
+        assert_eq!(
+            online.len(),
+            2,
+            "both peers are online and advertise a manifest"
+        );
+
+        // Divergence only ever compares the settled one.
+        let fps = roster.settled_manifest_fps();
+        assert_eq!(
+            fps,
+            vec![0xBBBB],
+            "a peer that is still syncing must not be compared for divergence — it is \
+             behind, not diverged, and treating it as diverged makes every new share \
+             cry OutOfSync while it is still joining"
+        );
     }
 
     #[test]
