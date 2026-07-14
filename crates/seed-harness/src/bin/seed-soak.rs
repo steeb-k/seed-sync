@@ -573,12 +573,17 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
                             cpu,
                             rss_mb
                         )?;
-                        // Anomaly: OutOfSync sustained > 5 min.
-                        if status == "OutOfSync" {
+                        // Anomaly: OutOfSync or NoPeers sustained > 5 min. NoPeers is
+                        // tracked on the same clock because a partitioned node is
+                        // exactly as broken as a diverged one and, before it had a
+                        // status of its own, was the *quieter* of the two — it read
+                        // as Healthy, so a soak could sit on a fully-stranded node
+                        // for hours and report nothing (known-issues #16/#17).
+                        if status == "OutOfSync" || status == "NoPeers" {
                             let since = *out_of_sync_since.entry(n.idx).or_insert(elapsed);
                             if elapsed - since > 300 && (elapsed - since) < 300 + a.interval {
                                 anomalies.push(format!(
-                                    "t+{elapsed}s node-{:02} OutOfSync sustained > 5 min",
+                                    "t+{elapsed}s node-{:02} {status} sustained > 5 min",
                                     n.idx
                                 ));
                             }

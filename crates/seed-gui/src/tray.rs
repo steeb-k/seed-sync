@@ -10,7 +10,7 @@
 //! than quitting (see `main`), so the icon persists in the background. Double-
 //! clicking it (or the "Open" menu item) re-shows the window; "Quit" exits.
 
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::Arc;
 
 /// Everything the tray backends need from the GTK side. Bundled so the
@@ -21,20 +21,33 @@ pub struct TrayWiring {
     pub pause_tx: async_channel::Sender<()>,
     /// Current global pause state, written by the GTK side; drives the menu label.
     pub paused: Arc<AtomicBool>,
-    /// Fires when the tray should re-render — a pause flip or fresh throughput.
-    /// Used by the ksni backend (the `tray-icon` backend polls instead).
+    /// Fires when the tray should re-render — a pause flip, fresh throughput, or a
+    /// change in `stranded`. Used by the ksni backend (the `tray-icon` backend polls
+    /// instead).
     pub refresh_rx: async_channel::Receiver<()>,
     /// Latest throughput in bytes/sec as `(down, up)`, shown in the tooltip.
     pub speeds: Arc<(AtomicU64, AtomicU64)>,
+    /// How many shares can currently reach no member at all
+    /// ([`seed_ipc::ShareStatus::NoPeers`]). Surfaced in the tooltip because the
+    /// window is usually closed — this app lives in the tray, so a partition that is
+    /// only visible once you open the window is a partition nobody notices, which is
+    /// how known-issues #16 went unseen for a week.
+    pub stranded: Arc<AtomicUsize>,
 }
 
-/// The live down/up rate line for the tray tooltip, mirroring the window's bottom
-/// status bar (e.g. "↓ 1.2 Mbps   ↑ 0.3 Mbps").
-fn rate_line(speeds: &(AtomicU64, AtomicU64)) -> String {
+/// The tray tooltip: the live down/up rate line (mirroring the window's bottom
+/// status bar, e.g. "↓ 1.2 Mbps   ↑ 0.3 Mbps"), plus a warning line whenever some
+/// share can reach nobody.
+fn tooltip(speeds: &(AtomicU64, AtomicU64), stranded: &AtomicUsize) -> String {
     use std::sync::atomic::Ordering;
     let down = speeds.0.load(Ordering::Relaxed);
     let up = speeds.1.load(Ordering::Relaxed);
-    format!("↓ {}   ↑ {}", crate::fmt_speed(down), crate::fmt_speed(up))
+    let rate = format!("↓ {}   ↑ {}", crate::fmt_speed(down), crate::fmt_speed(up));
+    match stranded.load(Ordering::Relaxed) {
+        0 => rate,
+        1 => format!("{rate}\n⚠ 1 share has no members reachable"),
+        n => format!("{rate}\n⚠ {n} shares have no members reachable"),
+    }
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -52,6 +65,7 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow, wiring: 
         paused,
         refresh_rx: _refresh_rx,
         speeds,
+        stranded,
     } = wiring;
 
     // Opt the process into dark mode so native popups (the tray's context menu,
@@ -113,7 +127,7 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow, wiring: 
     let app = app.clone();
     let window = window.clone();
     let mut last_paused = paused.load(Ordering::Relaxed);
-    let mut last_speeds = (u64::MAX, u64::MAX);
+    let mut last_speeds = (u64::MAX, u64::MAX, usize::MAX);
     // Track the panel background theme so the glyph variant can be re-picked when
     // the user switches light/dark (taskbar on Windows, system appearance on
     // macOS) while the app is running.
@@ -136,13 +150,15 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow, wiring: 
             });
             last_paused = now_paused;
         }
-        // Refresh the tooltip when the throughput changes.
+        // Refresh the tooltip when the throughput — or the count of shares that can
+        // reach nobody — changes.
         let now_speeds = (
             speeds.0.load(Ordering::Relaxed),
             speeds.1.load(Ordering::Relaxed),
+            stranded.load(Ordering::Relaxed),
         );
         if now_speeds != last_speeds {
-            let _ = icon.set_tooltip(Some(format!("S.E.E.D.\n{}", rate_line(&speeds))));
+            let _ = icon.set_tooltip(Some(format!("S.E.E.D.\n{}", tooltip(&speeds, &stranded))));
             last_speeds = now_speeds;
         }
         let mut open_window = false;
@@ -333,6 +349,8 @@ mod linux {
         pause_tx: async_channel::Sender<()>,
         /// Live throughput `(down, up)` in bytes/sec, shown in the tooltip.
         speeds: std::sync::Arc<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
+        /// Shares that can reach no member at all; warned about in the tooltip.
+        stranded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl ksni::Tray for SeedTray {
@@ -354,7 +372,7 @@ mod linux {
         fn tool_tip(&self) -> ksni::ToolTip {
             ksni::ToolTip {
                 title: "S.E.E.D.".into(),
-                description: super::rate_line(&self.speeds),
+                description: super::tooltip(&self.speeds, &self.stranded),
                 icon_name: String::new(),
                 icon_pixmap: Vec::new(),
             }
@@ -458,6 +476,7 @@ mod linux {
             paused,
             refresh_rx,
             speeds,
+            stranded,
         } = wiring;
         let icons = load_icons();
         if icons.is_empty() {
@@ -490,6 +509,7 @@ mod linux {
             paused,
             pause_tx,
             speeds,
+            stranded,
         };
         let spawn = std::thread::Builder::new()
             .name("seed-tray".into())

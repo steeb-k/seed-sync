@@ -20,7 +20,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -570,6 +570,7 @@ fn build_ui(
     // tray click back to the GTK loop, where `net` is available to issue the IPC.
     let paused_state = Arc::new(AtomicBool::new(false));
     let tray_speeds = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+    let tray_stranded = Arc::new(AtomicUsize::new(0));
     let (tray_refresh_tx, tray_refresh_rx) = async_channel::unbounded::<()>();
     let (tray_pause_tx, tray_pause_rx) = async_channel::unbounded::<()>();
 
@@ -893,6 +894,7 @@ fn build_ui(
         let sidebar_stack = sidebar_stack.clone();
         let keys_nav = keys_nav.clone();
         let tray_speeds = tray_speeds.clone();
+        let tray_stranded = tray_stranded.clone();
         let rows: Rc<RefCell<HashMap<String, RowWidgets>>> = Rc::new(RefCell::new(HashMap::new()));
         glib::spawn_future_local(async move {
             // Which status page (if any) the main area should show. Recomputed on
@@ -927,6 +929,16 @@ fn build_ui(
                         // labels. Notify the tray only when it actually flips.
                         all_paused = !shares.is_empty() && shares.iter().all(|s| s.paused);
                         if paused_state.swap(all_paused, Ordering::Relaxed) != all_paused {
+                            let _ = tray_refresh_tx.send(()).await;
+                        }
+                        // Shares that can reach nobody, warned about in the tray
+                        // tooltip — the window is usually closed, so the tray is
+                        // where a partition has to be visible to be noticed.
+                        let stranded = shares
+                            .iter()
+                            .filter(|s| s.status == ShareStatus::NoPeers)
+                            .count();
+                        if tray_stranded.swap(stranded, Ordering::Relaxed) != stranded {
                             let _ = tray_refresh_tx.send(()).await;
                         }
                         if let Some(lbl) = pause_all_btn.child().and_downcast::<gtk::Label>() {
@@ -1108,6 +1120,7 @@ fn build_ui(
             paused: paused_state.clone(),
             refresh_rx: tray_refresh_rx,
             speeds: tray_speeds.clone(),
+            stranded: tray_stranded.clone(),
         },
     );
 
@@ -1282,6 +1295,7 @@ fn status_text(s: &ShareSummary) -> String {
         }
         ShareStatus::Paused => "Paused".into(),
         ShareStatus::OutOfSync => "⚠ Out of sync — members disagree".into(),
+        ShareStatus::NoPeers => "⚠ No members reachable".into(),
     }
 }
 

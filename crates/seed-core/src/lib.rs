@@ -22,6 +22,7 @@ pub mod manifest;
 pub mod node;
 pub mod presence;
 pub mod relays;
+pub mod rendezvous;
 pub mod scan;
 pub mod secrets;
 

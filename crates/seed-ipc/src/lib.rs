@@ -221,6 +221,18 @@ pub enum ShareStatus {
     /// the settle window: members hold different filesets. Surfaced distinctly so a
     /// silent multi-member divergence can't hide behind "Healthy".
     OutOfSync,
+    /// This node can reach **no member of the share at all** — it is partitioned from
+    /// the pool (and so is neither syncing nor able to detect that it has diverged).
+    ///
+    /// Distinct from `Healthy` because it used to be indistinguishable from it: every
+    /// peer comparison the engine makes is over the set of *online* peers, and all of
+    /// them are vacuously true of an empty set, so a fully-partitioned node reported
+    /// `Healthy 100%` — 100% of nothing. That is what hid the cold-join bootstrap
+    /// failure (known-issues #16) on a live share for over a week.
+    ///
+    /// Not reported for a share this device created that nobody has joined yet: being
+    /// alone there is the expected steady state, not a partition.
+    NoPeers,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

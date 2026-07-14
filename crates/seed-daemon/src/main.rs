@@ -408,6 +408,21 @@ async fn presence_loop(daemon: Daemon) {
                     let _ = tokio::time::timeout(Duration::from_secs(30), resync.run()).await;
                 });
             }
+
+            // Rendezvous (known-issues #16): masters advertise their address under
+            // the share's public key so that *any* live master can bootstrap a
+            // joiner — not just the one device whose endpoint id happens to be
+            // baked into the key. Both halves are internally throttled (publish
+            // every ~2min; lookup only while a share can reach nobody), so asking
+            // every tick is cheap and a healthy pool never looks anything up.
+            let publishes = { daemon.engine.lock().await.rendezvous_publishes() };
+            for publish in publishes {
+                tokio::spawn(publish.run());
+            }
+            let dials = { daemon.engine.lock().await.rendezvous_dials() };
+            for dial in dials {
+                tokio::spawn(dial.run());
+            }
             let verified = { daemon.engine.lock().await.periodic_deep_verify() };
             if !verified.is_empty() {
                 tracing::info!(

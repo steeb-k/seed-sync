@@ -71,6 +71,13 @@ impl From<seed_ipc::Role> for Role {
 
 /// Keeps an `Error` variant the engine no longer produces (`seed_ipc` dropped
 /// it as dead) so the Android ABI and existing Kotlin `when` arms stay valid.
+///
+/// **Variant order is the ABI.** UniFFI marshals this enum by *ordinal*, and the
+/// generated Kotlin (`FfiConverterTypeShareStatus`) reads it back as
+/// `values()[ordinal]` — so a variant inserted in the middle silently renumbers
+/// every one after it, and a Kotlin binding that wasn't regenerated in lockstep
+/// would then decode every status as its neighbour. Only ever **append**, and
+/// regenerate `android/app/src/main/java/uniffi/seed_mobile/seed_mobile.kt`.
 #[derive(Debug, Clone, Copy, uniffi::Enum)]
 pub enum ShareStatus {
     Healthy,
@@ -79,6 +86,7 @@ pub enum ShareStatus {
     Paused,
     Error,
     OutOfSync,
+    NoPeers,
 }
 
 impl From<seed_ipc::ShareStatus> for ShareStatus {
@@ -89,6 +97,7 @@ impl From<seed_ipc::ShareStatus> for ShareStatus {
             seed_ipc::ShareStatus::Indexing => ShareStatus::Indexing,
             seed_ipc::ShareStatus::Paused => ShareStatus::Paused,
             seed_ipc::ShareStatus::OutOfSync => ShareStatus::OutOfSync,
+            seed_ipc::ShareStatus::NoPeers => ShareStatus::NoPeers,
         }
     }
 }
@@ -513,6 +522,20 @@ async fn reconcile_loop(inner: Arc<Inner>) {
             let rejoins = { inner.engine.lock().await.presence_rejoins() };
             for rejoin in rejoins {
                 rejoin.join().await;
+            }
+
+            // Rendezvous (known-issues #16). Both halves are internally throttled,
+            // so asking on every 8th tick is cheap: a master publishes its address
+            // every ~2min, and a lookup happens only while a share can reach no
+            // member at all. Detached, because a resolve is a network round trip
+            // and this loop also drives reconcile.
+            let publishes = { inner.engine.lock().await.rendezvous_publishes() };
+            for publish in publishes {
+                tokio::spawn(publish.run());
+            }
+            let dials = { inner.engine.lock().await.rendezvous_dials() };
+            for dial in dials {
+                tokio::spawn(dial.run());
             }
         }
 

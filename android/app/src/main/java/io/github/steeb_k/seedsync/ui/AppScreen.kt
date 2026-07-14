@@ -247,10 +247,15 @@ private fun ShareRow(share: ShareSummary, actions: ScreenActions) {
 
 @Composable
 private fun StatusDot(share: ShareSummary) {
+    // NO_PEERS must be matched explicitly: the `else` arm below means "syncing", and
+    // letting a share that can reach nobody fall through to it would paint a total
+    // partition the same amber as ordinary progress — the Android echo of the
+    // "Healthy 100% while talking to no one" bug (known-issues #17).
     val color = when {
         share.paused -> Color(0xFF9E9E9E)
         share.status == ShareStatus.ERROR -> Color(0xFFD32F2F)
         share.status == ShareStatus.OUT_OF_SYNC -> Color(0xFFD32F2F)
+        share.status == ShareStatus.NO_PEERS -> Color(0xFFD32F2F)
         share.status == ShareStatus.HEALTHY -> Color(0xFF2E7D32)
         else -> Color(0xFFF9A825) // syncing / indexing
     }
@@ -266,6 +271,7 @@ private fun statusLabel(share: ShareSummary): String = when {
         ShareStatus.PAUSED -> "Paused"
         ShareStatus.ERROR -> "Error"
         ShareStatus.OUT_OF_SYNC -> "⚠ Out of sync"
+        ShareStatus.NO_PEERS -> "⚠ No members reachable"
     } + roleSuffix(share.role)
 }
 

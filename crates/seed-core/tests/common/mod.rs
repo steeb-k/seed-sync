@@ -177,11 +177,18 @@ impl Cluster {
     }
 
     /// Converged = every folder matches `want`, all fingerprints agree, and no
-    /// node reports OutOfSync.
+    /// node reports OutOfSync or NoPeers.
+    ///
+    /// NoPeers is excluded for the same reason OutOfSync is: it is a state in which
+    /// the node's agreement with the pool is not actually established. A stranded
+    /// node trivially "agrees" with every peer it can hear, because it can hear
+    /// none — which is precisely the vacuous-truth trap that let a partition pass
+    /// for perfect health (known-issues #17).
     pub fn converged(&self, want: &BTreeMap<String, Vec<u8>>) -> bool {
         self.folders_match(want)
             && self.fps_agree()
-            && (0..self.nodes.len()).all(|i| self.status(i) != "OutOfSync")
+            && (0..self.nodes.len())
+                .all(|i| self.status(i) != "OutOfSync" && self.status(i) != "NoPeers")
     }
 
     /// Best-effort teardown, bounded per node so a wedged iroh close can't

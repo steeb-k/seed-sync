@@ -240,6 +240,21 @@ impl PeerRoster {
         self.peers.keys().cloned().collect()
     }
 
+    /// Every member we know of: heard this session, *or* remembered from an earlier
+    /// one. The remembered half is what makes a restart survive any single peer
+    /// being down — `peer_names` has persisted every member's full endpoint id all
+    /// along, but until known-issues #16 it was only ever read to *label* the
+    /// roster, never to dial. See [`peer_providers`].
+    fn known_peer_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.peers.keys().cloned().collect();
+        for id in self.remembered.keys() {
+            if !self.peers.contains_key(id) {
+                ids.push(id.clone());
+            }
+        }
+        ids
+    }
+
     /// Peer-id strings currently considered online (heard-from within the TTL).
     /// Used to pick live content providers for a download — read at download time
     /// so it reflects who is actually around now, not a stale job snapshot.
@@ -583,8 +598,21 @@ fn try_reclaim_owned_data(blobs_dir: &Path, hash: Hash) -> bool {
     }
 }
 
-/// Provider endpoint ids to re-fetch content from during self-heal: the master
-/// (its id is carried in the share key) first, then any peers seen in the roster.
+/// Every endpoint id we could dial for a share: the creating master (its id is
+/// carried in the share key) first, then every member the roster knows — heard this
+/// session *or* remembered from an earlier one.
+///
+/// The remembered half matters more than it looks. The creator's id is the only
+/// thing a bare share key carries, so before known-issues #16 this set collapsed to
+/// exactly one device whenever the roster was cold — and a joiner or a just-restarted
+/// node whose creator happened to be offline had nowhere to dial at all, no matter
+/// how many other masters were up. `peer_names` had persisted every member's full
+/// endpoint id all along; it was simply never read for dialing. Including it here
+/// fixes every case *except* the first-ever join (where there is nothing remembered
+/// yet) — that one needs [`crate::rendezvous`].
+///
+/// Feeds presence mesh repair, doc resync, and content self-heal. Offline entries
+/// are harmless: the dial just fails.
 fn peer_providers(key: &ShareKey, roster: &Arc<StdMutex<PeerRoster>>) -> Vec<EndpointId> {
     let mut ids = Vec::new();
     if let Some(eid) = key.endpoint_id() {
@@ -593,7 +621,7 @@ fn peer_providers(key: &ShareKey, roster: &Arc<StdMutex<PeerRoster>>) -> Vec<End
         }
     }
     if let Ok(r) = roster.lock() {
-        for s in r.peer_ids() {
+        for s in r.known_peer_ids() {
             if let Ok(id) = s.parse::<EndpointId>() {
                 if !ids.contains(&id) {
                     ids.push(id);
@@ -2233,6 +2261,17 @@ struct ShareState {
     /// of sync; throttles the self-heal to one kick per
     /// [`DIVERGENCE_RESYNC_KICK_SECS`] (the daemon *asks* every ~6s).
     last_doc_resync: i64,
+    /// Whether *this* device minted the share key (its endpoint id is the one baked
+    /// into the key). Distinguishes "a share I created that nobody has joined yet",
+    /// where having no members is the expected steady state, from "a share I joined
+    /// but cannot reach anyone in" — which is a partition (see [`Self::isolated`]).
+    we_minted: bool,
+    /// Unix seconds of the last rendezvous lookup for this share; throttles it to one
+    /// per [`crate::rendezvous::LOOKUP_SECS`] (the daemon *asks* every ~6s).
+    last_rendezvous: i64,
+    /// Unix seconds of the last rendezvous publish (masters only); throttles it to
+    /// one per [`crate::rendezvous::REPUBLISH_SECS`].
+    last_rendezvous_publish: i64,
 }
 
 impl ShareState {
@@ -2263,6 +2302,28 @@ impl ShareState {
                     .all(|fp| *fp == self.manifest_fp)
             })
             .unwrap_or(true)
+    }
+
+    /// Whether this node can reach **no member at all** of a share that ought to have
+    /// members — i.e. it is partitioned from the pool.
+    ///
+    /// This is the condition that used to be indistinguishable from perfect health
+    /// (known-issues #17). Every peer-comparison in the engine — the health percent,
+    /// [`Self::converged_with_online_peers`], the consensus fingerprint — is computed
+    /// over the set of *online* peers, and each is vacuously satisfied by an empty
+    /// set. A totally partitioned node therefore agreed with everyone it could hear
+    /// (nobody), held everything it knew about (nothing), and reported `Healthy 100%`.
+    /// That is what hid known-issues #16 on a live share for over a week.
+    ///
+    /// An empty comparison set is not health, it is *ignorance* — with one genuine
+    /// exception, which is why this is not simply "no online peers": a share this
+    /// device **created** that nobody has joined yet is legitimately alone, and must
+    /// keep reading Healthy. Every other case — we joined someone else's share, or we
+    /// created one that members *did* join and can now reach none of them — is a
+    /// partition and says so.
+    fn isolated(&self) -> bool {
+        let (online, known) = self.roster.lock().map(|r| r.counts()).unwrap_or((0, 0));
+        online == 0 && (known > 0 || !self.we_minted)
     }
 }
 
@@ -2688,25 +2749,6 @@ impl Engine {
 
         std::fs::create_dir_all(folder)?;
 
-        // If no explicit bootstrap was given, any node added from a share key can
-        // reach the *creating* node by its endpoint id (carried in the key) via n0
-        // DNS discovery — build an address with just the id and let discovery
-        // resolve it. This applies to a master added from a master key just as much
-        // as to a viewer (multi-master): both must dial the creator for doc sync.
-        // The creating master's own key carries its own id, so skip dialing
-        // ourselves.
-        let mut bootstrap = bootstrap;
-        if bootstrap.is_empty() {
-            if let Some(eid) = key.endpoint_id() {
-                if let Ok(pk) = iroh::EndpointId::from_bytes(&eid) {
-                    if pk != self.node.endpoint.id() {
-                        tracing::info!("no bootstrap given; using endpoint-id discovery");
-                        bootstrap.push(iroh::EndpointAddr::new(pk));
-                    }
-                }
-            }
-        }
-
         // Subscribe (keeps live sync alive + feeds the peer roster) and register
         // the namespace for serving + connect to any bootstrap peers.
         let roster = Arc::new(StdMutex::new(PeerRoster::default()));
@@ -2721,6 +2763,47 @@ impl Engine {
             }
             Err(e) => tracing::debug!("load remembered peer names: {e:#}"),
         }
+
+        // If no explicit bootstrap was given, dial every member we know of by
+        // endpoint id, letting n0 DNS discovery resolve each to an address: the
+        // *creating* device (its id is the one thing a bare share key carries), plus
+        // every member remembered from an earlier session. This applies to a master
+        // added from a master key just as much as to a viewer (multi-master): both
+        // must reach *some* member to sync the doc. Our own id is dropped — a
+        // creating master's key carries its own, and dialing yourself warns.
+        //
+        // Dialing only the creator is known-issues #16: it made the creating device a
+        // silent single point of failure for every later join and restart. Adding the
+        // remembered members closes that for any node that has synced at least once.
+        // A first-ever join has nothing remembered yet, and is covered instead by
+        // [`crate::rendezvous`].
+        let self_id = self.node.endpoint.id();
+        let mut bootstrap = bootstrap;
+        if bootstrap.is_empty() {
+            let mut ids: Vec<EndpointId> = Vec::new();
+            if let Some(eid) = key.endpoint_id() {
+                if let Ok(pk) = EndpointId::from_bytes(&eid) {
+                    ids.push(pk);
+                }
+            }
+            if let Ok(r) = roster.lock() {
+                ids.extend(
+                    r.known_peer_ids()
+                        .iter()
+                        .filter_map(|s| s.parse::<EndpointId>().ok()),
+                );
+            }
+            ids.retain(|pk| *pk != self_id);
+            ids.sort();
+            ids.dedup();
+            if !ids.is_empty() {
+                tracing::info!(
+                    "no bootstrap given; using endpoint-id discovery for {} known member(s)",
+                    ids.len()
+                );
+                bootstrap.extend(ids.into_iter().map(iroh::EndpointAddr::new));
+            }
+        }
         spawn_event_task(&doc, roster.clone()).await?;
 
         // Presence: a per-share gossip topic carrying each member's name + health.
@@ -2728,7 +2811,6 @@ impl Engine {
         // explicit bootstrap addrs), minus ourselves — a master's key carries its
         // own endpoint id, and dialing yourself warns. Best-effort: a subscribe
         // failure must not fail opening the share.
-        let self_id = self.node.endpoint.id();
         let mut presence_bootstrap: Vec<EndpointId> = bootstrap.iter().map(|a| a.id).collect();
         if let Some(eid) = key.endpoint_id() {
             if let Ok(pk) = EndpointId::from_bytes(&eid) {
@@ -2789,6 +2871,9 @@ impl Engine {
                 diverged_deep_verified: false,
                 full_scans: 0,
                 last_doc_resync: 0,
+                we_minted: key.endpoint_id() == Some(self.node.endpoint_id_bytes()),
+                last_rendezvous: 0,
+                last_rendezvous_publish: 0,
             },
             bootstrap,
         ))
@@ -2796,6 +2881,12 @@ impl Engine {
 
     pub fn endpoint_addr(&self) -> iroh::EndpointAddr {
         self.node.addr()
+    }
+
+    /// This node's iroh endpoint. Exposed for [`crate::rendezvous`]'s publish/resolve,
+    /// which borrow the endpoint's TLS trust anchors and DNS resolver.
+    pub fn endpoint(&self) -> &iroh::Endpoint {
+        &self.node.endpoint
     }
 
     /// This node's dialable address as an endpoint-ticket string, for handing to
@@ -2847,6 +2938,15 @@ impl Engine {
                 } else if let Some(&(done, tot)) = progress.get(id) {
                     let pct = (done.min(tot) * 100).checked_div(tot).unwrap_or(0) as u8;
                     (seed_ipc::ShareStatus::Indexing, pct, done, tot)
+                } else if s.isolated() {
+                    // Ranked above OutOfSync deliberately. Divergence is a claim about
+                    // what our *peers* hold, and `diverged_since` is sticky — so a node
+                    // that diverged and then lost every peer would keep insisting
+                    // "members disagree" about members it can no longer hear at all.
+                    // Being partitioned is both the truer statement and the one the
+                    // user has to fix first: no other condition can even be assessed,
+                    // let alone repaired, until this node can reach somebody.
+                    (seed_ipc::ShareStatus::NoPeers, s.health, 0, 0)
                 } else if out_of_sync {
                     // Members disagree on the fileset past the settle window — the most
                     // serious steady-state condition; never read "Healthy".
@@ -3071,8 +3171,22 @@ impl Engine {
 
             // Self: degraded only while unpaused with someone online to sync
             // against — a lone or user-paused node never nags its operator.
+            //
+            // With one exception, and it is the whole point of known-issues #17:
+            // being unable to hear *anyone* is not the same as being alone. The
+            // old rule lumped them together and treated both as Offline, which
+            // pauses the episode clock — so a node partitioned from its entire
+            // pool accrued no unhealthy time and never raised an alert. A share
+            // we joined (or one whose members we have known and can now reach
+            // none of) is degraded, and says so on the same 12h escalation as any
+            // other long-term fault. A share we created that nobody has joined is
+            // still genuinely alone, and still stays quiet.
             let any_online_peer = snap.iter().any(|p| p.online);
-            let self_obs = if state.paused || paused_all || !any_online_peer {
+            let self_obs = if state.paused || paused_all {
+                Observation::Offline
+            } else if state.isolated() {
+                Observation::OnlineDegraded
+            } else if !any_online_peer {
                 Observation::Offline
             } else if state.health < 100 || state.is_out_of_sync() {
                 Observation::OnlineDegraded
@@ -3454,6 +3568,87 @@ impl Engine {
                 share_id: id.clone(),
                 doc: s.doc.clone(),
                 peers,
+            });
+        }
+        out
+    }
+
+    /// Each master's periodic rendezvous publish: advertise this device's address
+    /// under the share's public key, so any key holder can find a live master without
+    /// the creating device being up (known-issues #16). Built under the engine lock,
+    /// awaited off it — see [`DocResync`] for why that split is mandatory.
+    ///
+    /// Masters only: signing the record needs the share seed, which is exactly what a
+    /// viewer key does not carry.
+    ///
+    /// Deliberately **not** gated on pause. A pause means "stop syncing this folder",
+    /// not "make this pool unjoinable" — and suppressing the advertisement while
+    /// paused would carve out a fresh #16-shaped hole, where a joiner is stranded
+    /// because the one master that was up happened to be paused. The record is a
+    /// reachability advertisement, not sync work, and costs one small HTTP PUT per
+    /// [`rendezvous::REPUBLISH_SECS`].
+    pub fn rendezvous_publishes(&mut self) -> Vec<crate::rendezvous::RendezvousPublish> {
+        let endpoint = self.node.endpoint.clone();
+        // No relay home and no direct addresses yet (startup, or offline): there is
+        // nothing dialable to advertise. Bail *before* the throttle is stamped —
+        // stamping here would burn the attempt and leave a just-restarted master
+        // unadvertised for a full republish interval, which is the exact window a
+        // joiner is most likely to be waiting in.
+        if endpoint.addr().addrs.is_empty() {
+            return Vec::new();
+        }
+        let now = now_secs();
+        let mut out = Vec::new();
+        for (id, s) in self.shares.iter_mut() {
+            let Some(seed) = s.key.seed_bytes() else {
+                continue; // viewer: cannot sign the record
+            };
+            if now - s.last_rendezvous_publish < crate::rendezvous::REPUBLISH_SECS {
+                continue;
+            }
+            s.last_rendezvous_publish = now;
+            out.push(crate::rendezvous::RendezvousPublish {
+                share_id: id.clone(),
+                endpoint: endpoint.clone(),
+                seed,
+            });
+        }
+        out
+    }
+
+    /// Rendezvous lookups for shares that can currently reach **no** member: resolve
+    /// whichever master published most recently and bootstrap doc sync + presence
+    /// gossip from it.
+    ///
+    /// This is the path that rescues a node the rest of the engine cannot: a
+    /// first-ever join whose creator is offline has nothing in `peer_names` to fall
+    /// back on (so [`peer_providers`] is just the dead creator), no doc replica (so
+    /// the member registry is empty), and no gossip contact (so presence is silent).
+    /// Every existing repair mechanism is downstream of first contact. This one is
+    /// not: it needs only the share's public key, which every key holder has.
+    ///
+    /// Throttled to one lookup per share per [`rendezvous::LOOKUP_SECS`] and skipped
+    /// entirely once *any* member is reachable — a healthy pool never touches the
+    /// pkarr server.
+    pub fn rendezvous_dials(&mut self) -> Vec<crate::rendezvous::RendezvousDial> {
+        let endpoint = self.node.endpoint.clone();
+        let paused_all = self.paused_all();
+        let now = now_secs();
+        let mut out = Vec::new();
+        for (id, s) in self.shares.iter_mut() {
+            if s.paused || paused_all || !s.isolated() {
+                continue;
+            }
+            if now - s.last_rendezvous < crate::rendezvous::LOOKUP_SECS {
+                continue;
+            }
+            s.last_rendezvous = now;
+            out.push(crate::rendezvous::RendezvousDial {
+                share_id: id.clone(),
+                endpoint: endpoint.clone(),
+                master_pub: s.key.master_pub_bytes(),
+                doc: s.doc.clone(),
+                presence: s.presence.as_ref().map(|h| h.sender.clone()),
             });
         }
         out

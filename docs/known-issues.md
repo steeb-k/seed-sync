@@ -20,8 +20,8 @@ why, and the fix or disposition.
 | 13 | iroh-docs `del` is prefix deletion (prefix-nested filenames collide) | design note (latent, rare, self-healing) |
 | 14 | replicated ignore-list *content* never reaches peers (silent local fallback) | **open** (found 2026-07-10 during member-registry work) |
 | 15 | doc writes during a virgin replica's initial sync churn the session (can re-open #12) | latent (member registry gated; ignore publish still exposed) |
-| 16 | cold-join bootstrap is a single creator endpoint id — any master *should* be able to bootstrap, none can | **open** (found 2026-07-14, live 5-member pool) |
-| 17 | a fully-partitioned node reports `Healthy 100%` (health of an empty peer set) | **open** (found 2026-07-14 — this is what hid #16 for a week) |
+| 16 | cold-join bootstrap is a single creator endpoint id — any master *should* be able to bootstrap, none can | **fixed** (share-key pkarr rendezvous + remembered members in the dial set) |
+| 17 | a fully-partitioned node reports `Healthy 100%` (health of an empty peer set) | **fixed** (`ShareStatus::NoPeers`) |
 
 Three vendored crates carry the upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
 `vendor/iroh-docs` — see `[patch.crates-io]` in the workspace `Cargo.toml`).
@@ -591,9 +591,11 @@ on `replica_seen` the same way (one-pass delay, same as member records).
 ## 16. Cold-join bootstrap is a single creator endpoint id — the creator is a silent SPOF
 **Tier:** confirmed (reproduced + fixed live on a 5-member pool, 2026-07-14)
 **Severity:** high (a new member cannot join at all while one specific device is offline)
-**Status:** open
-**Where:** `crates/seed-core/src/engine.rs:2698-2707` (`open_share`'s bootstrap
-resolution) and `ShareKeyPayload.endpoint_id` (`crates/seed-core/src/identity.rs:40-44`)
+**Status:** **fixed** (2026-07-14)
+**Where:** `open_share`'s bootstrap resolution + `peer_providers`
+(`crates/seed-core/src/engine.rs`), `ShareKeyPayload.endpoint_id`
+(`crates/seed-core/src/identity.rs`), and the fix in
+`crates/seed-core/src/rendezvous.rs`
 
 **Symptom:** a device added from a share key never syncs. It shows **exactly one**
 other member — no name, role "Viewer", offline, 0% — while the share itself reports
@@ -647,47 +649,100 @@ implicated** — the daemon's SQLite store round-trips fine (`reloaded 1 share(s
 the arch is irrelevant. The now-deleted `docs/arm64-triage.md` documented that false
 trail.
 
-**Fix directions (in ascending order of correctness):**
-- *Operational, no code:* keep one always-on member (e.g. alongside the relay host)
-  and mint invite keys **from it**, so the creator id baked into every key belongs to a
-  device that is always up.
-- *Small, contained:* feed the remembered members into the bootstrap set. `peer_names`
-  already stores every member's full endpoint id and `open_share` already loads those
-  rows — also dial them, alongside the creator's id. This makes every *restart*
-  resilient to any single peer being down; the creator then only matters for the
-  first-ever join.
-- *The actual fix — a rendezvous derived from the share key.* The master pubkey is an
-  ed25519 keypair every key holder already has, and iroh already depends on pkarr.
-  Have each master periodically publish its `EndpointAddr` to a pkarr record signed by
-  the **share** key; a joiner resolves it by public key (viewers hold `master_pub`,
-  which is all resolution needs). Any key holder then finds whichever master published
-  most recently — no designated creator, no anchor host, no ticket to distribute.
-  Masters share one signing key, so the record is last-writer-wins — which is fine:
-  you only need one live master to get in.
+**Fixed (2026-07-14)** in two layers, both of which were needed — the cheap one does
+not actually fix the reported bug:
+
+1. **Remembered members join the dial set** (`peer_providers`, `engine.rs`;
+   `PeerRoster::known_peer_ids`). `peer_names` had persisted every member's full
+   endpoint id all along, and `open_share` already loaded those rows — but only ever to
+   *label* the roster, never to dial. They now seed `open_share`'s bootstrap and feed
+   presence rejoin, doc resync, and content self-heal. This makes every **restart**
+   resilient to any single member being down. It does **not** rescue a first-ever join,
+   which has nothing remembered yet — which is exactly the case that was reported, and
+   why (2) is the real fix rather than a nicety.
+
+2. **A rendezvous derived from the share key** (`crates/seed-core/src/rendezvous.rs`).
+   Every master periodically publishes its own `EndpointAddr` as a [pkarr] signed packet
+   **named by the share's public key and signed with the share seed** — not with its
+   device key. Any key holder resolves that name with nothing but the key it already
+   has. Two properties make the share keypair the right name to use:
+   - *Viewers resolve but cannot publish.* Resolving needs only `master_pub`; signing
+     needs `master_seed`. `PkarrRelayClient::resolve` verifies the signature against the
+     name requested, so a viewer can neither forge a record nor clobber the real one to
+     deny bootstrap.
+   - *No designated device.* All masters publish under one name, so the record is
+     last-writer-wins — which is the self-healing property, not a flaw: a master that is
+     down stops republishing, so the newest packet is by construction from one that was
+     alive within the last `REPUBLISH_SECS` (120s). Nothing to elect, keep up, or fail
+     over.
+
+   The packet is *named* by a key that is nobody's node, so the publishing master's
+   endpoint id rides in `UserData` while its relay URL and direct addresses use the
+   record's normal address fields; `resolve` recombines them into a dialable
+   `EndpointAddr`. Lookups happen only while a share can reach **nobody** (throttled to
+   one per `LOOKUP_SECS`), so a healthy pool never contacts the pkarr server at all.
+
+**Rollout:** the rendezvous only helps once the *masters* run this code — a joiner on
+the new build still cannot find a pool of 0.6.x masters, because none of them publishes.
+Update the masters first.
+
+**Privacy:** the record maps a share's public key to a master's addresses, and the
+pkarr server operator sees that mapping. Anyone who can resolve it already holds a share
+key, so the exposure is to the server, not the world. We use n0's public server
+(`N0_DNS_PKARR_RELAY_PROD`), which n0 supports for production use. Self-hosting is a
+one-constant change plus an `iroh-dns-server` — note that an **iroh relay does not serve
+pkarr**; it is a separate service, so a self-hosted rendezvous means a second daemon next
+to the relay, not a relay setting.
 
 **Note on tickets:** handing out a bootstrap ticket alongside the key is a manual
 unblock, not a model. A ticket is a *snapshot of an address*, so it goes stale exactly
 when it is needed, and it trades one single-device dependency for another.
 
+**Tests:** `crates/seed-core/tests/rendezvous.rs` (`--ignored`; real endpoints +
+internet). `joiner_with_a_dead_creator_still_syncs_via_rendezvous` reproduces this bug
+exactly — a key whose baked-in creator id is dead — and proves the joiner reaches a live
+master and syncs. Verified by falsification: with the rendezvous dial removed, it never
+syncs.
+
+[pkarr]: https://pkarr.org
+
 ---
 
 ## 17. A fully-partitioned node reports `Healthy 100%` (health of an empty set)
 **Tier:** confirmed · **Severity:** medium (silent: total partition is indistinguishable
-from perfect health) · **Status:** open
-**Where:** the health calculation, `crates/seed-core/src/engine.rs:3064`
+from perfect health) · **Status:** **fixed** (2026-07-14)
+**Where:** `ShareState::isolated` + `list_summaries` + `health_alerts`,
+`crates/seed-core/src/engine.rs`; `ShareStatus::NoPeers`, `crates/seed-ipc/src/lib.rs`
 
-**Issue:** health is computed over peers filtered by
-`p.online && p.is_master && p.manifest_fp != 0`. A node that has reached **no** masters
-at all has an empty set to be unhealthy against, so it reports `Healthy 100%` — 100% of
-nothing. Every screen therefore reads "fine" on a node that has no working peer
-connectivity and no document sync whatsoever. This is precisely what let #16 sit
-undetected on a live share for over a week, and what made the eventual symptom so
-confusing (a share simultaneously reporting `Healthy 100%` and a single unhealthy,
-nameless member).
+**Issue:** every peer comparison the engine makes filters on *online* peers — the health
+percent, `converged_with_online_peers`, the consensus fingerprint — and all of them are
+vacuously true of an empty set. A node that reached **no** masters therefore agreed with
+everyone it could hear (nobody) and held everything it knew about (nothing), and
+reported `Healthy 100%` — 100% of nothing. Every screen read "fine" on a node with no
+peer connectivity and no document sync whatsoever. This is what let #16 sit undetected on
+a live share for over a week, and what made the eventual symptom so confusing (a share
+simultaneously reporting `Healthy 100%` and one unhealthy, nameless member).
 
-**Fix direction:** an empty comparison set is not health, it is *unknown*. Report a
-distinct state (e.g. `NoPeers` / "no members reachable") when there are zero online
-masters to compare against, rather than collapsing it to 100%. The member count is
-already known (`counts()` returns `(online, total)`, `engine.rs:280`), so a node that
-knows about members but can hear none of them is directly detectable — and, given #16,
-worth surfacing loudly.
+**Fixed:** an empty comparison set is not health, it is *ignorance*. A new
+`ShareStatus::NoPeers` is reported whenever a share can reach no member — ranked above
+`OutOfSync`, because `diverged_since` is sticky and a node that diverged and then lost
+every peer would otherwise keep insisting "members disagree" about members it can no
+longer hear at all.
+
+The subtlety that makes this more than "warn when the peer list is empty": **two** states
+have zero reachable peers, and only one is a fault. A share this device *created* that
+nobody has joined yet is genuinely alone and stays `Healthy` — flagging it would cry wolf
+on every freshly-created share, which is how you train people to ignore the real alarm.
+So `isolated()` is `online == 0 && (known > 0 || !we_minted)`.
+
+`health_alerts` no longer treats "no online peers" as `Offline` (which *pauses* the
+episode clock, so a partitioned node accrued no unhealthy time and never alerted). An
+isolated share is now `OnlineDegraded` and escalates on the normal 12h track. The state is
+surfaced in the GUI status label, the **tray tooltip** (the window is usually closed —
+a partition only visible once you open the app is a partition nobody notices), the
+Android status dot + label, and the soak harness's anomaly detector.
+
+**Tests:** `crates/seed-core/tests/isolation.rs` (`--ignored`). Both halves are pinned:
+a lone creator stays `Healthy`; a partitioned master reports `NoPeers`. Verified by
+falsification — with the check disabled, the partitioned master reports `Healthy`, which
+is the original symptom exactly.
