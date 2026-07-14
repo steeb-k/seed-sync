@@ -339,6 +339,12 @@ mod linux {
 
     /// The StatusNotifier item. Holds pre-rendered ARGB icons and a sender that
     /// hands interactions (run on the ksni thread) back to the GTK main loop.
+    ///
+    /// `Clone` because registering with the watcher consumes the tray
+    /// (`TrayMethods::spawn(self)`), and registration has to be *retried* — see the
+    /// spawn loop in `install`. Every field is a handle or a pre-rendered buffer, so
+    /// cloning is cheap.
+    #[derive(Clone)]
     struct SeedTray {
         icons: Vec<ksni::Icon>,
         tx: async_channel::Sender<TrayCmd>,
@@ -526,18 +532,61 @@ mod linux {
                     }
                 };
                 rt.block_on(async move {
-                    match tray.spawn().await {
-                        Ok(handle) => {
-                            tracing::info!("system tray installed (ksni/StatusNotifier)");
-                            // Re-render (menu label + tooltip) whenever the GTK side
-                            // signals a change — a pause flip or fresh throughput.
-                            while refresh_rx.recv().await.is_ok() {
-                                let _ = handle.update(|_| {}).await;
+                    // Registering with the StatusNotifierWatcher must be RETRIED, not
+                    // attempted once.
+                    //
+                    // The watcher is provided by the desktop shell (or a tray
+                    // extension), and at login an autostarted GUI routinely reaches
+                    // this point before the shell has claimed its bus name — we race
+                    // it. A single attempt therefore fails exactly when the tray
+                    // matters most, and because nothing retried, the icon then stayed
+                    // missing for the entire life of the process: the only way anyone
+                    // ever saw it was to kill the app and start it again by hand, once
+                    // the shell was up. Same shape of bug as the keystore race in
+                    // known-issues #18 — start too early, fail once, never recover.
+                    //
+                    // ksni handles the watcher going away *after* a successful
+                    // registration (see `Tray::watcher_offline`), so this loop is only
+                    // about getting registered in the first place.
+                    let mut delay = std::time::Duration::from_secs(1);
+                    let mut attempt: u32 = 0;
+                    let handle = loop {
+                        attempt += 1;
+                        match tray.clone().spawn().await {
+                            Ok(h) => {
+                                tracing::info!(
+                                    "system tray installed (ksni/StatusNotifier) \
+                                     on attempt {attempt}"
+                                );
+                                break h;
                             }
-                            std::future::pending::<()>().await;
+                            Err(e) => {
+                                // Warn once (this is normal at login), then go quiet:
+                                // a desktop with no tray support at all would otherwise
+                                // log forever.
+                                if attempt == 1 {
+                                    tracing::warn!(
+                                        "no StatusNotifier tray yet ({e}); \
+                                         retrying in the background"
+                                    );
+                                } else {
+                                    tracing::debug!("tray registration attempt {attempt}: {e}");
+                                }
+                                tokio::time::sleep(delay).await;
+                                // Back off to a slow poll: the watcher may appear
+                                // seconds later (shell still starting) or much later
+                                // (user enables a tray extension), and one D-Bus call
+                                // every 30s costs nothing while we wait.
+                                delay = (delay * 2).min(std::time::Duration::from_secs(30));
+                            }
                         }
-                        Err(e) => tracing::warn!("tray unavailable: {e}"),
+                    };
+                    // Re-render (menu label + tooltip) whenever the GTK side signals a
+                    // change — a pause flip, fresh throughput, or a stranded share.
+                    while refresh_rx.recv().await.is_ok() {
+                        let _ = handle.update(|_| {}).await;
                     }
+                    std::future::pending::<()>().await;
                 });
             });
         if let Err(e) = spawn {
