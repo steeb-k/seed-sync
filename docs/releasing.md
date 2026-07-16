@@ -11,7 +11,34 @@ the `web-install.sh` bootstrap) are **version-driven**: each compares the instal
 `seed-daemon --version` against the latest release tag on `seed-sync-binaries` and
 upgrades only when the release is newer. So every release **must** bump the version.
 
-## 1. Bump the version
+## 1. Create the draft release FIRST — before building anything
+
+**Do this at the very start of every release, not at the end.** Cutting a release is a
+long, multi-machine job (three or four platform builds, minutes each); if the GitHub
+release page only appears after all of them finish, it's invisible for the whole run and
+there's nowhere for assets to land as they complete. So create it up front, as a **draft**,
+the moment you know the target version:
+
+```sh
+# You know vX.Y.Z before you build — it's a decision, not a build output.
+gh release create vX.Y.Z \
+  --repo steeb-k/seed-sync-binaries \
+  --title vX.Y.Z \
+  --notes-file release-notes.md \
+  --draft
+# -> prints the draft's URL. Assets get attached to it in step 3 as each build lands;
+#    the notes can be refined any time before you finalize.
+```
+
+Draft, not published, because the release marked **Latest** is what every updater fetches
+(`releases/latest`) — you don't want a half-built release going Latest with only some
+platforms' assets attached. It stays a draft, invisible to updaters, until step 4.
+
+> If `release-notes.md` isn't written yet, create the draft with a placeholder and edit the
+> notes before finalizing (`gh release edit vX.Y.Z --repo … --notes-file release-notes.md`).
+> The point is that the page exists from minute one.
+
+## 2. Bump the version
 
 The workspace version in `Cargo.toml` is the single source of truth.
 
@@ -40,11 +67,16 @@ You can tag the source repo too if you like history (`git tag vX.Y.Z && git push
 origin vX.Y.Z`) — with CI gone, the tag triggers nothing. It is **not** required;
 the release on `seed-sync-binaries` carries its own tag, created by `gh` below.
 
-## 2. Build the artifacts (each on its own OS)
+## 3. Build the artifacts — and upload each to the draft as it lands
 
 Only build the platforms you have a machine for — the release is assembled
-incrementally, so you can attach more assets to the same release later. Every
-artifact is named `seed-sync-<ver>-<platform>`.
+incrementally, so you can attach more assets to the same (draft) release later. Every
+artifact is named `seed-sync-<ver>-<platform>`. **As each build finishes, upload it to the
+draft right away** rather than saving them all for the end:
+
+```sh
+gh release upload vX.Y.Z --repo steeb-k/seed-sync-binaries <artifact>
+```
 
 **Windows MSI** (Windows, GTK + Azure signing set up — see
 [`windows-packaging.md`](windows-packaging.md)):
@@ -92,33 +124,29 @@ scripts/package-linux.sh            # -> seed-sync-<ver>-linux-x86_64.tar.gz
 scripts/package-macos.sh            # -> seed-sync-<ver>-macos-universal.tar.gz
 ```
 
-## 3. Publish to seed-sync-binaries
-
-Publishing needs write access to `steeb-k/seed-sync-binaries`: either be logged in
+Publishing/uploading needs write access to `steeb-k/seed-sync-binaries`: either be logged in
 via `gh auth login` as an account with `repo` scope (the maintainer's `steeb-k`
 account is), or export a `SEED_BINARIES_TOKEN` PAT (`contents: write` on that repo)
-and pass it to `gh` via `GH_TOKEN`.
+and pass it to `gh` via `GH_TOKEN`. (`gh` created the `vX.Y.Z` tag on *that* repo back in
+step 1.)
 
-Create the release on the binaries repo and attach whatever you built (`gh`
-creates the `vX.Y.Z` tag on *that* repo):
+## 4. Finalize — publish the draft as Latest
+
+Only once every platform you're shipping has its asset attached, flip the draft to a
+published, Latest release:
 
 ```sh
-gh release create vX.Y.Z \
-  --repo steeb-k/seed-sync-binaries \
-  --title vX.Y.Z \
-  --notes-file release-notes.md \
-  seed-sync-<ver>-windows-x86_64.msi \
-  seed-sync-<ver>-android-universal.apk
-# add assets to the same release as they get built on each OS:
-gh release upload vX.Y.Z --repo steeb-k/seed-sync-binaries seed-sync-<ver>-linux-x86_64.tar.gz
-gh release upload vX.Y.Z --repo steeb-k/seed-sync-binaries seed-sync-<ver>-macos-universal.tar.gz
+# refine notes if they were a placeholder, then publish:
+gh release edit vX.Y.Z --repo steeb-k/seed-sync-binaries --notes-file release-notes.md
+gh release edit vX.Y.Z --repo steeb-k/seed-sync-binaries --draft=false --latest
 ```
 
 The release marked **Latest** on `seed-sync-binaries` is what the updaters fetch
-(`releases/latest`). Make sure the newest version is the one published last / not
-left as a draft or pre-release.
+(`releases/latest`). Finalizing last — never leaving the newest version as a draft or
+pre-release, never marking it Latest before its assets are all attached — is what keeps a
+half-built release from being handed to every updater.
 
-## 4. Release notes
+## 5. Release notes
 
 Write `release-notes.md` (the `--notes-file` above). Keep it consistent with the
 downloads list and the minimum OS / Linux deps:
