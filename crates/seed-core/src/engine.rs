@@ -1272,6 +1272,34 @@ fn manifest_fingerprint(remote: &HashMap<String, RemoteEntry>) -> u64 {
     }
 }
 
+/// The manifest fingerprint to **advertise** in presence: the real fingerprint of
+/// `remote` once our replica has proven contact with the share (`replica_seen`),
+/// else the `0` sentinel meaning "unknown / not yet computed".
+///
+/// Why the gate exists (known-issues #19). A node freshly added to a share has not
+/// synced the doc replica yet, so its merged `remote` is EMPTY — and an empty
+/// manifest fingerprints to a perfectly valid nonzero value, *and* reports
+/// `health == 100` (100% of nothing; `total_bytes == 0` in [`ReconcileJob::run`]).
+/// So before this gate a just-joined node broadcast `percent = 100` + `FP_EMPTY`,
+/// and every settled peer read it as a fully-synced member whose fileset disagreed,
+/// tripping a false OutOfSync within the settle window the moment a member joined.
+/// It is [known-issues #17] inside-out: the health of an empty *manifest* rather than
+/// an empty *peer set*. Advertising `0` while virgin puts the node in the documented
+/// "unknown" state that both [`PeerRoster::settled_manifest_fps`] and
+/// [`PeerRoster::online_manifest_fps`] already exclude from comparison — so it counts
+/// as *behind*, not *diverged*, until its replica is real.
+///
+/// A genuinely empty but **established** share is unaffected: its master has written
+/// an ignore entry / member record, so `replica_seen` is true and it advertises the
+/// real `FP_EMPTY`. Two empty masters still agree on it and converge to Healthy.
+fn advertised_fp(replica_seen: bool, remote: &HashMap<String, RemoteEntry>) -> u64 {
+    if replica_seen {
+        manifest_fingerprint(remote)
+    } else {
+        0
+    }
+}
+
 /// Convert a 32-byte hash slice into an iroh [`Hash`].
 fn to_hash(bytes: &[u8]) -> anyhow::Result<Hash> {
     let arr: [u8; 32] = bytes.try_into().context("bad hash len")?;
@@ -2243,7 +2271,7 @@ impl ReconcileJob {
             index_dels,
             reclaim,
             skipped: still_skipped,
-            manifest_fp: manifest_fingerprint(&remote),
+            manifest_fp: advertised_fp(replica_seen, &remote),
             forced_scan: self.force_scan,
             did_full_scan: do_scan,
             member_records,
@@ -4104,7 +4132,13 @@ impl Engine {
             .lock()
             .map(|r| r.settled_manifest_fps())
             .unwrap_or_default();
-        let self_settled = state.health >= 100;
+        // `manifest_fp != 0` is the other half of guard 1: our own `health == 100` is
+        // vacuously true while our replica is still virgin (an empty manifest is 100%
+        // of nothing), so without this a just-joined node would itself cry "members
+        // disagree" about the established peers whose real fingerprints differ from our
+        // unknown one. We set `manifest_fp = 0` until `replica_seen` for exactly this
+        // reason — you cannot judge a fileset you have not synced yet.
+        let self_settled = state.health >= 100 && state.manifest_fp != 0;
         let disagrees = self_settled && peer_fps.iter().any(|fp| *fp != state.manifest_fp);
         if disagrees {
             // Fingerprint the disagreement itself (our fp + the peers' fps). While
@@ -4592,6 +4626,37 @@ mod tests {
         );
     }
 
+    /// Known-issues #19, the roster half: a just-joined member whose replica is still
+    /// virgin reports `percent == 100` (an empty manifest is 100% of nothing) but,
+    /// post-fix, advertises `manifest_fp == 0` (unknown). Such a peer must be excluded
+    /// from the divergence comparison exactly as a still-downloading one is — otherwise
+    /// its empty manifest reads as a settled member that disagrees, which is what
+    /// tripped a false OutOfSync the moment a member was added.
+    #[test]
+    fn divergence_ignores_a_virgin_peer_reporting_full_health() {
+        let virgin = eid(1).to_string();
+        let settled = eid(2).to_string();
+        let mut roster = PeerRoster::default();
+
+        let mut p = presence("Joining", seed_ipc::Role::Master);
+        p.percent = 100; // empty manifest ⇒ health 100 (100% of nothing)
+        p.manifest_fp = 0; // but nothing synced yet ⇒ the "unknown" sentinel
+        roster.note_presence(&virgin, p);
+
+        let mut q = presence("Settled", seed_ipc::Role::Master);
+        q.percent = 100;
+        q.manifest_fp = 0xBBBB;
+        roster.note_presence(&settled, q);
+
+        assert_eq!(
+            roster.settled_manifest_fps(),
+            vec![0xBBBB],
+            "a virgin peer at 100% with an unknown (0) fingerprint must not be compared \
+             for divergence — its empty manifest is not a settled fileset, and treating \
+             it as one is what made every fresh join cry OutOfSync"
+        );
+    }
+
     #[test]
     fn member_record_key_roundtrips() {
         let rec = MemberRecord {
@@ -4798,6 +4863,41 @@ mod tests {
         // Never the 0 (= "unknown") sentinel, even for an empty view.
         let empty: HashMap<String, RemoteEntry> = HashMap::new();
         assert_ne!(manifest_fingerprint(&empty), 0);
+    }
+
+    /// Known-issues #19: a node must not *advertise* a fingerprint until its replica
+    /// has proven contact with the share. A virgin replica is empty, and an empty
+    /// manifest fingerprints to a valid nonzero value while reporting health 100 — so
+    /// broadcasting it made every settled peer count a just-joined member as a
+    /// fully-synced disagreement and cry OutOfSync the instant it joined. The gate
+    /// makes a virgin node advertise the `0` "unknown" sentinel that the divergence
+    /// comparison already excludes; an *established* empty share (replica seen) still
+    /// advertises the real empty fingerprint so two empty masters converge to Healthy.
+    #[test]
+    fn advertised_fp_is_zero_until_replica_seen() {
+        let mut populated = HashMap::new();
+        populated.insert("docs/x.txt".to_string(), re(&[1u8; 32], 10));
+        let empty: HashMap<String, RemoteEntry> = HashMap::new();
+
+        // Virgin replica (doc-sync still in flight): advertise "unknown", never a
+        // fingerprint of the empty set — whatever `remote` happens to hold.
+        assert_eq!(
+            advertised_fp(false, &empty),
+            0,
+            "a virgin replica must advertise the 0 (unknown) sentinel, not FP_EMPTY, \
+             so settled peers treat it as behind rather than diverged"
+        );
+        assert_eq!(advertised_fp(false, &populated), 0);
+
+        // Replica seen: advertise the real fingerprint. Crucially the empty-but-seen
+        // case (a genuinely empty, established share) advertises the *real* nonzero
+        // empty fingerprint — two such masters agree on it and stay Healthy.
+        assert_eq!(advertised_fp(true, &empty), manifest_fingerprint(&empty));
+        assert_ne!(advertised_fp(true, &empty), 0);
+        assert_eq!(
+            advertised_fp(true, &populated),
+            manifest_fingerprint(&populated)
+        );
     }
 
     /// Delete-vs-content resolution (known-issues #12): a tombstone deletes a

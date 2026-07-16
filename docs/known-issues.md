@@ -23,6 +23,7 @@ why, and the fix or disposition.
 | 16 | cold-join bootstrap is a single creator endpoint id — any master *should* be able to bootstrap, none can | **fixed** (share-key pkarr rendezvous + remembered members in the dial set) |
 | 17 | a fully-partitioned node reports `Healthy 100%` (health of an empty peer set) | **fixed** (`ShareStatus::NoPeers`) |
 | 18 | a locked OS keystore silently demotes a master to viewer — which then **reverts the user's edits** | **fixed** (held inert + auto-retry; found 2026-07-14 in the field) |
+| 19 | a just-joined member's empty replica reports 100% + a fingerprint → false `OutOfSync` on every peer the instant it joins | **fixed** (advertise `0`/unknown until the replica is seen; found 2026-07-15 in the field) |
 
 Three vendored crates carry the upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
 `vendor/iroh-docs` — see `[patch.crates-io]` in the workspace `Cargo.toml`).
@@ -817,3 +818,61 @@ exactly that). With a peer online, the old behavior is caught red-handed — the
 self-reported "Viewer", the unsyncable files, `Healthy 100%` everywhere. It was
 *not* a corrupted share. Confirmed by the reporter: with the master not demoted, the same
 operation synced exactly as expected.
+
+---
+
+## 19. A just-joined member reports 100% + a fingerprint → false `OutOfSync` on every peer — **FIXED**
+**Tier:** confirmed (reproduced in the field, then pinned by unit test) · **Severity:** medium
+(false alarm; the pool's most serious steady-state status raised the instant a member is added)
+**Status:** **fixed** (2026-07-15)
+**Where:** `advertised_fp` + `ReconcileJob::run`'s outcome and `Engine::finish_reconcile`'s
+divergence guard (`crates/seed-core/src/engine.rs`)
+
+**Symptom (field, 2026-07-15):** add a new member to a share and, within the settle window
+(`DIVERGENCE_SETTLE_SECS`, 45 s), the share flips to **`OutOfSync` — "members disagree"** —
+long before the new member has downloaded anything. The newcomer has barely started; its
+"health" should not be able to condemn the pool yet.
+
+**Root cause.** This is [#17] turned inside-out — the health of an empty *manifest* rather
+than an empty *peer set*. A member freshly added to a share has not synced the doc replica
+yet, so its merged manifest (`remote`) is **empty**. Two things then conspire:
+
+- An empty manifest reports **`health == 100`** — `total_bytes == 0`, and "I hold 100 % of
+  what I know about" is 100 % of nothing (the exact vacuous-truth shape as #17).
+- `manifest_fingerprint(empty)` is a perfectly valid **nonzero** fingerprint (`FP_EMPTY`);
+  it never returns the `0` sentinel.
+
+So the newcomer broadcast presence with `percent = 100` **and** `manifest_fp = FP_EMPTY`.
+Divergence detection compares against peers that are *settled* — `settled_manifest_fps()`,
+i.e. `percent >= 100 && manifest_fp != 0` — precisely to exclude members that are merely
+*behind*. The virgin newcomer passed **both** filters, so every established peer read it as a
+fully-synced member holding a different fileset, and the disagreement was stable (an empty
+manifest doesn't change while the doc is still in flight) → `OutOfSync` after the settle
+window. It fired on both sides: the newcomer likewise saw the established peers' real
+fingerprints disagree with its own `FP_EMPTY`.
+
+**Fixed** in two guards, both keyed on the existing `replica_seen` signal ("has our replica
+proven contact with share state — files, tombstones, an ignore entry, or member records"):
+
+1. **Advertise a fingerprint only once the replica is real.** `advertised_fp(replica_seen,
+   &remote)` broadcasts the documented `0` = "unknown / not yet computed" sentinel while
+   virgin — which both `settled_manifest_fps` and `online_manifest_fps` already exclude — so
+   a just-joined node counts as *behind*, not *diverged*, until its doc syncs.
+2. **Don't judge divergence while our own fingerprint is unknown.** `self_settled` now also
+   requires `state.manifest_fp != 0`; you cannot claim a peer disagrees with a fileset you
+   have not synced yet.
+
+A genuinely empty but **established** share is unaffected: its master has written an ignore
+entry / member record, so `replica_seen` is true and it advertises the real `FP_EMPTY` — two
+empty masters still agree on it and converge to Healthy. And the normal join lifecycle is
+clean: once the doc arrives, `manifest_fp` becomes the real (matching) value, health reflects
+true download %, the member shows `Syncing` at a climbing percent, then `Healthy` — never a
+false `OutOfSync`.
+
+**Tests:** `engine::tests::advertised_fp_is_zero_until_replica_seen` (the gate: virgin ⇒ 0,
+seen ⇒ real fingerprint, incl. the empty-but-seen case) and
+`divergence_ignores_a_virgin_peer_reporting_full_health` (the roster half: a peer at 100 %
+with an unknown fingerprint is excluded from the comparison), alongside the existing
+`divergence_ignores_peers_that_are_still_syncing`.
+
+[#17]: #17-a-fully-partitioned-node-reports-healthy-100-health-of-an-empty-set
