@@ -435,10 +435,25 @@ tombstones being iroh-docs *deletions* (empty entries, filtered out of reads).
 > LWW forever. Old readers skip unknown control keys, so the new keyspace is
 > wire-compatible. Unit-tested (`tombstones_resolve_by_lww_content_wins_ties`)
 > + integration-tested (`delete_survives_unseen_master_copy`: the exact
-> soak-observed race, both directions). One semantic to know: restoring a
-> deleted file from a backup **with its old mtime preserved** re-deletes it
-> (the delete is "newer" by LWW); a normal copy/save gets a fresh mtime and
-> resurrects. Original write-up kept below.
+> soak-observed race, both directions).
+>
+> **Refinement (delete-then-replace, the "vanishing ISO" bug):** the mtime-only
+> tie-break was too strong — a file that is *copied, extracted from an archive,
+> or downloaded* keeps its **source's** mtime, which is older than the delete,
+> so replacing a deleted file with a new version of the same name deleted it on
+> every pass, forever, even for the member who deleted it. The tombstone now
+> carries the **deleted content's hash** as its value, and the merge's "new
+> local file" arm suppresses a local file only when it is the *exact deleted
+> content still lingering* (same hash AND not-newer mtime — the #12 race);
+> **different** content at that name is a genuine re-add and always publishes,
+> regardless of mtime. Legacy tombstones (value `[1]`, no hash) and ones whose
+> tiny value blob hasn't synced yet fall back to the old time-only rule,
+> self-correcting once the hash is available. Extracted into the pure,
+> unit-tested `tombstone_suppresses` helper and covered end-to-end by
+> `replaced_file_survives_stale_mtime`. Only remaining semantic: re-adding the
+> **byte-identical** deleted file with a **preserved older** mtime still reads
+> as the leftover and is removed — indistinguishable by content or time, and a
+> no-op for the user either way. Original write-up kept below.
 
 **Symptom (fleet soak #7, 3M+25V):** files deleted by churn on one master while
 another master was still working through its initial import/publish of the same

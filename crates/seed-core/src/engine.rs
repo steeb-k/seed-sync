@@ -879,6 +879,29 @@ fn resolve_tombstones(
     });
 }
 
+/// Should a delete tombstone suppress (delete) a local file that is present on
+/// disk but absent from the replica? Yes only when the file is *the exact
+/// deleted content still lingering* — same hash as the tombstone AND not newer
+/// than the delete. Different content at the same name is a genuine re-add and
+/// must publish: a file mtime is not a reliable "when I re-added this" clock
+/// (copy / extract-from-archive / download all preserve the source's older
+/// mtime), so keying suppression on mtime alone deletes a legitimately replaced
+/// file forever. `deleted_hash` is `None` for a legacy tombstone (no stored
+/// hash) or one whose value blob hasn't synced yet → fall back to the
+/// time-only rule, which self-corrects once the hash is known.
+fn tombstone_suppresses(
+    deleted_hash: Option<&[u8]>,
+    local_hash: &[u8],
+    mtime: u64,
+    tts: u64,
+) -> bool {
+    let older = mtime <= tts;
+    match deleted_hash {
+        Some(h) => h == local_hash && older,
+        None => older,
+    }
+}
+
 /// Read the merged file view from the doc: latest-per-key, with deletion markers
 /// already excluded by the query. Normal keys carry content; `\x00e/<path>` keys
 /// mark empty files; `\x00t/<path>` keys are delete tombstones (resolved against
@@ -1505,15 +1528,43 @@ impl ReconcileJob {
     /// Tombstone a file (and its empty-marker) in the replica, leaving a
     /// timestamped `\x00t/<path>` marker so a member that never saw this path
     /// can tell "deleted" from "never seen" (known-issues #12). The marker's
-    /// record timestamp is the delete time for delete-vs-edit LWW.
-    async fn tombstone(&self, path: &str) {
+    /// record timestamp is the delete time for delete-vs-edit LWW; its *value*
+    /// is the deleted content's hash, so the reconcile can tell "the exact
+    /// deleted file is still on our disk" (suppress it) from "different content
+    /// re-added at the same name" (a real re-add — publish it, even when a
+    /// copy/extract/download gave it a stale mtime older than the delete).
+    async fn tombstone(&self, path: &str, deleted_hash: &[u8]) {
         let mut tk = TOMBSTONE_PREFIX.to_vec();
         tk.extend_from_slice(path.as_bytes());
-        let _ = self.doc.set_bytes(self.author, tk, vec![1u8]).await;
+        let _ = self
+            .doc
+            .set_bytes(self.author, tk, deleted_hash.to_vec())
+            .await;
         let _ = self.doc.del(self.author, path.as_bytes().to_vec()).await;
         let mut ek = EMPTY_PREFIX.to_vec();
         ek.extend_from_slice(path.as_bytes());
         let _ = self.doc.del(self.author, ek).await;
+    }
+
+    /// The content hash recorded in a path's live delete tombstone, if the
+    /// marker's value blob has arrived and looks like a hash (32 bytes). Returns
+    /// `None` for a legacy tombstone (value `[1]`, written before we stored the
+    /// hash) or when the tiny value blob hasn't synced yet — callers then fall
+    /// back to the time-only rule, self-correcting on a later pass.
+    async fn tombstone_hash(&self, path: &str) -> Option<Vec<u8>> {
+        let mut tk = TOMBSTONE_PREFIX.to_vec();
+        tk.extend_from_slice(path.as_bytes());
+        let entry = self
+            .doc
+            .get_one(Query::single_latest_per_key().key_exact(tk))
+            .await
+            .ok()??;
+        let h = entry.content_hash();
+        if !self.blobs.blobs().has(h).await.unwrap_or(false) {
+            return None;
+        }
+        let bytes = self.blobs.blobs().get_bytes(h).await.ok()?;
+        (bytes.len() == 32).then(|| bytes.to_vec())
     }
 
     /// Live content providers for this job — see [`live_providers_from`].
@@ -1996,14 +2047,29 @@ impl ReconcileJob {
                         // Master, local file absent from the replica. Before
                         // treating it as brand-new, check for a delete
                         // tombstone (known-issues #12): "absent because
-                        // deleted" must not read as "never seen". LWW decides
-                        // — a file mtime NEWER than the tombstone is a
-                        // legitimate edit/re-creation after the delete and
-                        // republishes; an older one is the deleted copy still
-                        // on our disk (e.g. we hadn't finished our initial
-                        // publish when the delete happened) and is removed.
+                        // deleted" must not read as "never seen".
+                        //
+                        // Only suppress the local file when it is *the exact
+                        // deleted content* still lingering on our disk (same
+                        // hash as the tombstone) AND not newer than the delete.
+                        // Different content at this name is a genuine re-add /
+                        // replace and must publish — a file mtime is NOT a
+                        // reliable "when did I re-add this" signal, since copy,
+                        // extract-from-archive and download all preserve the
+                        // *source's* older mtime, which would otherwise lose the
+                        // LWW to the tombstone forever and delete the re-added
+                        // file on every pass (even for the member who deleted
+                        // it). A legacy tombstone (no stored hash) or one whose
+                        // value blob hasn't synced yet falls back to the
+                        // time-only rule.
                         if let Some(&tts) = tombstones.get(&path) {
-                            if mtime_micros(abs) <= tts {
+                            let deleted_hash = self.tombstone_hash(&path).await;
+                            if tombstone_suppresses(
+                                deleted_hash.as_deref(),
+                                &le.hash,
+                                mtime_micros(abs),
+                                tts,
+                            ) {
                                 let _ = std::fs::remove_file(abs);
                                 if let Some(p) = abs.parent() {
                                     emptied_parents.insert(p.to_path_buf());
@@ -2052,8 +2118,11 @@ impl ReconcileJob {
                         && b.map(|bh| bh == &re.hash).unwrap_or(false)
                     {
                         // Master, full scan saw it genuinely gone while base+replica
-                        // agreed → the user deleted it: propagate the tombstone.
-                        self.tombstone(&path).await;
+                        // agreed → the user deleted it: propagate the tombstone,
+                        // recording the deleted content's hash so a later re-add of
+                        // *different* content at this name isn't mistaken for the
+                        // deleted file lingering.
+                        self.tombstone(&path, &re.hash).await;
                         index_dels.push(path);
                         changed = true;
                     } else {
@@ -4941,6 +5010,46 @@ mod tests {
         let mut tombs = HashMap::from([("gone".to_string(), 50u64)]);
         resolve_tombstones(&mut files, &mut tombs);
         assert_eq!(tombs.get("gone"), Some(&50));
+    }
+
+    /// A tombstone-vs-local-file decision (the reconcile arm that bit the
+    /// "deleted ISO, pasted a new one, it kept vanishing" bug). Different
+    /// content at the deleted name must publish even with a stale (older) mtime;
+    /// only the *exact deleted content* still on disk is suppressed.
+    #[test]
+    fn tombstone_only_suppresses_the_same_deleted_content() {
+        let deleted = [7u8; 32];
+        let replacement = [9u8; 32]; // a genuinely different file at the same name
+
+        // The reported bug: re-added file has DIFFERENT content but an mtime
+        // OLDER than the delete (copy/extract/download preserved it). It must
+        // still publish — never be suppressed.
+        assert!(
+            !tombstone_suppresses(Some(&deleted), &replacement, 100, 200),
+            "different content with a stale mtime is a real re-add — must publish"
+        );
+        // Different content with a fresh mtime: also publishes.
+        assert!(!tombstone_suppresses(
+            Some(&deleted),
+            &replacement,
+            300,
+            200
+        ));
+
+        // The race the tombstone exists for: the *exact* deleted file still on
+        // disk, not newer than the delete → suppress it.
+        assert!(
+            tombstone_suppresses(Some(&deleted), &deleted, 100, 200),
+            "the same deleted content lingering (older) must be removed"
+        );
+        // Same content but re-created strictly after the delete → keep (publish).
+        assert!(!tombstone_suppresses(Some(&deleted), &deleted, 300, 200));
+
+        // Legacy tombstone (no stored hash) falls back to the time-only rule:
+        // older → suppress, newer → publish. Preserves prior behavior until the
+        // hash is known.
+        assert!(tombstone_suppresses(None, &replacement, 100, 200));
+        assert!(!tombstone_suppresses(None, &replacement, 300, 200));
     }
 
     /// Cross-master empty↔non-empty flip: when both the content key and the

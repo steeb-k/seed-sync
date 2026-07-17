@@ -482,3 +482,60 @@ async fn delete_survives_unseen_master_copy() -> anyhow::Result<()> {
     b.shutdown().await?;
     Ok(())
 }
+
+/// The "deleted a big file, pasted a replacement with the same name, and it kept
+/// vanishing every time" bug. Once a delete tombstone is recorded, re-adding
+/// *different* content at that path must publish and survive — even when the new
+/// file's mtime is OLDER than the delete (copy, extract-from-archive and
+/// download all preserve the source's mtime). A single node reproduces it: the
+/// member who deleted couldn't re-add. The tombstone now stores the deleted
+/// content's hash, so a re-add of different content is no longer mistaken for
+/// the deleted file lingering.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn replaced_file_survives_stale_mtime() -> anyhow::Result<()> {
+    use seed_core::Engine;
+
+    let a_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let path = a_folder.path().join("iso.bin");
+
+    let v1 = content_for("iso.bin-v1", 4096);
+    let v2 = content_for("iso.bin-v2", 8192); // genuinely different content
+
+    std::fs::write(&path, &v1)?;
+    let mut a = Engine::new(a_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), a.wait_online())
+        .await
+        .map_err(|_| anyhow::anyhow!("A endpoint never came online"))?;
+    let created = a.create_share(a_folder.path(), vec![]).await?;
+    let share_id = created.share_id.clone();
+    a.reconcile(&share_id).await?; // publish v1
+
+    // Delete it and reconcile → tombstone (ts = now, value = hash(v1)).
+    std::fs::remove_file(&path)?;
+    a.reconcile(&share_id).await?;
+    assert!(!path.exists(), "precondition: the delete was recorded");
+
+    // Paste a REPLACEMENT: different content, and a STALE mtime 60 s before the
+    // delete — exactly what a copy/extract/download leaves behind.
+    std::fs::write(&path, &v2)?;
+    let stale = std::time::SystemTime::now() - Duration::from_secs(60);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)?
+        .set_modified(stale)?;
+
+    // Several reconcile passes must NOT delete the replacement.
+    for _ in 0..8 {
+        a.reconcile(&share_id).await?;
+    }
+    assert_eq!(
+        std::fs::read(&path).ok().as_deref(),
+        Some(&v2[..]),
+        "replacement with a stale mtime was deleted by the tombstone (the reported bug)"
+    );
+
+    a.shutdown().await?;
+    Ok(())
+}
