@@ -756,13 +756,28 @@ async fn self_heal_file(
     Err(last_err.unwrap_or_else(|| anyhow!("self-heal failed for {}", target.display())))
 }
 
+/// Staging path for a self-heal download: the target's FULL file name with a
+/// `.seedheal-tmp` suffix appended. Deliberately not `with_extension`, which
+/// REPLACES the extension — so `a.bin` and `a.txt` would both stage through
+/// `a.seedheal-tmp` and could collide (and the temp could shadow a real sibling
+/// that happens to share the stem). Appending keeps the staging path unique per
+/// file and preserves the original name.
+fn heal_tmp_path(target: &Path) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".seedheal-tmp");
+    target.with_file_name(name)
+}
+
 /// Stream a blob from a connection, writing its verified leaves into a temp file
 /// next to `target`, then atomically replace `target`. Streams chunk-by-chunk
 /// (no whole-file in memory), and the content is bao-verified against `hash` as
 /// it arrives, so a bad peer cannot write wrong bytes.
 async fn fetch_blob_to_file(conn: &Connection, hash: Hash, target: &Path) -> anyhow::Result<()> {
     use std::io::{Seek, SeekFrom, Write};
-    let tmp = target.with_extension("seedheal-tmp");
+    let tmp = heal_tmp_path(target);
     let mut file =
         std::fs::File::create(&tmp).with_context(|| format!("create temp {}", tmp.display()))?;
     let mut stream = get_blob(conn.clone(), hash);
@@ -5025,6 +5040,23 @@ mod tests {
         let mut tombs = HashMap::from([("gone".to_string(), 50u64)]);
         resolve_tombstones(&mut files, &mut tombs);
         assert_eq!(tombs.get("gone"), Some(&50));
+    }
+
+    /// The self-heal staging path appends `.seedheal-tmp` to the full file name
+    /// rather than replacing the extension, so siblings sharing a stem get
+    /// distinct temps and the temp can't shadow a real file.
+    #[test]
+    fn heal_tmp_path_appends_and_is_unique() {
+        use std::path::Path;
+        let bin = heal_tmp_path(Path::new("/share/a.bin"));
+        let txt = heal_tmp_path(Path::new("/share/a.txt"));
+        assert_eq!(bin.file_name().unwrap(), "a.bin.seedheal-tmp");
+        assert_eq!(txt.file_name().unwrap(), "a.txt.seedheal-tmp");
+        assert_ne!(bin, txt, "siblings sharing a stem must not collide");
+        // Extensionless names get the suffix too, staying in the same dir.
+        let noext = heal_tmp_path(Path::new("/share/README"));
+        assert_eq!(noext.file_name().unwrap(), "README.seedheal-tmp");
+        assert_eq!(noext.parent(), Path::new("/share/README").parent());
     }
 
     /// A tombstone-vs-local-file decision (the reconcile arm that bit the

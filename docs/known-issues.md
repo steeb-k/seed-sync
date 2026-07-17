@@ -920,3 +920,11 @@ content, remove the stale target and export from the store (zero-network).
 can't produce matching bytes. Regression test:
 `inplace_overwrite_large_file_converges` (a >4 MiB swarm-path file overwritten in
 place must converge on the peer).
+
+Related hardening (same self-heal path): the staging file was named with
+`with_extension("seedheal-tmp")`, which *replaces* the extension, so `a.bin` and
+`a.txt` both staged through `a.seedheal-tmp`. Heals run sequentially within a
+pass so it rarely collided, but it could also shadow a real sibling sharing the
+stem. Now `heal_tmp_path` appends the suffix to the full name (`a.bin` →
+`a.bin.seedheal-tmp`), keeping every staging path unique (unit test
+`heal_tmp_path_appends_and_is_unique`).
