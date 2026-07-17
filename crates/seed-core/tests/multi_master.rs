@@ -104,6 +104,45 @@ async fn concurrent_same_file_ordered() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// In-place overwrite of a large (swarm-path) file: a master rewrites an existing
+/// file with new content (no delete), and the peer must converge by exporting the
+/// freshly-downloaded blob from its local store. Regression for the double-download
+/// bug where `materialize` skipped the store export because the stale target still
+/// existed and fell through to `self_heal_file`, re-fetching the whole blob over
+/// the network a second time. This asserts correctness of the fixed path across
+/// the >4 MiB swarm route; the peer ends byte-identical to the new content.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn inplace_overwrite_large_file_converges() -> anyhow::Result<()> {
+    let mut c = cluster(2, 0).await?;
+
+    // Seed a >4 MiB file from master 0 (exercises the swarm download path).
+    let v1 = content_for("big.bin-v1", 6 * 1024 * 1024);
+    std::fs::write(c.nodes[0].folder().join("big.bin"), &v1)?;
+    let mut want = BTreeMap::new();
+    want.insert("big.bin".to_string(), v1);
+    c.drive_until(Duration::from_secs(180), "seed big file", |c| {
+        c.converged(&want)
+    })
+    .await?;
+
+    // Overwrite it IN PLACE with different large content (no delete), strictly
+    // later so LWW takes it. The peer already has the old file on disk, so this is
+    // exactly the materialize path that used to re-download over the network.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let v2 = content_for("big.bin-v2", 5 * 1024 * 1024 + 1234);
+    std::fs::write(c.nodes[0].folder().join("big.bin"), &v2)?;
+    want.insert("big.bin".to_string(), v2);
+    c.drive_until(Duration::from_secs(180), "peer takes in-place overwrite", |c| {
+        c.converged(&want)
+    })
+    .await?;
+    println!("in-place large-file overwrite converged");
+
+    c.shutdown().await?;
+    Ok(())
+}
+
 /// Two masters each generate a deterministic corpus (hundreds/thousands of
 /// small-to-mid files) into their folders concurrently; the union must
 /// converge byte-identically on both, verified by streaming hashes. Also logs

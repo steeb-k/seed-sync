@@ -891,3 +891,32 @@ with an unknown fingerprint is excluded from the comparison), alongside the exis
 `divergence_ignores_peers_that_are_still_syncing`.
 
 [#17]: #17-a-fully-partitioned-node-reports-healthy-100-health-of-an-empty-set
+
+---
+
+## 20. In-place file overwrite re-downloaded the blob twice (2× bandwidth) — **FIXED**
+**Tier:** user-reported · **Severity:** medium (wasted bandwidth; no data loss) · **Status:** fixed
+
+**Where:** `Engine::materialize` (`crates/seed-core/src/engine.rs`), the export-to-target step.
+
+**Symptom:** a master overwrote an existing file with new content (same name, no
+delete). A peer downloaded the new blob normally, reached ~99%, then created
+`<name>.seedheal-tmp` and downloaded the *entire blob again* over the network
+before replacing the on-disk file — twice the bandwidth for one update. Fresh
+files (not previously present) synced once, as expected.
+
+**Root cause:** `materialize` fetches the blob into the local **blob store**
+(`ensure_download` — the ~99% the user saw), then exports from the store to the
+target file. That export was gated on `if !target.exists()`. For an in-place
+overwrite the *old* file is still on disk, so the export was skipped even though
+the new blob was already complete in the store; execution fell through to
+`self_heal_file`, which opens a fresh connection to a peer and re-streams the
+whole blob into `<name>.seedheal-tmp`. The store already had verified bytes
+(`has(hash)` was true) — the second network fetch was pure waste.
+
+**Fix:** when the blob is complete in the store but the target holds stale
+content, remove the stale target and export from the store (zero-network).
+`self_heal_file` is now only the last resort for when the store export itself
+can't produce matching bytes. Regression test:
+`inplace_overwrite_large_file_converges` (a >4 MiB swarm-path file overwritten in
+place must converge on the peer).

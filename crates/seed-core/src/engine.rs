@@ -1804,25 +1804,40 @@ impl ReconcileJob {
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        if !target.exists() {
-            if let Err(e) = self
-                .blobs
-                .blobs()
-                .export_with_opts(ExportOptions {
-                    hash,
-                    mode: ExportMode::TryReference,
-                    target: target.clone(),
-                })
-                .await
-            {
-                tracing::debug!("reference-export {path} failed; will self-heal: {e}");
-            }
+        // The blob is complete in the local store (has(hash) above), so writing it
+        // to the target is a zero-network local export. `export_with_opts` won't
+        // overwrite an existing path; for an in-place overwrite the OLD file is
+        // still on disk, so remove the stale copy first and export the new bytes
+        // from the store.
+        //
+        // This export was previously gated on `!target.exists()`, which meant an
+        // in-place overwrite (or any diverged-but-present file) SKIPPED it and
+        // fell through to `self_heal_file` below — re-fetching the entire blob
+        // over the network even though it was already complete in the local store.
+        // That doubled the bandwidth of every replaced file. Export from the store
+        // instead; `self_heal_file` is now only the last resort when the store
+        // export itself can't produce matching bytes.
+        if target.exists() {
+            let _ = std::fs::remove_file(&target);
+        }
+        if let Err(e) = self
+            .blobs
+            .blobs()
+            .export_with_opts(ExportOptions {
+                hash,
+                mode: ExportMode::TryReference,
+                target: target.clone(),
+            })
+            .await
+        {
+            tracing::debug!("reference-export {path} failed; will self-heal: {e}");
         }
         if file_matches(&target, hash_bytes) {
             reclaim.push(hash);
             Ok(true)
         } else {
-            // Existing file diverged (edited/corrupted): re-fetch verified bytes.
+            // Store export didn't yield matching bytes (rare): pull a verified copy
+            // from a peer as a last resort.
             self_heal_file(&self.endpoint, &self.providers, hash, &target)
                 .await
                 .with_context(|| format!("self-heal {path}"))?;
