@@ -14,7 +14,13 @@
 //! lighter `relays::probe_relay`).
 //!
 //! Usage:
-//!     cargo run -p seed-core --example relay_probe -- <relay-url> [--token T] [--quic-port P]
+//!     cargo run -p seed-core --example relay_probe -- <relay-url> [--token T] [--quic-port P] [--selector]
+//!
+//! The token can also come from the `SEED_RELAY_TOKEN` env var (kept off the
+//! command line). `--selector` installs the production `PreferMyRelaySelector`
+//! (preferred set = the probed relay) on both data-path endpoints, exactly as
+//! `node.rs` does — A/B-ing phase 3 with and without it isolates whether the
+//! path selector, rather than the relay, breaks relayed connections.
 
 use std::time::Duration;
 
@@ -41,14 +47,16 @@ async fn main() -> anyhow::Result<()> {
         .context("usage: relay_probe <relay-url> [--token T] [--quic-port P]")?
         .parse()
         .context("parse relay url")?;
-    let mut token: Option<String> = None;
+    let mut token: Option<String> = std::env::var("SEED_RELAY_TOKEN").ok();
     let mut quic_port: Option<u16> = None;
+    let mut selector = false;
     while let Some(a) = args.next() {
         match a.as_str() {
             "--token" => token = Some(args.next().context("--token needs a value")?),
             "--quic-port" => {
                 quic_port = Some(args.next().context("--quic-port needs a value")?.parse()?)
             }
+            "--selector" => selector = true,
             other => bail!("unknown arg: {other}"),
         }
     }
@@ -66,12 +74,24 @@ async fn main() -> anyhow::Result<()> {
         config.quic.as_ref().map(|q| q.port).unwrap_or(0),
     );
 
+    if selector {
+        println!("path selector: PreferMyRelaySelector (production config)");
+    }
+
     // Phase 1: home-relay connection (HTTPS/WebSocket upgrade, token in header).
-    let bind = |cfg: RelayConfig| {
-        Endpoint::builder(presets::Minimal)
+    let preferred_url = url.clone();
+    let bind = move |cfg: RelayConfig| {
+        let mut b = Endpoint::builder(presets::Minimal)
             .relay_mode(RelayMode::Custom(RelayMap::from(cfg)))
-            .alpns(vec![ALPN.to_vec()])
-            .bind()
+            .alpns(vec![ALPN.to_vec()]);
+        if selector {
+            let preferred = seed_core::relays::PreferredRelays::default();
+            preferred.set([preferred_url.clone()].into());
+            b = b.path_selector(std::sync::Arc::new(
+                seed_core::relays::PreferMyRelaySelector::new(preferred),
+            ));
+        }
+        b.bind()
     };
     let a = bind(config.clone()).await.context("bind endpoint A")?;
     let https_ok = tokio::time::timeout(Duration::from_secs(15), a.online())

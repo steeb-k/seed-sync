@@ -259,11 +259,25 @@ pub async fn probe_relay(url: &str, token: Option<&str>, timeout: Duration) -> R
 /// user's relay wins the home-relay pick once it answers again — the path
 /// selector prefers it regardless).
 ///
+/// `force_fallback` is the escape hatch for a relay that reads *connected* but is
+/// silently **blackholing** client↔client traffic — the exact shape of the
+/// 2026-07 fleet isolation (docs/fleet-isolation-investigation.md), where every
+/// member homed on a custom relay that answered its own ping/handshake while
+/// forwarding nothing, so `is_connected()` stayed true and this watchdog never
+/// engaged. The engine's partition self-heal sets this flag once a share has been
+/// unable to reach any member for long enough; while set, the watchdog treats the
+/// custom relay as unusable and adds the public relays regardless of
+/// `is_connected()`. Adding relays never strands a node, so this is safe even if
+/// the custom relay is actually fine — it just gains a second path. Honored only
+/// in `Preferred` mode: `Only` means "never touch third-party infra", a choice a
+/// blackhole does not override.
+///
 /// Runs detached for the endpoint's lifetime; the engine aborts it on shutdown.
 pub(crate) async fn relay_watchdog(
     endpoint: Endpoint,
     settings: Arc<StdMutex<RelaySettings>>,
     fallback: Arc<AtomicBool>,
+    force_fallback: Arc<AtomicBool>,
 ) {
     use iroh::Watcher as _;
 
@@ -284,10 +298,14 @@ pub(crate) async fn relay_watchdog(
                 continue;
             }
         };
-        let connected_custom = status
-            .get()
-            .iter()
-            .any(|s| s.is_connected() && custom_urls.contains(s.url()));
+        // A forced fallback (blackhole detected by the engine) counts as "no custom
+        // relay reachable" even when the transport still reads connected.
+        let forced = force_fallback.load(Ordering::Relaxed);
+        let connected_custom = !forced
+            && status
+                .get()
+                .iter()
+                .any(|s| s.is_connected() && custom_urls.contains(s.url()));
 
         if connected_custom {
             misses = 0;
@@ -306,10 +324,17 @@ pub(crate) async fn relay_watchdog(
                     endpoint.insert_relay(cfg.url.clone(), cfg).await;
                 }
                 fallback.store(true, Ordering::Relaxed);
-                tracing::warn!(
-                    "no custom relay reachable for {}s; falling back to the public relays",
-                    TICK.as_secs() * MISSES_TO_FALL_BACK as u64
-                );
+                if forced {
+                    tracing::warn!(
+                        "custom relay reads connected but a share can reach no member \
+                         (suspected blackhole); adding the public relays as a fallback path"
+                    );
+                } else {
+                    tracing::warn!(
+                        "no custom relay reachable for {}s; falling back to the public relays",
+                        TICK.as_secs() * MISSES_TO_FALL_BACK as u64
+                    );
+                }
             }
         }
     }

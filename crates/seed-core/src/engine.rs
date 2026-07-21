@@ -82,6 +82,17 @@ pub(crate) struct PeerRoster {
     /// Members whose remembered identity changed since the last DB flush
     /// ([`Engine::presence_broadcasts`] drains this every presence tick).
     dirty: HashSet<String>,
+    /// Unix seconds of the last *genuine* sign of life from any peer — a received
+    /// doc entry, a gossip neighbor-up, a presence beat, or a doc-sync that
+    /// actually **succeeded**. A *failed* sync deliberately does NOT advance this:
+    /// counting failed dials as contact is what made a fully-partitioned node mark
+    /// every peer "online" on each retry, flapping the whole fleet "Syncing ↔
+    /// offline" while nothing connected (docs/fleet-isolation-investigation.md,
+    /// known-issues #16). `0` = no contact yet this session.
+    last_contact: i64,
+    /// The most recent failed doc-sync attempt: (peer id, error, unix secs). Kept
+    /// purely for diagnostics and the partition WARN; never affects liveness.
+    last_sync_err: Option<(String, String, i64)>,
 }
 
 #[derive(Default)]
@@ -116,19 +127,64 @@ struct RememberedPeer {
 /// still flushes immediately.
 const REMEMBERED_LAST_SEEN_FLUSH_SECS: i64 = 300;
 
+/// Per-share bookkeeping for the provable-partition self-heal ladder
+/// (docs/fleet-isolation-investigation.md). Default = healthy; reset the instant
+/// the share can reach any member again.
+#[derive(Default)]
+struct IsolationHeal {
+    /// Unix seconds since which the share has been continuously unable to reach any
+    /// member while it *has* members to reach; `None` while healthy.
+    since: Option<i64>,
+    /// Whether the loud partition WARN has already been logged this episode (so it
+    /// isn't repeated every ~6s tick).
+    warned: bool,
+    /// Unix seconds of the last presence-subscription rebuild in this episode.
+    last_presence_rebuild: i64,
+}
+
 impl PeerRoster {
     /// Record activity for a peer. `neighbor` distinguishes gossip membership
     /// transitions: `Some(true)` = NeighborUp, `Some(false)` = NeighborDown,
     /// `None` = other evidence of life (remote insert / sync finished / presence).
     pub(crate) fn note(&mut self, id: &str, neighbor: Option<bool>) {
+        let now = now_secs();
         let e = self.peers.entry(id.to_string()).or_default();
         if neighbor == Some(false) {
             // NeighborDown is positive evidence the peer left: force it offline
             // now rather than refreshing its liveness.
-            e.last_seen = now_secs() - PEER_ONLINE_TTL_SECS - 1;
+            e.last_seen = now - PEER_ONLINE_TTL_SECS - 1;
         } else {
-            e.last_seen = now_secs();
+            e.last_seen = now;
+            self.last_contact = now;
         }
+    }
+
+    /// Record the outcome of a doc live-sync with a peer. A **successful** sync is
+    /// genuine contact and refreshes liveness like any other sign of life; a
+    /// **failed** one is NOT — it only records a diagnostic and never touches
+    /// `last_seen`, so an unreachable peer ages out and stays out instead of being
+    /// marked "online" on every failed retry (the phantom-liveness flap;
+    /// docs/fleet-isolation-investigation.md).
+    pub(crate) fn note_sync_finished(&mut self, id: &str, ok: bool, err: Option<&str>) {
+        if ok {
+            self.note(id, None);
+        } else {
+            self.last_sync_err = Some((
+                id.to_string(),
+                err.unwrap_or_default().to_string(),
+                now_secs(),
+            ));
+        }
+    }
+
+    /// Unix seconds of the last genuine peer contact this session (0 = none yet).
+    pub(crate) fn last_contact(&self) -> i64 {
+        self.last_contact
+    }
+
+    /// The most recent failed doc-sync attempt (peer id, error, unix secs), if any.
+    pub(crate) fn last_sync_err(&self) -> Option<&(String, String, i64)> {
+        self.last_sync_err.as_ref()
     }
 
     /// Fold a presence broadcast into the roster: refresh name/role/health and
@@ -138,6 +194,7 @@ impl PeerRoster {
     pub(crate) fn note_presence(&mut self, id: &str, p: crate::presence::Presence) {
         let now = now_secs();
         let master = matches!(p.role, seed_ipc::Role::Master);
+        self.last_contact = now;
         let e = self.peers.entry(id.to_string()).or_default();
         e.last_seen = now;
         e.name = Some(p.name.clone());
@@ -526,6 +583,24 @@ const DIVERGENCE_RESYNC_KICK_SECS: i64 = 30;
 /// buys nothing over a few and multiplies the fleet-wide session count by the
 /// member count. Same bounded-repair philosophy as [`PRESENCE_REJOIN_SAMPLE`].
 const DOC_RESYNC_SAMPLE: usize = 3;
+
+/// Provable-partition self-heal (docs/fleet-isolation-investigation.md). A share
+/// that can reach **no** member while it *has* members to reach, continuously for
+/// longer than this, is treated as a real partition (not normal churn) and the
+/// recovery ladder engages: a loud WARN plus the endpoint-wide public-relay
+/// fallback (in case a custom relay is silently blackholing). Generous on purpose —
+/// rendezvous, mesh rejoin, and doc resync all get first crack well inside it.
+const ISOLATION_HEAL_SECS: i64 = 120;
+
+/// Second rung of the ladder: once partitioned this long, rebuild the share's
+/// gossip/presence subscription and re-kick doc sync. The presence overlay does
+/// not always re-form on its own after a prolonged partition even once transport
+/// recovers — observed in the field, where presence stayed dead until a restart.
+const ISOLATION_PRESENCE_REBUILD_SECS: i64 = 210;
+
+/// Re-arm the presence rebuild at most this often within one partition episode, so
+/// a stubborn partition retries periodically without thrashing the gossip actor.
+const ISOLATION_PRESENCE_REBUILD_MIN_SECS: i64 = 120;
 
 /// Stall watchdog: an in-flight download older than this is presumed wedged and is
 /// aborted so the next reconcile re-queues it (verified chunks persist on disk, so
@@ -2460,6 +2535,8 @@ struct ShareState {
     /// Unix seconds of the last rendezvous publish (masters only); throttles it to
     /// one per [`crate::rendezvous::REPUBLISH_SECS`].
     last_rendezvous_publish: i64,
+    /// Provable-partition self-heal state (docs/fleet-isolation-investigation.md).
+    heal: IsolationHeal,
 }
 
 impl ShareState {
@@ -2596,6 +2673,12 @@ pub struct Engine {
     /// Whether the watchdog has added the public relays to the live map because
     /// no custom relay was reachable (see [`crate::relays::relay_watchdog`]).
     relay_fallback: Arc<AtomicBool>,
+    /// Set by [`Engine::isolation_recoveries`] when a share is provably partitioned
+    /// (reaches no member despite having members and a live rendezvous). Tells the
+    /// watchdog to add the public relays even though the custom relay reads
+    /// *connected* — the blackhole case that `is_connected()` alone can't catch
+    /// (docs/fleet-isolation-investigation.md).
+    force_relay_fallback: Arc<AtomicBool>,
     /// The watchdog task, aborted on [`Engine::shutdown`] so tests that build
     /// many engines don't accumulate tickers.
     relay_watchdog: tokio::task::AbortHandle,
@@ -2664,10 +2747,12 @@ impl Engine {
         let author = node.docs_api().author_default().await?;
         let relay_settings = Arc::new(StdMutex::new(relay_settings));
         let relay_fallback = Arc::new(AtomicBool::new(false));
+        let force_relay_fallback = Arc::new(AtomicBool::new(false));
         let relay_watchdog = tokio::spawn(crate::relays::relay_watchdog(
             node.endpoint.clone(),
             relay_settings.clone(),
             relay_fallback.clone(),
+            force_relay_fallback.clone(),
         ))
         .abort_handle();
         let device_name = db
@@ -2692,6 +2777,7 @@ impl Engine {
             health_tracks,
             relay_settings,
             relay_fallback,
+            force_relay_fallback,
             relay_watchdog,
         };
         engine.reload_shares().await?;
@@ -3105,6 +3191,7 @@ impl Engine {
                 we_minted: key.endpoint_id() == Some(self.node.endpoint_id_bytes()),
                 last_rendezvous: 0,
                 last_rendezvous_publish: 0,
+                heal: IsolationHeal::default(),
             },
             bootstrap,
         ))
@@ -3911,6 +3998,136 @@ impl Engine {
         out
     }
 
+    /// Provable-partition detection and self-heal (docs/fleet-isolation-investigation.md).
+    ///
+    /// A share that reaches **no** member while it *has* members to reach — the
+    /// rendezvous keeps resolving live masters, presence rejoin and doc resync keep
+    /// firing, yet nothing ever connects — is a real partition, not normal churn.
+    /// The 2026-07 field incident was exactly this: every member homed on a custom
+    /// relay that answered its own handshake/ping while silently forwarding no
+    /// client↔client traffic, so `is_connected()` stayed true, the fallback watchdog
+    /// never engaged, and the only cure was a human removing the relay or restarting
+    /// the service. The whole point of this method is that nobody should have to.
+    ///
+    /// The ladder, per share, keyed off how long it has been continuously isolated:
+    /// 1. `>= ISOLATION_HEAL_SECS`: log one loud WARN naming the contradiction, and
+    ///    set the endpoint-wide force-fallback signal so the watchdog adds the public
+    ///    relays even if the custom relay reads connected (the automatic, reversible
+    ///    equivalent of the manual `relay-remove` that healed it live). Adding relays
+    ///    never strands a node, so this is safe even on a false positive.
+    /// 2. `>= ISOLATION_PRESENCE_REBUILD_SECS`: rebuild the gossip/presence
+    ///    subscription and re-kick doc sync — the overlay does not always re-form on
+    ///    its own after a prolonged partition even once transport recovers.
+    ///
+    /// Returns [`DocResync`] jobs to run off-lock (the doc re-kick), mirroring
+    /// [`Engine::retry_locked_keys`]. Subscribing to gossip is a local actor
+    /// hand-off (not a network dial), so rebuilding the handle inline under the lock
+    /// is consistent with [`Engine::open_share`], which does the same.
+    pub async fn isolation_recoveries(&mut self) -> Vec<DocResync> {
+        let paused_all = self.paused_all();
+        let self_id = self.node.endpoint.id();
+        let gossip = self.node.gossip.clone();
+        let now = now_secs();
+        let mut any_partitioned = false;
+        let mut jobs = Vec::new();
+
+        for (id, s) in self.shares.iter_mut() {
+            let partitioned = !s.paused && !paused_all && s.isolated();
+            if !partitioned {
+                // Reachable again (or not applicable): end any episode immediately.
+                s.heal = IsolationHeal::default();
+                continue;
+            }
+            let since = *s.heal.since.get_or_insert(now);
+            let elapsed = now - since;
+            if elapsed < ISOLATION_HEAL_SECS {
+                continue; // still within the grace window; normal repair owns it
+            }
+            any_partitioned = true;
+
+            if !s.heal.warned {
+                s.heal.warned = true;
+                let (known, last_contact, last_err) = s
+                    .roster
+                    .lock()
+                    .map(|r| {
+                        (
+                            r.counts().1,
+                            r.last_contact(),
+                            r.last_sync_err().map(|(p, e, _)| format!("{p}: {e}")),
+                        )
+                    })
+                    .unwrap_or((0, 0, None));
+                let contact = if last_contact == 0 {
+                    "no peer heard this session".to_string()
+                } else {
+                    format!("last heard a peer {}s ago", now - last_contact)
+                };
+                let last_err = last_err.unwrap_or_else(|| "no sync attempts recorded".into());
+                tracing::warn!(
+                    "share {id}: PARTITIONED — cannot reach any of {known} known member(s) \
+                     for {elapsed}s ({contact}; last dial error — {last_err}); forcing \
+                     public-relay fallback (docs/fleet-isolation-investigation.md)"
+                );
+            }
+
+            if elapsed >= ISOLATION_PRESENCE_REBUILD_SECS
+                && now - s.heal.last_presence_rebuild >= ISOLATION_PRESENCE_REBUILD_MIN_SECS
+            {
+                s.heal.last_presence_rebuild = now;
+                let bootstrap: Vec<EndpointId> = s
+                    .roster
+                    .lock()
+                    .map(|r| {
+                        r.known_peer_ids()
+                            .iter()
+                            .filter_map(|x| x.parse::<EndpointId>().ok())
+                            .filter(|pk| *pk != self_id)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let topic = crate::presence::presence_topic(&s.key.share_id());
+                match crate::presence::spawn_presence(
+                    &gossip,
+                    topic,
+                    bootstrap,
+                    self_id,
+                    s.roster.clone(),
+                )
+                .await
+                {
+                    // Replacing the handle drops the old one, aborting its (stalled)
+                    // receive task.
+                    Ok(h) => {
+                        s.presence = Some(h);
+                        tracing::info!("rebuilt presence subscription for partitioned share {id}");
+                    }
+                    Err(e) => tracing::warn!("presence rebuild for {id} failed: {e:#}"),
+                }
+                let peers: Vec<iroh::EndpointAddr> = peer_providers(&s.key, &s.roster)
+                    .into_iter()
+                    .filter(|pid| *pid != self_id)
+                    .map(iroh::EndpointAddr::new)
+                    .collect();
+                if !peers.is_empty() {
+                    jobs.push(DocResync {
+                        share_id: id.clone(),
+                        doc: s.doc.clone(),
+                        peers,
+                    });
+                }
+            }
+        }
+
+        // Endpoint-wide: fall back to the public relays while ANY share is provably
+        // partitioned, and stop once none is (the watchdog then re-homes on the
+        // custom relay). Cleared here rather than left latched so a genuine custom
+        // relay reclaims the home slot as soon as connectivity returns.
+        self.force_relay_fallback
+            .store(any_partitioned, Ordering::Relaxed);
+        jobs
+    }
+
     /// Re-ask the OS keystore for the write key of every share held inert by
     /// [`Engine::locked`], and open any whose key has become available.
     ///
@@ -4565,7 +4782,25 @@ async fn spawn_event_task(
                         match e {
                             LiveEvent::NeighborUp(_) => r.note(&peer, Some(true)),
                             LiveEvent::NeighborDown(_) => r.note(&peer, Some(false)),
+                            // A sync event fires on BOTH success and failure. Only a
+                            // success proves the peer is reachable; a failed dial must
+                            // not refresh liveness, or a fully-partitioned node marks
+                            // every peer online for the TTL on each retry and the fleet
+                            // flaps "Syncing ↔ offline" while nothing actually connects
+                            // (docs/fleet-isolation-investigation.md, known-issues #16).
+                            LiveEvent::SyncFinished(se) => match &se.result {
+                                Ok(_) => r.note(&peer, None),
+                                Err(err) => r.note_sync_finished(&peer, false, Some(err.as_str())),
+                            },
                             _ => r.note(&peer, None),
+                        }
+                    }
+                    // A failed sync is invisible today (it returns Ok from start_sync
+                    // and only surfaces as this event); log it so a silent partition
+                    // is diagnosable. Debug-level: it fires on every retry.
+                    if let LiveEvent::SyncFinished(se) = e {
+                        if let Err(err) = &se.result {
+                            tracing::debug!("doc sync with {peer} failed: {err}");
                         }
                     }
                 }
@@ -4667,6 +4902,42 @@ mod tests {
             select_rejoin_targets(&mut rng, all.clone(), &heard),
             vec![all[27]]
         );
+    }
+
+    /// Acceptance test for the phantom-liveness fix
+    /// (docs/fleet-isolation-investigation.md): a **failed** doc-sync must produce
+    /// zero roster online-flaps. Before the fix, a fully-partitioned node counted
+    /// every failed retry as contact, marking peers "online" for the 20s TTL and
+    /// flapping the whole fleet "Syncing ↔ offline" while nothing connected.
+    #[test]
+    fn failed_sync_never_marks_a_peer_online() {
+        let mut r = PeerRoster::default();
+        let peer = eid(7).to_string();
+
+        // A failed dial: not contact. No online peer, no advanced last-contact, but
+        // the error is recorded for diagnostics.
+        r.note_sync_finished(&peer, false, Some("connection timed out"));
+        assert_eq!(r.counts().0, 0, "a failed sync must not mark a peer online");
+        assert_eq!(r.last_contact(), 0, "a failed sync is not genuine contact");
+        assert!(
+            r.last_sync_err().is_some(),
+            "the failure is kept for diagnostics"
+        );
+
+        // Repeated failures (the retry loop) never flip it online either.
+        for _ in 0..5 {
+            r.note_sync_finished(&peer, false, Some("connection timed out"));
+        }
+        assert_eq!(
+            r.counts().0,
+            0,
+            "repeated failed syncs must not flap online"
+        );
+
+        // A *successful* sync IS contact and marks the peer online.
+        r.note_sync_finished(&peer, true, None);
+        assert_eq!(r.counts().0, 1, "a successful sync marks the peer online");
+        assert!(r.last_contact() > 0, "success advances last-contact");
     }
 
     fn presence(name: &str, role: seed_ipc::Role) -> crate::presence::Presence {

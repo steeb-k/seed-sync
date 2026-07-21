@@ -424,6 +424,18 @@ async fn presence_loop(daemon: Daemon) {
                 tokio::spawn(dial.run());
             }
 
+            // Provable-partition self-heal (docs/fleet-isolation-investigation.md):
+            // a share that can reach no member despite having members and a live
+            // rendezvous forces the public-relay fallback (blackholed custom relay)
+            // and, if it persists, rebuilds its gossip/presence subscription. The
+            // returned doc re-kicks run off-lock like every other network job.
+            let recoveries = { daemon.engine.lock().await.isolation_recoveries().await };
+            for resync in recoveries {
+                tokio::spawn(async move {
+                    let _ = tokio::time::timeout(Duration::from_secs(30), resync.run()).await;
+                });
+            }
+
             // Master shares whose write key was locked in the OS keystore at startup
             // (a login keyring not yet unlocked) are held inert. Re-ask for the key so
             // unlocking the keyring resumes the share on its own — the alternative is

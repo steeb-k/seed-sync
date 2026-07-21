@@ -244,15 +244,20 @@ impl RendezvousDial {
             addr.id.fmt_short(),
         );
 
-        // Presence first: it's a queue hand-off to the gossip actor and returns
-        // immediately, whereas start_sync dials.
-        if let Some(sender) = self.presence {
-            crate::presence::PresenceRejoin::new(sender, vec![addr.id])
-                .join()
-                .await;
-        }
+        // Doc sync first: it carries the *full* resolved address, which seeds the
+        // endpoint's remote map for this id (known-issues #4/H4). The gossip
+        // presence join takes only the bare endpoint **id** and otherwise relies on
+        // discovery to resolve it — which, for a member reachable only via the
+        // rendezvous, may not yet be possible. Seeding the map first gives the
+        // subsequent join a dialable address instead of an unresolvable id.
+        let peer_id = addr.id;
         if let Err(e) = self.doc.start_sync(vec![addr]).await {
             tracing::warn!("rendezvous doc sync for {} failed: {e:#}", self.share_id);
+        }
+        if let Some(sender) = self.presence {
+            crate::presence::PresenceRejoin::new(sender, vec![peer_id])
+                .join()
+                .await;
         }
     }
 }
