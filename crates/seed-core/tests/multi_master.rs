@@ -578,3 +578,90 @@ async fn replaced_file_survives_stale_mtime() -> anyhow::Result<()> {
     a.shutdown().await?;
     Ok(())
 }
+
+/// Paste-then-rename-during-write (a routine flow: paste an ISO, then immediately
+/// rename it before the copy finishes). While the file is present but *unreadable*
+/// — locked mid-copy — the master's scan SKIPS it (the os-error-32 "cannot read;
+/// will retry" path), so it hasn't published. It is then renamed before it ever
+/// published. The renamed file must still publish and converge on the peer, and the
+/// pre-rename name must never surface anywhere. Regression for the reported
+/// "pasted-then-renamed file won't sync until re-added".
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn pasted_then_renamed_while_locked_still_syncs() -> anyhow::Result<()> {
+    let mut c = cluster(1, 1).await?; // one master (publisher) + one viewer (receiver)
+
+    // Baseline so the share is live and converged before the tricky file.
+    let base = content_for("baseline.txt", 4096);
+    std::fs::write(c.nodes[0].folder().join("baseline.txt"), &base)?;
+    let mut want = BTreeMap::new();
+    want.insert("baseline.txt".to_string(), base);
+    c.drive_until(Duration::from_secs(60), "baseline converged", |c| {
+        c.converged(&want)
+    })
+    .await?;
+
+    // The paste: a large file appears in the master's folder holding the content it
+    // will have once the copy completes, but it is unreadable (locked mid-copy).
+    let iso = content_for("renamed-final.iso", 5 * 1024 * 1024 + 777);
+    let staged = c.nodes[0].folder().join("staged.iso");
+    std::fs::write(&staged, &iso)?;
+
+    // Hold it unreadable across several reconciles so the master SKIPS it and never
+    // publishes it (the exact "1 file unreadable/unpublished, will retry" state).
+    #[cfg(windows)]
+    let lock = {
+        use std::os::windows::fs::OpenOptionsExt;
+        // share_mode(0) denies all sharing, so any other open (incl. the scanner's
+        // in this same process) hits a sharing violation — os error 32.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&staged)?
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o000))?;
+    }
+    for _ in 0..4 {
+        c.tick().await;
+    }
+    assert!(
+        !c.nodes[1].folder().join("staged.iso").exists(),
+        "an unreadable (mid-paste) file must not publish to the peer"
+    );
+
+    // The rename. On Windows a share_mode(0) handle blocks rename, so release it
+    // first (mimics the copy finishing, then the rename); on unix rename succeeds
+    // even at 0o000, so we rename *while still locked* — the harsher ordering — and
+    // only then make it readable.
+    let final_path = c.nodes[0].folder().join("renamed-final.iso");
+    #[cfg(windows)]
+    {
+        drop(lock);
+        std::fs::rename(&staged, &final_path)?;
+    }
+    #[cfg(unix)]
+    {
+        std::fs::rename(&staged, &final_path)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&final_path, std::fs::Permissions::from_mode(0o644))?;
+    }
+    want.insert("renamed-final.iso".to_string(), iso);
+
+    c.drive_until(
+        Duration::from_secs(120),
+        "pasted-then-renamed file converges under its final name",
+        |c| c.converged(&want),
+    )
+    .await?;
+    assert!(
+        !c.nodes[1].folder().join("staged.iso").exists(),
+        "the pre-rename name must not survive on the peer"
+    );
+    println!("pasted-then-renamed-while-locked file synced to the peer under its final name");
+
+    c.shutdown().await?;
+    Ok(())
+}
