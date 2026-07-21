@@ -187,12 +187,26 @@ Landed in `seed-core` / `seed-daemon` (build + `seed-core` lib tests green):
   "last contact" in the IPC `list`/GUI/tray is deliberately deferred — it touches
   seed-ipc/gui/mobile and the WARN + honest `NoPeers` already make the incident
   visible.)
-- **Fix #3 — self-heal ladder [PARTIAL].** New `Engine::isolation_recoveries`
-  (driven every ~6s from the presence loop). A share isolated past
-  `ISOLATION_HEAL_SECS` (120s) forces the public-relay fallback and WARNs; past
-  `ISOLATION_PRESENCE_REBUILD_SECS` (210s) it rebuilds the gossip/presence
-  subscription and re-kicks doc sync. **Deferred:** in-process endpoint rebuild
-  (rung 3) — higher risk, and the relay-fallback rung is the proven-live fix.
+- **Fix #3 — self-heal ladders [DONE].** New `Engine::connectivity_recoveries`
+  (driven every ~6s from the presence loop), two independent ladders:
+  - *Ladder 1 — total isolation (transport dead).* A share isolated past
+    `ISOLATION_HEAL_SECS` (120s) forces the public-relay fallback and WARNs; past
+    `ISOLATION_PRESENCE_REBUILD_SECS` (210s) it rebuilds the presence subscription
+    and re-kicks doc sync.
+  - *Ladder 2 — presence overlay dead while transport is alive* (the "doc-sync
+    works / gossip dead" case, see below). Keyed on presence staleness rather than
+    isolation: transport fresh (`last_contact` within
+    `PRESENCE_TRANSPORT_FRESH_SECS`=60s) but no presence heartbeat within
+    `PRESENCE_HEARD_TTL_SECS` (20s), sustained for `PRESENCE_GAP_HEAL_SECS` (90s),
+    → rebuild the presence subscription (throttled by `PRESENCE_REBUILD_MIN_SECS`).
+    Presence-vs-transport is now tracked separately in the roster
+    (`last_presence` vs `last_contact`), because a successful doc-sync marks a peer
+    online and would otherwise hide the dead overlay from ladder 1. Pure decision
+    `presence_overlay_dead` is unit-tested
+    (`presence_overlay_dead_only_when_transport_alive_and_presence_silent`).
+
+  **Deferred:** in-process endpoint rebuild — higher risk, and the two ladders
+  cover both observed failure modes.
 - **Fix #4 — watchdog hardening [DONE].** `relay_watchdog` takes a
   `force_fallback` signal; while set (by #3) it treats the custom relay as
   unusable and adds the public relays **even though `is_connected()` is true** —
