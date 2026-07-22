@@ -229,11 +229,11 @@ pub(crate) async fn serve(
     tokio::spawn(reconcile_loop(daemon.clone()));
     tokio::spawn(presence_loop(daemon.clone()));
     tokio::spawn(throughput_loop(daemon.clone()));
-    // Suspend/resume self-heal (Linux): a frequently-suspending laptop otherwise
-    // never finishes a large download, because each suspend kills the transfer and
-    // iroh doesn't notice the dead connections on an s2idle wake
-    // (known-issues #21).
-    #[cfg(target_os = "linux")]
+    // Suspend/resume self-heal (known-issues #21): a frequently-suspending laptop
+    // otherwise never finishes a large download, because each suspend kills the
+    // transfer and iroh doesn't notice the dead connections on wake. Every platform
+    // spawns a `sleep_monitor_loop`; Linux uses a precise logind signal, other
+    // platforms a portable wall-clock-gap watchdog (both call `drive_resume`).
     tokio::spawn(sleep_monitor_loop(daemon.clone()));
 
     let listener = transport::bind(&socket)?;
@@ -262,14 +262,64 @@ pub(crate) async fn serve(
     Ok(())
 }
 
+/// Re-establish connectivity after a resume: [`Engine::on_resume`] rebinds the
+/// iroh socket, re-homes the relay, and rebuilds gossip presence, returning a
+/// doc-resync per share which we run off-lock and bounded — the in-process
+/// equivalent of the daemon restart that was previously the only cure
+/// (known-issues #21). Shared by every platform's resume trigger.
+async fn drive_resume(daemon: &Daemon) {
+    let resyncs = { daemon.engine.lock().await.on_resume().await };
+    for resync in resyncs {
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(30), resync.run()).await;
+        });
+    }
+}
+
+/// Suspend/resume watchdog for platforms without a wired power-event source
+/// (Windows, macOS): a wall-clock-gap detector. We sleep in short monotonic ticks
+/// and compare against the wall clock; a suspend freezes the monotonic timer while
+/// wall time keeps advancing, so a wall gap far larger than the tick means the
+/// machine was suspended and just resumed. On that edge we run the same
+/// [`drive_resume`] as the Linux logind path.
+///
+/// Chosen over the native hooks (Windows `WM_POWERBROADCAST`, macOS `NSWorkspace`)
+/// because those need a message pump / run loop that the daemon has in neither its
+/// console nor its Windows-service mode; this is dependency-free and uniform across
+/// both. A forward clock jump (NTP step, manual set) can trigger a spurious resume,
+/// which is harmless — `on_resume` is idempotent. Detection latency is at most one
+/// tick.
+#[cfg(not(target_os = "linux"))]
+async fn sleep_monitor_loop(daemon: Daemon) {
+    use std::time::SystemTime;
+    // Short enough that post-resume recovery is prompt; long enough to be cheap.
+    const TICK: Duration = Duration::from_secs(20);
+    // A wall gap above this (vs the ~20s tick) means real suspend, not jitter.
+    const RESUME_GAP: Duration = Duration::from_secs(60);
+    let mut last = SystemTime::now();
+    loop {
+        tokio::time::sleep(TICK).await;
+        let now = SystemTime::now();
+        let elapsed = now.duration_since(last).unwrap_or(Duration::ZERO);
+        last = now;
+        if elapsed >= RESUME_GAP {
+            tracing::info!(
+                "resume inferred (wall-clock gap {}s over a {}s tick) — re-establishing connectivity",
+                elapsed.as_secs(),
+                TICK.as_secs()
+            );
+            drive_resume(&daemon).await;
+        }
+    }
+}
+
 /// Watch systemd-logind for suspend/resume and force a connectivity re-establish
 /// on every resume.
 ///
 /// `org.freedesktop.login1.Manager.PrepareForSleep` fires with `true` just before
 /// the machine suspends and `false` right after it resumes. On the resume edge we
-/// call [`Engine::on_resume`], which rebinds the iroh socket, re-homes the relay,
-/// and rebuilds gossip presence — the in-process equivalent of the daemon restart
-/// that was previously the only cure (known-issues #21).
+/// call [`drive_resume`] — the in-process equivalent of the daemon restart that was
+/// previously the only cure (known-issues #21).
 ///
 /// Best-effort: if the system bus or logind is unavailable (containers, non-systemd
 /// hosts) we log at debug and retry, never failing the daemon.
@@ -312,12 +362,7 @@ async fn run_sleep_monitor(daemon: &Daemon) -> anyhow::Result<()> {
             continue;
         }
         tracing::info!("resumed from suspend — re-establishing connectivity");
-        let resyncs = { daemon.engine.lock().await.on_resume().await };
-        for resync in resyncs {
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(Duration::from_secs(30), resync.run()).await;
-            });
-        }
+        drive_resume(daemon).await;
     }
     // The stream ended (bus dropped) — bubble up so the outer loop reconnects.
     anyhow::bail!("logind PrepareForSleep stream ended")

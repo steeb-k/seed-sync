@@ -23,7 +23,7 @@ why, and the fix or current disposition.
 | 18 | a locked OS keystore silently demotes a master to viewer, reverting edits | fixed (held inert + auto-retry) |
 | 19 | a just-joined member's empty replica trips false `OutOfSync` | fixed (advertise unknown until the replica is seen) |
 | 20 | in-place file overwrite re-downloaded the blob twice | fixed |
-| 21 | large downloads never resume after suspend/resume | fixed (v0.6.9; logind resume hook) |
+| 21 | large downloads never resume after suspend/resume | fixed (Linux logind + Win/macOS wall-clock-gap watchdog) |
 | 22 | blob store never garbage-collects; store grows unbounded | fixed (hourly daemon GC pass, replica-derived live set) |
 | 23 | fleet-wide silent isolation (phantom liveness + dead presence overlay) | fixed |
 | 24 | empty directories are not mirrored (files-only manifest) | design note |
@@ -461,9 +461,21 @@ It is triggered by a `seed-daemon` listener on logind's `PrepareForSleep` signal
 verified-range bitfield to disk before router teardown so a restart mid-download
 resumes from disk. Field-verified 2026-07-21: a 1.8 GB ISO completed across three
 real suspend/resume cycles with no restart. Tests:
-`crates/seed-core/tests/resume.rs` (`--ignored`). macOS (`NSWorkspace`) and Windows
-(`WM_POWERBROADCAST`) likely need the same resume hook; only the Linux path is wired
-so far.
+`crates/seed-core/tests/resume.rs` (`--ignored`).
+
+Windows and macOS are now wired too. Rather than the native power events
+(`WM_POWERBROADCAST` / `NSWorkspace`), which need a message pump / run loop the
+daemon has in neither its console nor its Windows-service mode, non-Linux platforms
+run a dependency-free **wall-clock-gap watchdog** (`sleep_monitor_loop`,
+`#[cfg(not(target_os = "linux"))]`): a suspend freezes the monotonic sleep timer
+while wall time keeps advancing, so a wall gap far larger than the ~20 s tick means
+the machine just resumed. Both it and the Linux logind path call the shared
+`drive_resume` → `Engine::on_resume`. A spurious trigger from a forward clock jump
+is harmless (`on_resume` is idempotent); detection latency is at most one tick. The
+native OS hooks remain a possible future refinement if immediate, jitter-proof
+detection is ever needed. Power-event behaviour is validated by real suspend on
+each platform (the watchdog branch also compiles as the Windows build's active
+path).
 
 ## 22. Blob store never garbage-collects (unbounded growth)
 
