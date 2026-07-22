@@ -1,7 +1,8 @@
 # Member registry: last-known member names that survive disconnects
 
-**Status: implemented (2026-07-10).** Verified end-to-end by
-`crates/seed-core/tests/member_names.rs` (run with `-- --ignored`).
+Replicated last-known member names so the member list survives disconnects and
+restarts. End-to-end coverage is in `crates/seed-core/tests/member_names.rs`
+(run with `-- --ignored`).
 
 ## The problem
 
@@ -11,7 +12,7 @@ bare endpoint ids (or dropped members entirely):
 
 1. **Doc-sync discovery without presence.** A peer that syncs the replica but
    whose gossip hasn't reached us yet (the asymmetric-delivery case behind
-   known-issues #9) sits in the roster nameless.
+   known-issues #7) sits in the roster nameless.
 2. **Daemon restart.** The roster starts empty; members that don't come back
    online simply vanish from the list, and "2 of 5" reads "2 of 2".
 3. **Fresh member.** A newly-joined device has never heard anyone; until each
@@ -39,7 +40,7 @@ gossip message from it.
 
 Per member, the freshest entry timestamp wins. Renames leave superseded keys
 behind (~100 bytes each, never deleted — `del` is prefix deletion,
-known-issues #13, and can't remove another author's entries anyway); they
+known-issues #11, and can't remove another author's entries anyway); they
 simply lose the timestamp comparison forever.
 
 Reading happens early in every reconcile pass (step 1.5); publishing happens
@@ -48,23 +49,18 @@ Reading happens early in every reconcile pass (step 1.5); publishing happens
 are best-effort and timeout-bounded like the other doc reads; registry trouble
 never fails a file reconcile.
 
-The publish gate is load-bearing, found the hard way: with the publish inlined
-at step 1.5, a co-master's very first pass wrote its own record while its
-*initial* doc-sync with the existing members was still in flight. That write
-churned the sync session enough that the first merge ran against a still-empty
-replica — so the joiner republished its local copies as brand-new entries with
-fresh LWW timestamps, resurrecting a concurrent delete exactly as in
-known-issues #12 (`multi_master::delete_survives_unseen_master_copy` went from
-~10s green on baseline to a reproducible 120s timeout; disabling the write
-restored baseline; the gate keeps it green). Genesis costs one pass of delay:
-the creator's own replicated ignore entry satisfies the gate from pass 2 on.
-The same hazard class exists latently for the ignore-list publish itself
-(known-issues #15).
+The publish gate matters: publishing inline at step 1.5 let a co-master's first
+pass write its own record while its initial doc-sync was still in flight, which
+churned the session and re-opened the concurrent-delete resurrection race —
+known-issues #15 covers the mechanism and the reproduction. Genesis costs one
+pass of delay: the creator's own replicated ignore entry satisfies the gate from
+pass 2 on. The same hazard class exists latently for the ignore-list publish
+itself.
 
 **Trust:** unchanged from presence. Any master-key holder can write any
 record (replica entries are signed by the shared namespace key, not
 per-device), and presence names were already spoofable by members
-(`usability-findings.md` #4). Masters are trusted with folder *content*, so
+(known-issues #27). Masters are trusted with folder *content*, so
 trusting them with display names adds no new exposure. File content stays
 hash-verified.
 
@@ -96,25 +92,6 @@ write capability.
 No IPC, GUI, or mobile-facade changes: `PeerInfo.name` simply stops being
 `None`, and offline members keep their row. Old peers skip unknown `\x00`
 control keys, so the wire format is backward-compatible.
-
-## Aside: can the registry let us ping less often?
-
-Explored while designing this; parked deliberately. Presence currently does
-two jobs: **identity** (name/role) and **liveness/health** (online TTL,
-percent, manifest fingerprint for divergence detection). The registry fully
-takes over identity — a missed beat no longer loses names, and a fresh member
-doesn't need to hear everyone before its list is useful.
-
-What it cannot take over is liveness: "still alive" is inherently a heartbeat,
-and doc entries are the wrong medium for it (viewers can't write, and stamping
-the replica every few seconds per member would churn a permanent, replicated
-structure for ephemeral data). So the 3s beat / 20s TTL cadence is now purely
-a *liveness-latency* choice, no longer an identity-convergence requirement.
-That makes relaxing it (e.g. 5s beat / 30s TTL, halving steady-state gossip)
-a legitimate follow-up tuning knob — but cadence changes interact with the
-mesh-repair dynamics that took a fleet soak to stabilize (known-issues #9:
-rejoin sampling, TTL vs. reconcile-CPU beat delays), so any change should be
-soak-verified at fleet scale, not reasoned about. Not changed in this pass.
 
 ## Files
 
