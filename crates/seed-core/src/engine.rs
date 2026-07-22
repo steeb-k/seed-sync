@@ -498,9 +498,20 @@ use crate::scan::{self, IgnoreSet};
 /// All reserved doc keys share the `\x00` control prefix so they never collide
 /// with user file paths (relative POSIX strings, never starting with NUL).
 const CONTROL_PREFIX: u8 = 0;
-/// Replicated, master-written ignore list (CBOR `Vec<String>`), LWW-merged across
-/// masters. Viewers read it so they honor what a master chose not to sync.
-const IGNORE_KEY: &[u8] = b"\x00ignore";
+/// Prefix for the replicated, master-written ignore list: `\x00i/<CBOR
+/// Vec<String>>` with a non-empty marker value. Like the member registry
+/// (`\x00m/`), the list is encoded **in the key**, not the value — the engine
+/// disables iroh-docs' content auto-downloader per replica, so the old
+/// `\x00ignore` `set_bytes` form (list stored as a *value blob*) never reached
+/// peers: viewers silently fell back to their *local* list and could delete
+/// files a master ignored (known-issues #14). Key bytes ride doc-sync metadata,
+/// so the list reaches every peer that syncs the doc. Across masters it is
+/// last-writer-wins on the entry timestamp: each distinct list is a distinct
+/// key and the reader takes the freshest entry under the prefix (superseded
+/// lists are left behind and simply lose the timestamp comparison, like member
+/// renames). Old readers skip unknown control keys, so this is wire-compatible;
+/// any legacy `\x00ignore` entry is ignored and harmlessly orphaned.
+const IGNORE_PREFIX: &[u8] = b"\x00i/";
 /// Prefix for empty-file markers: `\x00e/<relpath>` with a non-empty marker value.
 /// iroh-docs filters 0-byte entries out of queries as deletion markers, so a real
 /// empty file can't ride a normal entry — it gets its own (non-empty) control key.
@@ -1158,23 +1169,44 @@ async fn read_remote_files(doc: &Doc) -> anyhow::Result<RemoteView> {
     Ok(RemoteView { files, tombstones })
 }
 
-/// Read the replicated ignore list (`\x00ignore`), if a master has published one
-/// and its content has arrived. `None` means "use the locally-configured list".
-async fn read_ignore_list(doc: &Doc, blobs: &FsStore) -> anyhow::Result<Option<Vec<String>>> {
-    let Some(entry) = doc
-        .get_one(Query::single_latest_per_key().key_exact(IGNORE_KEY))
-        .await?
-    else {
-        return Ok(None);
-    };
-    let hash = entry.content_hash();
-    if !blobs.blobs().has(hash).await? {
-        return Ok(None);
+/// Encode an ignore list into its doc key: `\x00i/` + CBOR. Equal lists encode
+/// to equal keys, so republishing an unchanged list is idempotent.
+fn ignore_list_key(list: &[String]) -> Vec<u8> {
+    let mut k = IGNORE_PREFIX.to_vec();
+    // A list of strings is infallible to serialize.
+    let _ = ciborium::into_writer(list, &mut k);
+    k
+}
+
+/// Decode a `\x00i/` doc key back into an ignore list (`None`: not an ignore
+/// key, or a future encoding this version can't read).
+fn decode_ignore_list(key: &[u8]) -> Option<Vec<String>> {
+    let tail = key.strip_prefix(IGNORE_PREFIX)?;
+    ciborium::from_reader(tail).ok()
+}
+
+/// Read the replicated ignore list (`\x00i/…`), if a master has published one.
+/// The list rides the doc *key* (see [`IGNORE_PREFIX`]); across masters the
+/// freshest entry by record timestamp wins (LWW). `None` means no master has
+/// published a list — the caller falls back to the locally-configured one.
+async fn read_ignore_list(doc: &Doc) -> anyhow::Result<Option<Vec<String>>> {
+    let mut best: Option<(Vec<String>, u64)> = None;
+    let mut s = std::pin::pin!(
+        doc.get_many(Query::single_latest_per_key().key_prefix(IGNORE_PREFIX))
+            .await?
+    );
+    while let Some(e) = s.next().await {
+        let e = e?;
+        let Some(list) = decode_ignore_list(e.key()) else {
+            continue;
+        };
+        let ts = e.timestamp();
+        match &best {
+            Some((_, t)) if *t >= ts => {}
+            _ => best = Some((list, ts)),
+        }
     }
-    let bytes = blobs.blobs().get_bytes(hash).await?;
-    let list: Vec<String> =
-        ciborium::from_reader(bytes.as_ref()).context("decode replicated ignore list")?;
-    Ok(Some(list))
+    Ok(best.map(|(list, _)| list))
 }
 
 /// Map a remembered `master` flag back to the IPC role enum.
@@ -1605,6 +1637,11 @@ pub struct ReconcileJob {
     share_id: String,
     folder: PathBuf,
     is_master: bool,
+    /// Whether *this* device minted the share key. Lets a fresh creator publish
+    /// its ignore list on pass 1 (its empty replica is authoritative, not virgin)
+    /// while a joining master waits for `replica_seen` — see the ignore-list
+    /// publish gate in [`ReconcileJob::run`] (known-issues #15).
+    we_minted: bool,
     configured_ignore: Vec<String>,
     /// This device's display name at job build, published into the doc member
     /// registry (masters only) so peers keep a last-known name for us.
@@ -2053,27 +2090,28 @@ impl ReconcileJob {
         // 1. Effective ignore set: the replicated `\x00ignore` is authoritative
         //    (so viewers honor what a master ignored, e.g. don't delete those
         //    files). A master (re)publishes its configured list when it drifts.
-        self.set_phase("read ignore list (doc + blob store)");
+        self.set_phase("read ignore list (doc keys)");
         let live_ignore = tokio::time::timeout(
             Duration::from_secs(DOC_READ_TIMEOUT_SECS),
-            read_ignore_list(&self.doc, &self.blobs),
+            read_ignore_list(&self.doc),
         )
         .await
         .map_err(|_| anyhow!("ignore-list doc read timed out after {DOC_READ_TIMEOUT_SECS}s"))??;
-        // Evidence of a non-virgin replica for the member-registry publish gate:
-        // an ignore entry can only exist if we've synced someone's state (or
-        // published our own on an earlier pass).
+        // Evidence of a non-virgin replica for the publish gates below: an ignore
+        // entry can only exist if we've synced someone's state (or published our
+        // own on an earlier pass).
         let replica_had_ignore = live_ignore.is_some();
+        // A master's effective list is always its own configured list; a viewer
+        // honors the replicated one (so it won't delete files a master ignored),
+        // falling back to local only until a master has published. A master's
+        // publish of a *drifted* list is DEFERRED to the end of the pass and gated
+        // like the member registry (known-issues #15): a doc write during a virgin
+        // replica's initial sync can churn the session and resurrect concurrent
+        // deletes. `effective_ignore` doesn't depend on that write, so the scan can
+        // proceed with it now.
+        let ignore_needs_publish =
+            self.is_master && live_ignore.as_deref() != Some(self.configured_ignore.as_slice());
         let effective_ignore = if self.is_master {
-            if live_ignore.as_deref() != Some(self.configured_ignore.as_slice()) {
-                let mut cbor = Vec::new();
-                ciborium::into_writer(&self.configured_ignore, &mut cbor)
-                    .context("encode ignore list")?;
-                self.doc
-                    .set_bytes(self.author, IGNORE_KEY.to_vec(), cbor)
-                    .await
-                    .context("publish ignore list")?;
-            }
             self.configured_ignore.clone()
         } else {
             live_ignore.unwrap_or_else(|| self.configured_ignore.clone())
@@ -2534,6 +2572,36 @@ impl ReconcileJob {
             || !remote.is_empty()
             || !tombstones.is_empty()
             || !member_records.is_empty();
+
+        // Ignore-list publish (masters only), LAST and gated like the member
+        // registry (known-issues #15): a drifted list is written only once the
+        // replica has proven contact with the share (`replica_seen`) OR this
+        // device minted the share. A fresh creator's replica is authoritatively
+        // empty (there is nothing to sync *from*), so it may bootstrap its list
+        // immediately — that first `\x00i/` entry is also what flips `replica_seen`
+        // true from pass 2 on. A *joining* master instead waits for its initial
+        // sync, so a step-1 write can't churn the session and resurrect concurrent
+        // deletes the way an early member-record write did.
+        if ignore_needs_publish && (replica_seen || self.we_minted) {
+            self.set_phase("ignore list (publish)");
+            let key = ignore_list_key(&self.configured_ignore);
+            match tokio::time::timeout(
+                Duration::from_secs(DOC_READ_TIMEOUT_SECS),
+                self.doc.set_bytes(self.author, key, vec![1u8]),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("ignore-list publish for {} failed: {e:#}", self.share_id)
+                }
+                Err(_) => tracing::warn!(
+                    "ignore-list publish for {} timed out after {DOC_READ_TIMEOUT_SECS}s",
+                    self.share_id
+                ),
+            }
+        }
+
         if replica_seen {
             self.set_phase("member registry (publish)");
             let _ = tokio::time::timeout(
@@ -4531,6 +4599,7 @@ impl Engine {
             share_id: share_id.to_string(),
             folder: state.folder.clone(),
             is_master,
+            we_minted: state.we_minted,
             configured_ignore: state.ignore.clone(),
             device_name,
             doc: state.doc.clone(),
@@ -5472,6 +5541,39 @@ mod tests {
             advertised_fp(true, &populated),
             manifest_fingerprint(&populated)
         );
+    }
+
+    /// Known-issues #14: the replicated ignore list rides the doc *key*
+    /// (`\x00i/` + CBOR), not a value blob, so it must survive an exact
+    /// encode→decode round-trip and reject foreign/legacy keys. A non-ignore
+    /// control key (e.g. the old `\x00ignore` value-blob form, or a member
+    /// record) must decode to `None` so the prefix reader skips it.
+    #[test]
+    fn ignore_list_key_roundtrips_and_rejects_foreign_keys() {
+        for list in [
+            vec![],
+            vec!["*.tmp".to_string()],
+            vec!["a".to_string(), "b/c".to_string(), "d e".to_string()],
+        ] {
+            let key = ignore_list_key(&list);
+            assert!(key.starts_with(IGNORE_PREFIX), "key must carry the prefix");
+            assert_eq!(
+                decode_ignore_list(&key),
+                Some(list.clone()),
+                "list must survive the key round-trip verbatim"
+            );
+        }
+
+        // Equal lists → equal keys (republish is idempotent, no LWW churn).
+        let l = vec!["x".to_string(), "y".to_string()];
+        assert_eq!(ignore_list_key(&l), ignore_list_key(&l.clone()));
+
+        // Foreign / legacy control keys are not ignore keys.
+        assert_eq!(decode_ignore_list(b"\x00ignore"), None);
+        assert_eq!(decode_ignore_list(b"\x00m/whatever"), None);
+        assert_eq!(decode_ignore_list(b"some/user/path"), None);
+        // Right prefix but undecodable CBOR tail → None (forward-compat: skip).
+        assert_eq!(decode_ignore_list(b"\x00i/\xff\xff\xff"), None);
     }
 
     /// Delete-vs-content resolution (known-issues #12): a tombstone deletes a

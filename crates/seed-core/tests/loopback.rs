@@ -150,6 +150,92 @@ async fn master_viewer_mirror_lifecycle() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Known-issues #14: a viewer must honor the master's *replicated* ignore list,
+/// not silently fall back to its own (empty) local one. The list used to be stored
+/// as a value blob that the viewer — content auto-download disabled — never
+/// fetched, so it fell back to local and DELETED files the master had ignored. Now
+/// the list rides the doc *key* (`\x00i/`), so it reaches the viewer with the
+/// manifest. Control: a *non*-ignored rogue file IS still reverted, proving the
+/// mirror is live and only the ignore rule spared the ignored file.
+#[tokio::test]
+#[ignore = "opens real iroh endpoints; run with --ignored"]
+async fn viewer_honors_replicated_ignore_list() -> anyhow::Result<()> {
+    let a_data = tempfile::tempdir()?;
+    let b_data = tempfile::tempdir()?;
+    let a_folder = tempfile::tempdir()?;
+    let b_folder = tempfile::tempdir()?;
+
+    let mut master = Engine::new(a_data.path()).await?;
+    let mut viewer = Engine::new(b_data.path()).await?;
+    tokio::time::timeout(Duration::from_secs(20), async {
+        master.wait_online().await;
+        viewer.wait_online().await;
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("endpoints did not come online"))?;
+
+    // Master shares one file and ignores everything matching `*.log`.
+    std::fs::write(a_folder.path().join("readme.txt"), b"hello")?;
+    let created = master
+        .create_share(a_folder.path(), vec!["*.log".to_string()])
+        .await?;
+    let master_addr = master.endpoint_addr();
+    let share_id = viewer
+        .add_share(&created.viewer_key, b_folder.path(), vec![master_addr])
+        .await?;
+    assert_eq!(share_id, created.share_id);
+
+    // Initial sync: viewer mirrors readme.txt (and, alongside the manifest,
+    // receives the master's `\x00i/` ignore entry).
+    let want = snapshot(a_folder.path());
+    sync_until(&mut viewer, &share_id, b_folder.path(), &want).await?;
+
+    // Two purely-local files the master doesn't have:
+    //   secret.log -> matches the master's ignore rule; must be PRESERVED.
+    //   rogue.txt  -> not ignored; the strict mirror must REVERT (delete) it.
+    let secret = b_folder.path().join("secret.log");
+    let rogue = b_folder.path().join("rogue.txt");
+    std::fs::write(&secret, b"local only")?;
+    std::fs::write(&rogue, b"should vanish")?;
+
+    // Drive reconcile passes until the un-ignored rogue file is gone — then the
+    // ignored file has survived every one of those same passes.
+    tokio::time::timeout(Duration::from_secs(40), async {
+        loop {
+            for j in master.presence_broadcasts() {
+                j.send().await;
+            }
+            for j in viewer.presence_broadcasts() {
+                j.send().await;
+            }
+            let _ = master.apply(&share_id).await;
+            let _ = viewer.apply(&share_id).await;
+            if !rogue.exists() {
+                return anyhow::Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("viewer never reverted the un-ignored rogue.txt"))??;
+
+    assert!(
+        secret.is_file(),
+        "viewer deleted a file the master ignored — replicated ignore list not honored (known-issues #14)"
+    );
+    assert_eq!(
+        std::fs::read(&secret)?,
+        b"local only",
+        "an ignored local file must be left byte-untouched"
+    );
+    assert_eq!(std::fs::read(b_folder.path().join("readme.txt"))?, b"hello");
+
+    master.shutdown().await?;
+    viewer.shutdown().await?;
+    println!("viewer honored replicated ignore list (secret.log preserved, rogue.txt reverted)");
+    Ok(())
+}
+
 /// A genuinely empty (0-byte) file must sync — including a unicode-named one.
 /// iroh-docs filters 0-byte entries out of queries as deletion markers, so empty
 /// files ride a dedicated `\x00e/<path>` control key (non-empty marker value) and
