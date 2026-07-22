@@ -179,5 +179,5 @@ Self-replacement of `seed-sync` is safe: `apply_tree` writes the new file to a t
 - macOS packaging — **now in design**, mirrors this model (script/tarball + launchd, bundled GTK,
   ad-hoc signed). See `docs/macos-packaging.md`.
 
-See also: `docs/windows-packaging.md` (the MSI side) and the release/update handoff section
-in `docs/cross-os-testing.md` (what the Windows updater must mirror).
+See also: `docs/windows-packaging.md` (the MSI side) and `docs/releasing.md` (the
+cross-platform release runbook and the shared distribution model).

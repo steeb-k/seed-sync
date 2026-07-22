@@ -133,7 +133,7 @@ now sheds load too (≈ 1× instead of N×).
   (`ConnectionPool` calls `endpoint.connect(id)`, relying on the addr book /
   discovery). If peers can't reach each other (NAT, or stale addresses after
   resume-from-sleep), the swarm degrades to master-only regardless of policy — see
-  `docs/sleep-resume-investigation.md`.
+  known-issues #21.
 
 ## Health reporting
 

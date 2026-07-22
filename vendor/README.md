@@ -10,7 +10,7 @@ instead of keeping a second copy) moves the owned blob with `std::fs::rename` an
 only falls back to a copy when the OS error is `EXDEV` (unix, 18). On Windows a
 cross-volume move returns `ERROR_NOT_SAME_DEVICE` (17), which upstream didn't
 match, so the export failed and a viewer whose mirror was on a different drive
-than its data dir kept the content twice. See `docs/cross-os-testing.md` issue #1.
+than its data dir kept the content twice. See known-issues #25.
 
 **The patch** (`src/store/fs.rs`, in `export_path_impl`): also treat error 17 as a
 cross-volume move so it falls back to copy + sets the entry to `External`. The now-
