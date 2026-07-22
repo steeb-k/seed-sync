@@ -561,6 +561,10 @@ const SWARM_ROUND_BACKOFF_MS: u64 = 400;
 /// can't actually be reached) without losing progress.
 const SWARM_DEADLINE_SECS: u64 = 300;
 
+/// Bound on the post-resume `Endpoint::network_change` rebind so a wedged endpoint
+/// can't stall the reconcile loop that drives [`Engine::on_resume`].
+const RESUME_NETWORK_CHANGE_TIMEOUT_SECS: u64 = 10;
+
 /// How long a manifest disagreement with an online peer must persist before the
 /// share is reported "out of sync". Long enough that normal propagation lag after
 /// a change (the doc replicating across members) settles without a false alarm.
@@ -2490,11 +2494,11 @@ impl ReconcileJob {
                 present_bytes += self.local_bytes(hash).await.min(re.size);
             }
         }
-        let health = if total_bytes == 0 {
-            100
-        } else {
-            (present_bytes.min(total_bytes) * 100 / total_bytes) as u8
-        };
+        // An empty view is 100% (100% of nothing); otherwise the fraction held.
+        // `checked_div` folds the `total_bytes == 0` guard into the division.
+        let health = (present_bytes.min(total_bytes) * 100)
+            .checked_div(total_bytes)
+            .unwrap_or(100) as u8;
 
         still_skipped.sort();
         still_skipped.dedup();
@@ -4239,6 +4243,70 @@ impl Engine {
         // relay reclaims the home slot as soon as connectivity returns.
         self.force_relay_fallback
             .store(any_partitioned, Ordering::Relaxed);
+        jobs
+    }
+
+    /// Force a full connectivity re-establish after a system resume.
+    ///
+    /// Suspend freezes the process and tears down the network underneath it: QUIC
+    /// sockets, the home relay, NAT/holepunch mappings, and gossip neighbor
+    /// connections all go stale. On an `s2idle` resume iroh's `netwatch` does not
+    /// reliably fire (a suspend/resume does not always look like a normal interface
+    /// change on Linux), so the endpoint wakes believing dead connections are live
+    /// and nothing self-heals — only a restart fixes it. That is fatal for a
+    /// frequently-suspending laptop pulling a large file: every suspend kills the
+    /// in-flight transfer and the download never converges
+    /// (docs/sleep-resume-investigation.md).
+    ///
+    /// This is that restart, in-process, triggered by the resume edge rather than by
+    /// the degradation ladders in [`Engine::connectivity_recoveries`] noticing after
+    /// the fact: re-probe the network (rebind the socket + re-home the relay) and
+    /// unconditionally rebuild every active share's presence subscription. Returns a
+    /// [`DocResync`] per share so the caller re-kicks doc live-sync off-lock, exactly
+    /// like the other recovery paths.
+    pub async fn on_resume(&mut self) -> Vec<DocResync> {
+        // Rebind the magic socket and re-establish the home relay. Bounded so a
+        // wedged endpoint can't stall the caller (the reconcile loop). Harmless if
+        // the network didn't actually change or iroh already noticed.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(RESUME_NETWORK_CHANGE_TIMEOUT_SECS),
+            self.node.endpoint.network_change(),
+        )
+        .await;
+
+        let paused_all = self.paused_all();
+        let self_id = self.node.endpoint.id();
+        let gossip = self.node.gossip.clone();
+        let now = now_secs();
+        let mut jobs = Vec::new();
+        for (id, s) in self.shares.iter_mut() {
+            if s.paused || paused_all {
+                continue;
+            }
+            // Unconditional: resume is a known teardown, so don't wait for the
+            // isolation / presence-gap ladders to detect it. Reset their episode
+            // timers (this rebuild counts as the throttled one) so they don't fire a
+            // redundant second rebuild moments later.
+            s.heal.isolated_since = None;
+            s.heal.isolated_warned = false;
+            s.heal.presence_gap_since = None;
+            s.heal.last_presence_rebuild = now;
+            if rebuild_presence(&gossip, self_id, id, s).await {
+                tracing::info!("resume: rebuilt presence subscription for share {id}");
+            }
+            let peers: Vec<iroh::EndpointAddr> = peer_providers(&s.key, &s.roster)
+                .into_iter()
+                .filter(|pid| *pid != self_id)
+                .map(iroh::EndpointAddr::new)
+                .collect();
+            if !peers.is_empty() {
+                jobs.push(DocResync {
+                    share_id: id.clone(),
+                    doc: s.doc.clone(),
+                    peers,
+                });
+            }
+        }
         jobs
     }
 

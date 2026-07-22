@@ -229,6 +229,12 @@ pub(crate) async fn serve(
     tokio::spawn(reconcile_loop(daemon.clone()));
     tokio::spawn(presence_loop(daemon.clone()));
     tokio::spawn(throughput_loop(daemon.clone()));
+    // Suspend/resume self-heal (Linux): a frequently-suspending laptop otherwise
+    // never finishes a large download, because each suspend kills the transfer and
+    // iroh doesn't notice the dead connections on an s2idle wake
+    // (docs/sleep-resume-investigation.md).
+    #[cfg(target_os = "linux")]
+    tokio::spawn(sleep_monitor_loop(daemon.clone()));
 
     let listener = transport::bind(&socket)?;
     tracing::info!("seed-daemon listening on {}", socket.display());
@@ -254,6 +260,67 @@ pub(crate) async fn serve(
         }
     }
     Ok(())
+}
+
+/// Watch systemd-logind for suspend/resume and force a connectivity re-establish
+/// on every resume.
+///
+/// `org.freedesktop.login1.Manager.PrepareForSleep` fires with `true` just before
+/// the machine suspends and `false` right after it resumes. On the resume edge we
+/// call [`Engine::on_resume`], which rebinds the iroh socket, re-homes the relay,
+/// and rebuilds gossip presence — the in-process equivalent of the daemon restart
+/// that was previously the only cure (docs/sleep-resume-investigation.md).
+///
+/// Best-effort: if the system bus or logind is unavailable (containers, non-systemd
+/// hosts) we log at debug and retry, never failing the daemon.
+#[cfg(target_os = "linux")]
+async fn sleep_monitor_loop(daemon: Daemon) {
+    loop {
+        if let Err(e) = run_sleep_monitor(&daemon).await {
+            tracing::debug!("logind sleep monitor unavailable ({e:#}); retrying in 30s");
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn run_sleep_monitor(daemon: &Daemon) -> anyhow::Result<()> {
+    use futures_lite::StreamExt;
+
+    let conn = zbus::Connection::system().await?;
+    let proxy = zbus::Proxy::new(
+        &conn,
+        "org.freedesktop.login1",
+        "/org/freedesktop/login1",
+        "org.freedesktop.login1.Manager",
+    )
+    .await?;
+    let mut signals = proxy.receive_signal("PrepareForSleep").await?;
+    tracing::info!("sleep monitor: subscribed to logind PrepareForSleep");
+
+    while let Some(msg) = signals.next().await {
+        // The signal carries one bool: true = about to suspend, false = just resumed.
+        let going_to_sleep: bool = match msg.body().deserialize() {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!("PrepareForSleep decode failed: {e}");
+                continue;
+            }
+        };
+        if going_to_sleep {
+            tracing::info!("suspend imminent (logind PrepareForSleep=true)");
+            continue;
+        }
+        tracing::info!("resumed from suspend — re-establishing connectivity");
+        let resyncs = { daemon.engine.lock().await.on_resume().await };
+        for resync in resyncs {
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(30), resync.run()).await;
+            });
+        }
+    }
+    // The stream ended (bus dropped) — bubble up so the outer loop reconnects.
+    anyhow::bail!("logind PrepareForSleep stream ended")
 }
 
 /// Periodically reconcile every share against the merged replica.

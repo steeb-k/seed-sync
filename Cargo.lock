@@ -5624,6 +5624,7 @@ dependencies = [
  "tracing-subscriber",
  "walkdir",
  "windows-service",
+ "zbus 5.16.0",
 ]
 
 [[package]]

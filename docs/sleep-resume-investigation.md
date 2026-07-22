@@ -6,7 +6,76 @@ restarted. This was noticed alongside the distributed-download issue — and the
 very likely share a root cause (see "Interplay" below), so this is filed as a
 companion to `docs/distributed-downloads.md` rather than an unrelated bug.
 
-> Status: **investigation plan only** — not yet diagnosed or fixed. Next session.
+> Status: **DIAGNOSED + FIXED (2026-07-21).** Confirmed in the field and fixed as
+> the "Likely fix" below predicted. See **Resolution** immediately below; the
+> original investigation plan is kept underneath as the record.
+
+## Resolution (2026-07-21)
+
+**Confirmed in the field.** On the Linux laptop (`steebP14s`), a ~1.8 GB ISO was
+stuck at "Syncing 67%" while the two always-on Windows desktops had shared it
+instantly. Evidence:
+
+- The laptop suspended **18 times in one day** (`s2idle`), some wake windows only
+  ~4 min. The stuck blob's data file was last written at `16:49:36`; the kernel
+  logged `PM: suspend entry` at `16:49:38` — the download froze mid-write two
+  seconds later and never recovered.
+- `rendezvous publish ... Error sending http request` WARNs cluster right after
+  every `PM: suspend exit` — the network stack had not recovered on wake.
+- Small files finished within a single wake window (so they synced fine); the large
+  file could not, and iroh never re-established connectivity after resume — exactly
+  hypothesis #1 (netwatch does not fire for `s2idle`, so the endpoint wakes with
+  stale relay/holepunch state). Only a daemon restart cured it.
+
+The "uploading, not downloading" symptom the user saw follows directly: during the
+brief wake windows the node could not establish a stable *inbound* transfer of the
+missing tail, but it could still serve the blobs it already held to the fleet.
+
+**Fix (implemented).** The predicted resume hook:
+
+- `Engine::on_resume()` (`crates/seed-core/src/engine.rs`): calls
+  `iroh::Endpoint::network_change()` (rebind socket + re-home relay, bounded), then
+  unconditionally rebuilds every active share's gossip presence subscription and
+  returns a `DocResync` per share to re-kick doc live-sync. It is
+  `connectivity_recoveries`' logic fired on the *known* resume edge rather than
+  waiting for the isolation/presence-gap ladders to notice.
+- `seed-daemon` `sleep_monitor_loop` (Linux, `cfg(target_os = "linux")`): subscribes
+  to logind `org.freedesktop.login1` `PrepareForSleep`; on the resume edge (`false`)
+  it calls `on_resume()` and spawns the resyncs off-lock. Best-effort — no system
+  bus/logind ⇒ debug log + retry, never fails the daemon. Added `zbus` as a
+  linux-only dep.
+
+**Also hardened.** `Node::shutdown()` now calls `blobs.shutdown()` *before* the
+router teardown, to flush partial-download verified-range bitfields to disk
+(iroh-blobs runtime note — a plain `Router::shutdown` was leaving them ephemeral).
+This lets a restart mid-download resume from what's on disk instead of re-validating
+with a delay.
+
+**A retracted mid-investigation claim.** A new test briefly appeared to show partial
+progress was *lost* on restart (0% after reopen). That was a **measurement
+artifact**: a just-restarted node has no peers, so `ensure_download` returns early
+and nothing triggers the store to load/report the partial. The on-disk dump proved
+the data *and* a non-empty verified-range bitfield persist correctly (e.g. 34 MiB +
+41-byte bitfield after a 16 % freeze). There is no separate "progress lost on
+restart" bug.
+
+**Tests** (`crates/seed-core/tests/resume.rs`, `#[ignore]` — real endpoints):
+
+- `partial_swarm_download_survives_restart` — a partial swarm download's data and
+  verified-range bitfield survive an engine restart on the same data dir.
+- `large_download_converges_despite_repeated_interruptions` — a large swarm download
+  interrupted repeatedly (each abort mimics a suspend) still converges. This is the
+  in-process synthesis of the suspend cycle: from the app's view a suspend is just
+  "the in-flight transfer is cancelled and may resume against the same on-disk
+  store." It does **not** reproduce the *stale-connection-after-`s2idle`* trigger
+  (that needs a real suspend), which is why the resume hook's end-to-end proof is a
+  single real suspend on the laptop.
+
+---
+
+## Original investigation plan (kept for the record)
+
+> Status: **investigation plan only** — superseded by the Resolution above.
 
 ## Hypothesis
 

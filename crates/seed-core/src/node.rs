@@ -159,6 +159,20 @@ impl IrohNode {
     }
 
     pub async fn shutdown(self) -> anyhow::Result<()> {
+        // Persist the blob store's ephemeral state FIRST — specifically the
+        // verified-range bitfields of large *partial* downloads. iroh-blobs keeps
+        // those in memory and only flushes them on a clean `Store::shutdown`
+        // (vendor/iroh-blobs/src/store/fs.rs runtime note). Its docs claim
+        // `Router::shutdown` also closes the store, but in practice a big in-flight
+        // download's progress was lost on every restart (reported 0% after reopen,
+        // re-fetched from scratch) — fatal on a frequently-suspending laptop that
+        // restarts mid-transfer (docs/sleep-resume-investigation.md). Shutting the
+        // store down explicitly writes those bitfields so the next start resumes
+        // from what's already on disk instead of re-downloading. Best-effort: a
+        // store error here must not block tearing the endpoint down.
+        if let Err(e) = self.blobs.shutdown().await {
+            tracing::warn!("blob store shutdown (persist partials) failed: {e}");
+        }
         self.router.shutdown().await?;
         Ok(())
     }

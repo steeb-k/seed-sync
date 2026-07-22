@@ -133,9 +133,11 @@ async fn inplace_overwrite_large_file_converges() -> anyhow::Result<()> {
     let v2 = content_for("big.bin-v2", 5 * 1024 * 1024 + 1234);
     std::fs::write(c.nodes[0].folder().join("big.bin"), &v2)?;
     want.insert("big.bin".to_string(), v2);
-    c.drive_until(Duration::from_secs(180), "peer takes in-place overwrite", |c| {
-        c.converged(&want)
-    })
+    c.drive_until(
+        Duration::from_secs(180),
+        "peer takes in-place overwrite",
+        |c| c.converged(&want),
+    )
     .await?;
     println!("in-place large-file overwrite converged");
 
