@@ -59,8 +59,8 @@ We take ownership of content fetching:
 
 ## Single-blob swarm (implemented)
 
-A correction to an earlier assumption: iroh-blobs' `SplitStrategy::Split` does
-**not** split one raw blob across providers. Read `split_request`
+iroh-blobs' `SplitStrategy::Split` does **not** split one raw blob across
+providers. Read `split_request`
 (`vendor/iroh-blobs/src/api/downloader.rs`, the `FiniteRequest::Get` arm): it runs
 `execute_get(GetRequest::blob(hash))` — the *whole* blob from a single provider —
 then the per-offset requests are no-ops. `Split` is for **HashSeqs/collections**
