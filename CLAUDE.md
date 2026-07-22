@@ -60,28 +60,14 @@ environment looks off, `scripts/run-linux.sh` self-checks and points at
 
 ## Conventions & gotchas
 
-- **The Windows ARM64 build is two ABIs in one bundle, and that is not a mistake to tidy up.**
-  gvsbuild is x64-only and vcpkg's `gtk` port explicitly excludes arm64-windows, so the only
-  prebuilt GTK4 + libadwaita for Windows on ARM is **MSYS2's CLANGARM64** — which is mingw-ABI. So
-  the **GUI** builds for `aarch64-pc-windows-gnullvm` while the **daemon + CLI** (no GTK dependency
-  at all) stay on `aarch64-pc-windows-msvc`. Nothing is compromised: they are separate processes
-  that only meet over IPC, so no ABI boundary is ever crossed inside a process. Everything
-  cross-compiles from the x86_64 box (`scripts/build-arm64.ps1`, `fetch-gtk-msys2.ps1`,
-  `build-msi.ps1 -Arch arm64`). Four traps: (1) `ring` needs `clang` on `PATH` for either aarch64
-  target — and the two passes need *different* clangs (LLVM's finds the MSVC/SDK headers;
-  llvm-mingw's brings a mingw sysroot), so `build-arm64.ps1` sets `PATH` per pass — one shared
-  ordering fails with `'assert.h' file not found`; (2) `winresource` passes no `--target` to
-  `windres` for aarch64, so an unprefixed `windres` emits an **x64** object and the link dies with
-  "machine type x64 conflicts with arm64" — `seed-gui/build.rs` pins `aarch64-w64-mingw32-windres`
-  when the *target* is aarch64; (3) MSYS2's `bin\` is a shared prefix for the whole dependency
-  closure, not a curated GTK tree, so a blanket `*.dll` copy ships `libpython3.14.dll` — the bundler
-  copies only the **import closure** of our binaries plus the pixbuf loaders (which GTK `dlopen`s
-  rather than imports); (4) the ARM64 tree's GTK helper tools can't run on the build host, so the
-  schemas/pixbuf caches are generated with the **x86_64 build of the same MSYS2 packages**
-  (`fetch-gtk-msys2.ps1 -Env ucrt64`) — the bundler asserts the two loader sets match first. Since
-  none of it can be launched here, `scripts/verify-bundle.ps1` reads every PE header to prove the
-  bundle is single-architecture with no unresolvable imports; it runs on both arches. The updater
-  picks its MSI by **OS** arch and never falls back across architectures.
+- **The Windows ARM64 build mixes two ABIs in one bundle by necessity.** The GUI builds for
+  `aarch64-pc-windows-gnullvm` to match MSYS2's CLANGARM64 GTK (the only prebuilt GTK4 + libadwaita
+  for ARM Windows, which is mingw-ABI), while the daemon + CLI — no GTK dependency — stay on
+  `aarch64-pc-windows-msvc`. They only meet over IPC, so no ABI boundary is crossed inside a
+  process. It all cross-compiles from the x86_64 box; `docs/windows-packaging.md` §1b has the
+  rationale and the four cross-compile traps (`ring`/clang paths, the `windres` target, the MSYS2
+  DLL closure, the host-tools cache), and `scripts/verify-bundle.ps1` proves each bundle is
+  single-arch. The updater picks its MSI by **OS** arch and never falls back across architectures.
 - **iroh ecosystem crates are pinned and bumped *together*.** `iroh`,
   `iroh-blobs`, `iroh-gossip`, `iroh-docs`, `iroh-tickets`,
   `iroh-mdns-address-lookup`, `bao-tree` all share `iroh-base`; mixing minors
@@ -91,8 +77,8 @@ environment looks off, `scripts/run-linux.sh` self-checks and points at
   `docs/iroh-1.0-api-notes.md`.
 - **Vendored `iroh-blobs` patch.** `[patch.crates-io]` points `iroh-blobs` at
   `vendor/iroh-blobs`, a one-line patch for cross-volume export on Windows. See
-  the comment in `Cargo.toml` and `docs/cross-os-testing.md` (issue #1) before
-  touching it or bumping iroh-blobs.
+  the comment in `Cargo.toml` and known-issues #25 before touching it or bumping
+  iroh-blobs.
 - **No CI.** All releases are built **locally on each platform's own machine**
   and published to the public `steeb-k/seed-sync-binaries` repo. The old GitHub
   Actions workflow was removed. See `docs/releasing.md`.
@@ -104,25 +90,20 @@ environment looks off, `scripts/run-linux.sh` self-checks and points at
 ## Documentation map (`docs/`)
 
 Architecture / engine internals:
+- `known-issues.md` — the engine bug & design-caveat catalog. **Check here first when something's wrong.**
 - `iroh-1.0-api-notes.md` — verified iroh 1.0 stack API reference (versions + exact calls).
 - `distributed-downloads.md` — how blob *content* is fetched between peers; swarming large files.
-- `divergence-detection-plan.md` — cross-member divergence detection, self-heal, deep-verify (implemented).
-- `member-registry.md` — replicated last-known member names (`\x00m/` doc records + `peer_names` cache) so the member list survives disconnects/restarts (implemented).
-- `production-readiness-plan.md` — the active push: known-issues fixes, peer-health tracking + notifications, multi-master test suite + soaks. **Check here for current status.**
-- `usability-findings.md` — audit findings from the production-readiness push (non-engine-logic).
-- `known-issues.md` — open bugs & design caveats found by audit (not yet fixed). **Check here first when something's wrong.**
-- `sleep-resume-investigation.md` — investigation of the Linux post-suspend resume bug.
+- `divergence-detection.md` — cross-member divergence detection, self-heal, deep-verify.
+- `member-registry.md` — replicated last-known member names (`\x00m/` doc records + `peer_names` cache) so the member list survives disconnects/restarts.
 
 Packaging / distribution (maintainer guides):
+- `releasing.md` — how to cut a release across platforms + the shared distribution model.
 - `linux-packaging.md` — tarball + `systemd --user` + auto-update; the release baseline.
 - `windows-packaging.md` — MSI build/bundle/sign + Windows service.
 - `macos-packaging.md` — `.app` bundle, launchd, universal2, install/update flow.
 - `android-packaging.md` — building & signing the release APK from `android/`.
-- `releasing.md` — how to cut a release across platforms.
 - `dev-environment.md` — single-box (Windows) setup to build/run/package for Win/Linux/Android.
 
-Design / handoff:
-- `../android-app.md` — Android port design (engine → UniFFI → Compose).
-- `cross-os-testing.md` — running cross-OS sync test log + tracked issues.
-- `linux-handoff.md` / `windows-handoff.md` — platform orientation notes.
+Design:
+- `../android-app.md` — Android app design (engine → UniFFI → Compose).
 ```

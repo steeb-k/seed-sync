@@ -109,10 +109,12 @@ token gates only the relay *connection* (relayed traffic + hole-punch
 coordination) — the relay's public-address discovery service stays open to
 token-less peers, so direct connections may keep working even when the token
 is missing or wrong; the test result spells out which case you're in.
+
 Choose whether to fall back to the public relays while your relays are
-unreachable, or to use your relays exclusively. Changes apply live — no daemon
-restart. Relay settings are per-device and are not shared with other members:
-every device that should use your relay configures it (and the token) itself.
+unreachable, or to use your relays exclusively. Changes apply live, with no
+daemon restart. Relay settings are per-device and are not shared with other
+members: every device that should use your relay configures it (and the token)
+itself.
 
 ## License
 
