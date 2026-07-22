@@ -71,7 +71,7 @@ keyPassword=<key password>
 file is absent (fresh checkout, or CI without the secret), the release build is
 produced **unsigned** — it won't install, by design; debug builds are unaffected.
 
-> ### ⚠️ Back up the key — this is irreplaceable
+> ### Back up the key — this is irreplaceable
 > Both `android/keystore/seedsync-release.jks` **and** its password must be
 > stored offline (password manager + an encrypted backup). **If the signing key
 > is lost, the app can never be updated in place again** — every existing

@@ -21,7 +21,7 @@ pointing back here if something's missing:
 
 ---
 
-## ⚠️ Smart App Control must be OFF
+## Smart App Control must be OFF
 
 Windows 11 **Smart App Control (SAC)** blocks execution of freshly-compiled,
 unsigned executables — which is exactly what `cargo`/`cargo-ndk` produce when they

@@ -1,26 +1,9 @@
 # Linux packaging, distribution & auto-update — maintainer guide
 
 This is the baseline for shipping S.E.E.D. (SEED Sync) on Linux and keeping installs
-up to date. It's the Linux counterpart to `docs/windows-packaging.md`.
-
-## TL;DR for cutting a release
-1. Bump the version: edit `[workspace.package].version` in the root `Cargo.toml`,
-   run `cargo update --workspace`, commit.
-2. Build the tarball locally on a Linux box (or WSL):
-   ```sh
-   scripts/package-linux.sh            # -> dist/seed-sync-<ver>-linux-x86_64.tar.gz
-   ```
-3. Publish it to the **public** `steeb-k/seed-sync-binaries` repo as a GitHub
-   Release with `gh` (see [`releasing.md`](releasing.md) for the full flow):
-   ```sh
-   gh release create vX.Y.Z --repo steeb-k/seed-sync-binaries --title vX.Y.Z \
-     --notes-file release-notes.md dist/seed-sync-<ver>-linux-x86_64.tar.gz
-   ```
-4. Installed machines pick it up automatically within a day (the `seed-sync-update.timer`),
-   or immediately with `seed-sync --update`.
-
-That's it — all builds are local; there is no CI. The rest of this document
-explains the moving parts.
+up to date. It's the Linux counterpart to `docs/windows-packaging.md`. For the
+release runbook and the shared distribution model, see
+[`releasing.md`](releasing.md); the rest of this document is the Linux mechanics.
 
 ## Architecture (why it's built this way)
 S.E.E.D. is **not a typical sandboxed GUI app** — it's a *per-user background daemon* +
@@ -37,20 +20,10 @@ the keyring, full network (iroh), the session bus (tray), and system GTK 4.10+/l
   `systemd --user` timer for hands-off auto-update.
 
 ### Distribution / update flow
-```
-  dev machines (local builds)         seed-sync-binaries (PUBLIC)         user machine
-  ───────────────────────────         ──────────────────────────         ────────────
-  package-linux.sh  ──► gh release ──►  Release "vX.Y.Z"          ◄─── seed-sync --update
-  build-msi.ps1         create/upload   ├─ ...linux-x86_64.tar.gz  poll   (timer, daily)
-  gradlew assembleRel   (per platform,  ├─ ...windows-x86_64.msi    +     compares to
-  package-macos.sh       SEED_BINARIES   └─ ...android...   APK    fetch  `seed-daemon --version`
-                         _TOKEN / gh)
-```
-- Artifacts live in a **separate public repo** so machines download with **no auth**. Source
-  stays private in `seed-sync-gtk`.
-- The **installed version is the source of truth**: the updater reads `seed-daemon --version`
-  (provided by clap) and compares it to the latest release tag. So **the Cargo version must be
-  bumped per release** or the updater will never see a newer version.
+
+The public-repo, version-driven, no-CI distribution model is shared across all
+platforms and documented once in [`releasing.md`](releasing.md#distribution-model).
+On Linux the updater is `seed-sync --update`, run daily by `seed-sync-update.timer`.
 
 ## One-time setup (do this once, ever)
 1. **Create the public artifact repo** `steeb-k/seed-sync-binaries` (empty is fine; it just
@@ -176,8 +149,8 @@ Self-replacement of `seed-sync` is safe: `apply_tree` writes the new file to a t
   `cargo-generate-rpm`) + self-hosted apt/pacman repos, if a fleet standardizes.
 - A GUI "Check for updates" affordance (the daemon/GUI could surface the timer's result).
 - Code signing / minisign-style artifact signatures for tamper-evidence.
-- macOS packaging — **now in design**, mirrors this model (script/tarball + launchd, bundled GTK,
-  ad-hoc signed). See `docs/macos-packaging.md`.
+- macOS mirrors this model (script/tarball + launchd, bundled GTK, ad-hoc signed).
+  See `docs/macos-packaging.md`.
 
 See also: `docs/windows-packaging.md` (the MSI side) and `docs/releasing.md` (the
 cross-platform release runbook and the shared distribution model).

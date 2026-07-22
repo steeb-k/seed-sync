@@ -1,8 +1,8 @@
-# Windows: build, bundle, package, service (M4)
+# Windows: build, bundle, package, service
 
-This is the Windows-validation milestone. The steps below are run/validated on a
-real Windows machine — the MSI is built and signed locally (there is no CI).
-Primary development happens here per the project plan.
+The MSI is built, bundled, and signed locally on a real Windows machine; there is
+no CI. For the release runbook and shared distribution model, see
+[`releasing.md`](releasing.md).
 
 ## 0. One-time dev setup
 
@@ -80,7 +80,7 @@ binaries and cannot run on the build host — and `gdk-pixbuf-query-loaders` in 
 architecture-independent, so we run the **x86_64 build of the very same MSYS2 packages** to generate
 it; the bundler asserts the two trees' loader sets match before trusting the cache.
 
-Gotchas, all of which cost real time to find:
+Gotchas:
 - **`ring` needs `clang` on `PATH`** for either aarch64 target — the only dependency that does. The
   two passes need *different* clangs: LLVM's (which finds the MSVC/SDK headers) for the msvc pass,
   llvm-mingw's (which brings a mingw sysroot) for the gnullvm pass. `build-arm64.ps1` sets `PATH`
@@ -124,7 +124,7 @@ seed-daemon.exe stop
 seed-daemon.exe uninstall
 ```
 
-### Open questions — resolved (commit `0638ade`)
+### Service account vs. IPC reachability
 The service stays **LocalSystem**; the GUI/CLI run as the user. They meet via:
 - **Machine-wide socket.** Both sides default to `%PROGRAMDATA%\SeedSync\seed.sock`
   on Windows (`seed_ipc::machine_data_dir`/`machine_socket`, used by the daemon's
@@ -134,15 +134,12 @@ The service stays **LocalSystem**; the GUI/CLI run as the user. They meet via:
   Users read/write (connect + IO, not create-instance). Lets the user GUI open the
   service's pipe. Verified: daemon started with no args is reachable via
   `seed-cli --socket %PROGRAMDATA%\SeedSync\seed.sock list`.
-- **Named-pipe naming.** ✅ Resolved (commit `368382b`): `socket_name(path)` uses
-  `GenericFilePath` on Unix, `GenericNamespaced` (hashed path) on Windows.
+- **Named-pipe naming.** `socket_name(path)` uses `GenericFilePath` on Unix,
+  `GenericNamespaced` (hashed path) on Windows.
 - **Keystore note.** Seeds the daemon stores live in the **service account's**
   Credential Manager vault (SYSTEM); only the daemon needs them, so that's fine.
   A daemon run in *console* mode (as the user) uses the user vault instead — so
   shares created in console mode aren't visible to the service and vice-versa.
-
-Still to validate live: install/start the service from an **elevated** prompt and
-confirm the user-run GUI connects (cross-account, the real test vs. same-user CLI).
 
 ## 3. MSI installer (WiX 5)
 
@@ -207,15 +204,6 @@ from the Windows SDK + Trusted Signing client tools (override with `SIGNTOOL_PAT
 `ARTIFACT_SIGNING_DLIB`).
 
 ### 3.2 Auto-update (the Windows analog of the Linux timer)
-Distribution mirrors Linux: one **GitHub Release per `vX.Y.Z` tag** on the public
-`steeb-k/seed-sync-binaries` repo carries both OSes' assets. The Windows half is
-built + signed **locally** and attached to the Linux-created release:
-
-```pwsh
-pwsh -File scripts\build-msi.ps1                    # -> signed MSI
-pwsh -File scripts\publish-msi.ps1                  # gh release upload to seed-sync-binaries vX.Y.Z
-```
-
 `packaging\windows\seed-sync-update.ps1` (installed to `…\SeedSync\bin`) is the
 update engine, run as SYSTEM by the **SeedSyncUpdate** scheduled task (daily +
 shortly after boot). It compares `seed-daemon.exe --version` to the latest release
@@ -225,17 +213,8 @@ tag and, when newer, downloads the `*windows-x86_64.msi` asset and applies it wi
 report only, `-RegisterTask` / `-UnregisterTask` = used by the MSI. Logs to
 `%PROGRAMDATA%\SeedSync\update.log`.
 
-To cut a release: bump `[workspace.package].version` in `Cargo.toml`, run
-`cargo update --workspace`, commit. Then build, sign, and publish the MSI **locally**
-(there is no CI):
-
-```pwsh
-cargo build --release
-az login                                  # the signer-role account; see below
-pwsh -File scripts\build-msi.ps1 -SkipBuild   # bundle + sign exes + wix + sign MSI
-# -> target\wix\seed-sync-<ver>-windows-x86_64.msi
-pwsh -File scripts\publish-msi.ps1            # or `gh release upload …` (see releasing.md)
-```
+Cutting and publishing a release (`build-msi.ps1` → `publish-msi.ps1`) is covered
+in [`releasing.md`](releasing.md).
 
 ### 3.3 Local signing (Azure Artifact Signing)
 `build-msi.ps1` signs via `sign-artifacts.ps1` + the committed
@@ -255,11 +234,3 @@ it uses the `az` session instead of probing IMDS (which would otherwise hang).
 
 To produce an **unsigned** MSI for a quick local test, point
 `ARTIFACT_SIGNING_METADATA` at a nonexistent path.
-
-## 4. Checkpoint #3 (end-to-end)
-
-1. Install the MSI on a Windows box; confirm the service auto-starts.
-2. Launch the GUI; create a share.
-3. On the Linux dev box (`cargo run -p seed-daemon -- run` + `seed-cli`), add the
-   share via the key (no bootstrap — discovery) and confirm it syncs **Windows ↔
-   Linux** over real iroh (hole-punch + relay fallback).

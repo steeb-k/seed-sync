@@ -1,16 +1,13 @@
 # macOS packaging, distribution & auto-update — maintainer guide
 
-> **Status: BUILT, floor macOS 11, 2026-06-27.** Bring-up checklist 0–4 are done and verified on Apple
-> Silicon (see `docs/cross-os-testing.md` → [MACOS]). The build → bundle → `.app` → install →
-> launchd → update flow works end-to-end, including a `sandbox-exec` "no build-time libs" proof.
-> **GTK is now sourced from conda-forge, not Homebrew** — its dylibs carry a `minos` of macOS 11
-> regardless of the build host, so releases are cut **manually on any Mac** (no `macos-14` CI runner,
-> no second x86_64 Homebrew/Rosetta). Build with `scripts/setup-conda-macos.sh [--universal]` then
-> `scripts/package-macos.sh`. The minimum-version section below has the full rationale. One design
-> change from the original plan: we ship a **`SEED Sync.app` bundle _inside_ the curl|sh tarball**
-> (installed to `~/Applications`) rather than loose binaries — this keeps the quarantine dodge while
-> giving a real Dock/Applications icon. Details below; `_(planned)_` markers remain only on what's
-> genuinely not built.
+GTK is sourced from conda-forge (not Homebrew), whose dylibs carry a `minos` of
+macOS 11 regardless of the build host, so releases are cut on any Mac with
+`scripts/setup-conda-macos.sh [--universal]` then `scripts/package-macos.sh`. The
+build ships a `SEED Sync.app` bundle inside the `curl | sh` tarball (installed to
+`~/Applications`), which keeps the quarantine dodge while giving a real
+Dock/Applications icon. The minimum-version section below has the full rationale.
+For the release runbook and shared distribution model, see
+[`releasing.md`](releasing.md).
 
 ## Why the Linux model, not a `.dmg`/`.pkg`
 
@@ -34,42 +31,32 @@ to prefer it:
 **Rejected:** Homebrew cask (still needs the daemon/launchd story + a public tap), `.app` in a
 `.dmg` (quarantine + no autostart), `.pkg` (signing pressure, less consistent with Linux).
 
-## Locked decisions (human, 2026-06-20)
+Key decisions: a **universal2** build (`lipo` both slices of every binary and
+bundled dylib, built phased — arm64 first, x86_64 added after); **bundle the GTK4 +
+libadwaita dylibs** into the tarball (self-contained, no user Homebrew; relocate and
+re-sign, ship pixbuf loaders, GSettings schemas, Adwaita resources); and **ad-hoc
+signing only** (re-sign after relocation, mandatory on Apple Silicon; no
+notarization — rely on the `curl | sh` quarantine dodge, so $0 and no Apple account).
 
-| Decision | Choice | Consequence |
-|---|---|---|
-| Architecture | **Universal2 (arm64 + x86_64)** | `lipo` both slices of binaries **and** every bundled dylib. Built **phased**: arm64 first, x86_64 slice added after. |
-| GTK4 + libadwaita | **Bundle the dylibs** | Self-contained tarball; no user Homebrew. Relocate + re-sign; ship pixbuf loaders, GSettings schemas, Adwaita resources. ~60–80 MB tarball. |
-| Signing | **Ad-hoc only** | Re-sign after relocation (mandatory on Apple Silicon). No notarization; rely on the `curl \| sh` quarantine dodge. $0, no Apple account. |
-
-## Distribution / update flow (identical to Linux/Windows)
-
-```
-  dev machines (local builds)        seed-sync-binaries (PUBLIC)        user machine (macOS)
-  ───────────────────────────        ──────────────────────────        ────────────────────
-  package-macos.sh  ──► gh release ──►  Release "vX.Y.Z"        ◄─── seed-sync --update
-  (on a Mac)            create/upload   ├─ ...linux-x86_64.tar.gz  poll  (launchd timer, daily)
-                        the macOS asset  ├─ ...windows-x86_64.msi    +    compares to
-                                         └─ ...macos-universal.tar.gz fetch `seed-daemon --version`
-```
-
-Same public artifact repo, same "installed version is the source of truth" rule (the updater
-reads `seed-daemon --version` and compares to the latest release tag), same **mandatory Cargo
-version bump per release**. Asset name convention: **`seed-sync-<ver>-macos-universal.tar.gz`**.
+The distribution model — public artifact repo, version-driven updater, mandatory
+Cargo bump, no CI — is shared across platforms and documented in
+[`releasing.md`](releasing.md#distribution-model). On macOS the updater is
+`seed-sync --update`, run daily by a launchd agent; the asset is
+`seed-sync-<ver>-macos-universal.tar.gz`.
 
 ## Files built (`packaging/macos/` + `scripts/`)
 
 | File | Purpose |
 |---|---|
-| `scripts/setup-conda-macos.sh` ✅ | Creates the conda-forge GTK env(s) the packager bundles from — `osx-arm64` (and `osx-64` with `--universal`) at `.conda-gtk/`. conda-forge's macOS-11-SDK builds are what set the floor at macOS 11 regardless of the build host. Needs conda/mamba/micromamba (miniforge). |
-| `scripts/package-macos.sh` ✅ | The macOS analog of `scripts/package-linux.sh`: `cargo build --release` (pkg-config → conda env, `MACOSX_DEPLOYMENT_TARGET=11.0`), build the **`SEED Sync.app`** (binaries → `Contents/MacOS`), run the bundler over `Contents/`, write `Info.plist` + `Resources/AppIcon.icns` (sips + iconutil from `icon/appIcon.png`), seal the bundle, tar `dist/seed-sync-<ver>-macos-<arch>.tar.gz`. `--skip-build` to repackage. Builds universal when the `osx-64` conda env is present, else arm64. |
-| `scripts/bundle-gtk-macos.sh` ✅ | The hard part: walk the `seed-gui` otool closure + the gdk-pixbuf/librsvg loader modules, copy every non-system dylib into `lib/`, rewrite install names to `@executable_path/../lib` (handles `@rpath/*`, `@loader_path/*`, and absolute-prefix refs), regenerate `loaders.cache`, compile GSettings schemas, bundle the fontconfig config, **ad-hoc re-sign** inside-out. Source-agnostic via `BUNDLE_PREFIX` (a conda env; or `BUNDLE_BREW`/`brew --prefix` for Homebrew). `BUNDLE_BINDIR=MacOS` targets a `.app`'s `Contents/`; `BUNDLE_SKIP_AUX=1` does the dylib closure only (universal x86_64 pass). No icon theme needed (GTK4 embeds its icons). |
-| `packaging/macos/seed-sync` ✅ | The wrapper — install/update/uninstall/status, per-user, via `launchctl bootstrap/bootout`. Installs the `.app` to `~/Applications`, symlinks the CLI into `~/.local/bin`. |
-| `packaging/macos/Info.plist` ✅ | App bundle metadata (`CFBundleExecutable=seed-gui`, `CFBundleIconFile=AppIcon`, identifier, `__VERSION__` rewritten from Cargo). What makes NSBundle resolve → the Dock/Applications icon. |
-| `packaging/macos/web-install.sh` ✅ | `curl \| sh` bootstrap; selects the macOS asset, unpacks, runs `SEED Sync.app`'s sibling `seed-sync --install`. **Dodges quarantine.** (Superseded for hosting by the unified cross-OS `packaging/web-install.sh` — _planned_.) |
-| `packaging/macos/io.github.steeb_k.SeedSync.daemon.plist` ✅ | LaunchAgent: `__APP__/Contents/MacOS/seed-daemon run`, `KeepAlive`, `RunAtLoad`. Analog of `seed-daemon.service`. |
-| `packaging/macos/io.github.steeb_k.SeedSync.update.plist` ✅ | LaunchAgent: `RunAtLoad` + daily `StartCalendarInterval` → `__BIN__/seed-sync --update` (the real-file wrapper, not the in-app copy, so a self-update can't yank it). |
-| `packaging/macos/io.github.steeb_k.SeedSync.gui.plist` ✅ | LaunchAgent `RunAtLoad` for the tray GUI (`__APP__/Contents/MacOS/seed-gui --hidden`), Aqua-only. Analog of the `.desktop` autostart. |
+| `scripts/setup-conda-macos.sh` | Creates the conda-forge GTK env(s) the packager bundles from — `osx-arm64` (and `osx-64` with `--universal`) at `.conda-gtk/`. conda-forge's macOS-11-SDK builds are what set the floor at macOS 11 regardless of the build host. Needs conda/mamba/micromamba (miniforge). |
+| `scripts/package-macos.sh` | The macOS analog of `scripts/package-linux.sh`: `cargo build --release` (pkg-config → conda env, `MACOSX_DEPLOYMENT_TARGET=11.0`), build the **`SEED Sync.app`** (binaries → `Contents/MacOS`), run the bundler over `Contents/`, write `Info.plist` + `Resources/AppIcon.icns` (sips + iconutil from `icon/appIcon.png`), seal the bundle, tar `dist/seed-sync-<ver>-macos-<arch>.tar.gz`. `--skip-build` to repackage. Builds universal when the `osx-64` conda env is present, else arm64. |
+| `scripts/bundle-gtk-macos.sh` | Walks the `seed-gui` otool closure + the gdk-pixbuf/librsvg loader modules, copy every non-system dylib into `lib/`, rewrite install names to `@executable_path/../lib` (handles `@rpath/*`, `@loader_path/*`, and absolute-prefix refs), regenerate `loaders.cache`, compile GSettings schemas, bundle the fontconfig config, **ad-hoc re-sign** inside-out. Source-agnostic via `BUNDLE_PREFIX` (a conda env; or `BUNDLE_BREW`/`brew --prefix` for Homebrew). `BUNDLE_BINDIR=MacOS` targets a `.app`'s `Contents/`; `BUNDLE_SKIP_AUX=1` does the dylib closure only (universal x86_64 pass). No icon theme needed (GTK4 embeds its icons). |
+| `packaging/macos/seed-sync` | The wrapper — install/update/uninstall/status, per-user, via `launchctl bootstrap/bootout`. Installs the `.app` to `~/Applications`, symlinks the CLI into `~/.local/bin`. |
+| `packaging/macos/Info.plist` | App bundle metadata (`CFBundleExecutable=seed-gui`, `CFBundleIconFile=AppIcon`, identifier, `__VERSION__` rewritten from Cargo). What makes NSBundle resolve → the Dock/Applications icon. |
+| `packaging/macos/web-install.sh` | `curl \| sh` bootstrap; selects the macOS asset, unpacks, runs `SEED Sync.app`'s sibling `seed-sync --install`. **Dodges quarantine.** (A unified cross-OS `packaging/web-install.sh` for hosting is future work.) |
+| `packaging/macos/io.github.steeb_k.SeedSync.daemon.plist` | LaunchAgent: `__APP__/Contents/MacOS/seed-daemon run`, `KeepAlive`, `RunAtLoad`. Analog of `seed-daemon.service`. |
+| `packaging/macos/io.github.steeb_k.SeedSync.update.plist` | LaunchAgent: `RunAtLoad` + daily `StartCalendarInterval` → `__BIN__/seed-sync --update` (the real-file wrapper, not the in-app copy, so a self-update can't yank it). |
+| `packaging/macos/io.github.steeb_k.SeedSync.gui.plist` | LaunchAgent `RunAtLoad` for the tray GUI (`__APP__/Contents/MacOS/seed-gui --hidden`), Aqua-only. Analog of the `.desktop` autostart. |
 
 ## Tarball layout (built)
 
@@ -106,9 +93,9 @@ GTK4 embeds its own icon resource, so no Adwaita/hicolor icon theme is bundled. 
 The Keychain (`keyring` `apple-native`) holds the master seed. `launchctl bootstrap gui/$UID <plist>`
 loads the agents; `launchctl bootout` on uninstall. The CLI symlinks are why `@executable_path` must
 resolve through a symlink — `setup_runtime_env` calls `fs::canonicalize` so the prefix is the real
-`.app`, not the symlink's parent (see the gotcha in `cross-os-testing.md`).
+`.app`, not the symlink's parent (see the `@executable_path` caveat below).
 
-## The bundling process (the hard part) _(planned)_
+## The bundling process
 
 1. **Build** for `aarch64-apple-darwin` (and later `x86_64-apple-darwin`) against the conda-forge GTK
    env (pkg-config → `$ENV/lib/pkgconfig`; `MACOSX_DEPLOYMENT_TARGET=11.0`).
@@ -189,18 +176,6 @@ And in `package-macos.sh`: **`RUSTFLAGS=-C link-arg=-Wl,-headerpad_max_install_n
 use short `@rpath/<name>` install names, so rewriting `seed-gui`'s load commands to the longer
 `@executable_path/../lib/<name>` overflows a stock Mach-O header (`install_name_tool: load commands do
 not fit`). Homebrew's long absolute paths happened to shrink on rewrite, hiding this.
-
-## No CI — releases are built locally
-
-There is no GitHub Actions release job (the `.github/workflows/*.yml` were removed). Every macOS
-release is cut **manually** on a Mac with the conda-forge pipeline (above) and published with `gh`
-(see [`releasing.md`](releasing.md)). conda-forge sourcing is what makes this practical: the floor is
-macOS 11 regardless of the build host, so any Mac — including the maintainer's current dev box — can
-cut a shippable universal build with no hosted runner.
-
-**If CI is ever reintroduced**, the same pipeline runs on any `macos-*` runner with no runner-version
-pin and no Rosetta/second-Homebrew dance: install miniforge, `scripts/setup-conda-macos.sh
---universal`, add the `x86_64-apple-darwin` Rust target, then `scripts/package-macos.sh`.
 
 ### Minimum macOS version is set by where the GTK dylibs come from — we use conda-forge (floor = macOS 11)
 The bundle's real floor is the `minos` (LC_BUILD_VERSION) of the **bundled GTK dylibs**. Our Rust
@@ -293,5 +268,5 @@ on the arm64 slice (use `lipo -thin x86_64` first to check the Intel slice).
 - A `.dmg` for drag-to-Applications (would need notarization; the `.app` already exists).
 - Sparkle-style in-app updates (vs the launchd timer).
 
-See also: `docs/linux-packaging.md` (the model this mirrors), `docs/windows-packaging.md` (the MSI
-side), and the macOS bring-up checklist + sync matrix in `docs/cross-os-testing.md`.
+See also: `docs/linux-packaging.md` (the model this mirrors), `docs/windows-packaging.md`
+(the MSI side), and `docs/releasing.md` (the release runbook).

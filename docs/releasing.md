@@ -7,9 +7,32 @@ favor of local builds (notably so the macOS asset can target an OS floor well
 below what the hosted `macos-14` runner allowed).
 
 The auto-updaters (Windows scheduled task, Linux timer/service, macOS launchd, and
-the `web-install.sh` bootstrap) are **version-driven**: each compares the installed
+the `web-install.sh` bootstrap) are version-driven: each compares the installed
 `seed-daemon --version` against the latest release tag on `seed-sync-binaries` and
-upgrades only when the release is newer. So every release **must** bump the version.
+upgrades only when the release is newer. So every release must bump the version.
+
+## Distribution model
+
+All four platforms share one distribution model; the per-OS packaging docs describe
+only the mechanics on top of it.
+
+```
+  dev machines (local builds)         seed-sync-binaries (PUBLIC)         user machine
+  ───────────────────────────         ──────────────────────────         ────────────
+  package-linux.sh  ──► gh release ──►  Release "vX.Y.Z"          ◄─── seed-sync --update
+  build-msi.ps1         create/upload   ├─ ...linux-x86_64.tar.gz  poll   (timer/task/agent)
+  gradlew assembleRel   (per platform)  ├─ ...windows-x86_64.msi    +     compares to
+  package-macos.sh                      └─ ...android...   APK     fetch  `seed-daemon --version`
+```
+
+- Artifacts are published to a **separate public repo** (`steeb-k/seed-sync-binaries`)
+  so machines download with no auth; source stays private in `seed-sync-gtk`. One
+  GitHub Release per `vX.Y.Z` tag carries every platform's asset.
+- The **installed version is the source of truth**: the updater reads
+  `seed-daemon --version` and compares it to the latest release tag, so the Cargo
+  version must be bumped per release or no machine ever sees a newer build.
+- **No CI.** Every artifact is built and signed locally on its own platform's machine
+  and attached to the release; the old GitHub Actions workflow was removed.
 
 ## 1. Create the draft release FIRST — before building anything
 
@@ -97,10 +120,9 @@ architecture and will not fall back across architectures, so a release carrying 
 leaves every ARM64 install sitting on its current version.
 
 The whole bundle → sign exes → wix → sign-MSI chain runs locally; `-SkipBuild`
-reuses an existing `target\release\*.exe`. Local signing uses your interactive
-`az` session (your user must hold the signer role). The `ExcludeCredentials` list
-in `artifact-signing-metadata.json` pins the dlib to `AzureCliCredential` so it
-uses that session instead of probing IMDS (which otherwise hangs ~1 hr).
+reuses an existing `target\release\*.exe`. Signing uses your interactive `az`
+session (your user must hold the signer role); see
+[`windows-packaging.md`](windows-packaging.md) §3.1/§3.3 for the Azure setup.
 
 **Android APK** (any OS with the Android toolchain — see
 [`android-packaging.md`](android-packaging.md)):
@@ -117,7 +139,7 @@ cd android; .\gradlew.bat clean :app:assembleRelease
 scripts/package-linux.sh            # -> seed-sync-<ver>-linux-x86_64.tar.gz
 ```
 
-**macOS universal** (macOS, both arches via Rosetta/second Homebrew — see
+**macOS universal** (macOS, GTK sourced from conda-forge — see
 [`macos-packaging.md`](macos-packaging.md)):
 
 ```sh
