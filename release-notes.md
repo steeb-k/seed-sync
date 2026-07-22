@@ -1,34 +1,38 @@
-**S.E.E.D. (SEED Sync) v0.6.4** — P2P mirrored-folder sync.
+**S.E.E.D. (SEED Sync) v0.6.10** — P2P mirrored-folder sync.
 
-A focused fix for a false **"Out of sync — members disagree"** alarm that fired the
-moment you added a new member to a share.
+A reliability release: ignore lists now reach every device, disk no longer grows
+without bound, and wake-from-sleep recovery extends to Windows and macOS.
 
-### Fixed in 0.6.4
+### What's new
 
-**Adding a member no longer trips a false "Out of sync — members disagree."** A device
-you have just added hasn't received the shared file list yet, so its manifest starts
-**empty** — and an empty manifest was being reported as **100% synced** (it holds
-everything it knows about, which is nothing). Every established member then read the
-newcomer as a fully-synced device that happened to hold a *different* set of files, and
-raised the pool's most serious status within seconds of the join — long before the new
-device had downloaded anything.
+- **Ignore lists now reach every device.** A shared folder's ignore list is written
+  by a master, but read-only members weren't receiving it — so a viewer could
+  **delete files a master had chosen not to sync** (it treated anything not in the
+  shared list as removed). The ignore list now replicates to every peer, so ignored
+  files are honored everywhere and left untouched.
 
-A member that is **still receiving the share** is *behind*, not *diverged*: it fixes
-itself, it doesn't need you. A device now withholds its manifest fingerprint until its
-copy of the share has actually arrived, so it counts as still-joining rather than as a
-settled disagreement. Once its file list syncs it reports real download progress and
-converges to Healthy as usual — with no false alarm in between.
+- **Automatic disk cleanup.** The content store never reclaimed space, so leftover
+  data — most visibly partial downloads stranded by a removed share — accumulated
+  indefinitely. A background pass now garbage-collects blobs no share references any
+  more, built conservatively from the live shares so it never touches data in use
+  (and never anything in your synced folders).
 
-> This completes the divergence-reporting work from 0.6.3, which had already stopped a
-> member that was *still downloading* (visibly below 100%) from being counted; 0.6.4
-> closes the remaining case, where a just-joined member reported 100% because it held
-> nothing yet.
+- **Wake-from-sleep recovery on Windows and macOS.** The suspend/resume self-heal
+  added for Linux in 0.6.9 now runs on Windows and macOS too: after the machine
+  wakes, connectivity is re-established automatically so a large download resumes on
+  its own, instead of needing a restart.
+
+- **Warns on possible in-place file corruption.** On a master, if a deep verify finds
+  a file's contents changed with no change to its size or timestamp — a hallmark of
+  silent corruption rather than a genuine edit — it now logs a warning instead of
+  quietly publishing the changed bytes to peers.
 
 ### Downloads
-- **Linux x86_64** — `seed-sync-0.6.4-linux-x86_64.tar.gz`
-- **Windows x86_64** (signed MSI) — `seed-sync-0.6.4-windows-x86_64.msi`
-- **Windows ARM64** (signed MSI) — `seed-sync-0.6.4-windows-arm64.msi`
-- **Android** (universal APK) — `seed-sync-0.6.4-android-universal.apk`
+- **Linux x86_64** — `seed-sync-0.6.10-linux-x86_64.tar.gz`
+- **macOS universal** (Apple Silicon + Intel) — `seed-sync-0.6.10-macos-universal.tar.gz`
+- **Windows x86_64** (signed MSI) — `seed-sync-0.6.10-windows-x86_64.msi`
+- **Windows ARM64** (signed MSI) — `seed-sync-0.6.10-windows-arm64.msi`
+- **Android** (universal APK) — `seed-sync-0.6.10-android-universal.apk`
 
 ### System requirements
 
@@ -38,7 +42,10 @@ converges to Healthy as usual — with no false alarm in between.
 - Fedora: `gtk4 libadwaita dbus-libs`
 - Arch: `gtk4 libadwaita dbus`
 
-**Windows** — **Windows 10 (64-bit)** or later, x86_64 or ARM64. GTK4 + libadwaita and all
-libraries are bundled in the signed MSI; no separate runtime install required.
+**macOS** — Apple Silicon or Intel. GTK4 + libadwaita are bundled in the app; no
+Homebrew or other runtime needed.
+
+**Windows** — **Windows 10 (64-bit)** or later, x86_64 or ARM64. GTK4 + libadwaita and
+all libraries are bundled in the signed MSI; no separate runtime install required.
 
 **Android** — Android 11 (API 30) or later.
