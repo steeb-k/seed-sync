@@ -4,7 +4,8 @@ Bugs and design caveats in the sync engine, found by audit and by the
 production-readiness soaks. Each entry notes where it lives, what went wrong,
 why, and the fix or disposition.
 
-**Current status (2026-07-08, after the fleet/fullsize soak campaign):**
+**Current status (2026-07-08 fleet/fullsize soak baseline; entries 20–23 added
+through 2026-07-21 from field reports):**
 
 | # | Issue | Status |
 |---|-------|--------|
@@ -24,6 +25,10 @@ why, and the fix or disposition.
 | 17 | a fully-partitioned node reports `Healthy 100%` (health of an empty peer set) | **fixed** (`ShareStatus::NoPeers`) |
 | 18 | a locked OS keystore silently demotes a master to viewer — which then **reverts the user's edits** | **fixed** (held inert + auto-retry; found 2026-07-14 in the field) |
 | 19 | a just-joined member's empty replica reports 100% + a fingerprint → false `OutOfSync` on every peer the instant it joins | **fixed** (advertise `0`/unknown until the replica is seen; found 2026-07-15 in the field) |
+| 20 | in-place file overwrite re-downloaded the blob twice (2× bandwidth) | **fixed** |
+| 21 | large downloads never resume after suspend/resume (iroh keeps stale conns on `s2idle`) — a big file stuck mid-sync on a laptop that sleeps often | **fixed** (v0.6.9; logind `PrepareForSleep` resume hook; field-verified 2026-07-21) |
+| 22 | blob store never garbage-collects — orphaned/incomplete blobs accumulate; store grows unbounded | **open** (found 2026-07-21) |
+| 23 | fleet-wide silent isolation: a blackhole relay kept `is_connected()` true so failed syncs counted as liveness (phantom `Healthy`), and a dead gossip presence overlay never rebuilt — files stopped propagating until a manual relay-remove/restart | **fixed** (honest liveness on `SyncFinished` success + two-ladder `connectivity_recoveries` self-heal; found 2026-07-21 in the field) |
 
 Three vendored crates carry the upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
 `vendor/iroh-docs` — see `[patch.crates-io]` in the workspace `Cargo.toml`).
@@ -928,3 +933,111 @@ pass so it rarely collided, but it could also shadow a real sibling sharing the
 stem. Now `heal_tmp_path` appends the suffix to the full name (`a.bin` →
 `a.bin.seedheal-tmp`), keeping every staging path unique (unit test
 `heal_tmp_path_appends_and_is_unique`).
+
+## 21. Large downloads never resume after suspend/resume — **FIXED (v0.6.9, field-verified)**
+**Tier:** user-reported (field) · **Severity:** high (large files never complete on a device that sleeps often) · **Status:** fixed
+
+**Where:** `Engine::on_resume` (`crates/seed-core/src/engine.rs`) + the Linux
+`sleep_monitor_loop` in `crates/seed-daemon/src/main.rs`. Full write-up in
+`docs/sleep-resume-investigation.md`.
+
+**Symptom:** on a laptop that suspends frequently, a large file (e.g. a 1.8 GB
+ISO) stuck mid-sync at some percent and never finished, while small files synced
+fine and always-on desktops shared the same file instantly. The node often
+appeared to *upload* while stalled on download, and only a daemon restart cured
+it.
+
+**Root cause:** on an `s2idle` resume the OS tears down QUIC sockets, the relay
+connection, and gossip neighbors, but iroh's `netwatch` does **not** fire a
+network-change event for that resume — so the endpoint wakes believing dead
+connections are live and never re-establishes. A large transfer can't finish
+inside one short wake window, and with connectivity never recovering it never
+resumes. Small files finish in a single window, so they look fine. Field evidence:
+18 suspend cycles in a day; the stuck blob's data froze 2 s before a
+`PM: suspend entry`; `rendezvous ... Error sending http request` clustered right
+after every `PM: suspend exit`.
+
+**Fix:** `Engine::on_resume()` calls `iroh::Endpoint::network_change()` (rebind
+socket + re-home relay, bounded), unconditionally rebuilds every active share's
+gossip presence subscription, and returns a `DocResync` per share to re-kick doc
+live-sync — the in-process equivalent of the restart that used to be the only
+cure. It is triggered by a `seed-daemon` listener on logind's
+`org.freedesktop.login1` `PrepareForSleep` signal (Linux only; best-effort, no
+bus/logind ⇒ debug log + retry). Hardening: `Node::shutdown()` now calls
+`blobs.shutdown()` before the router teardown so a partial download's
+verified-range bitfield is flushed to disk (a restart mid-download resumes from
+disk). Tests (`crates/seed-core/tests/resume.rs`, `#[ignore]`, real endpoints):
+`partial_swarm_download_survives_restart`,
+`large_download_converges_despite_repeated_interruptions`. **Field-verified
+2026-07-21:** a 1.8 GB ISO downloaded to completion across three real
+suspend/resume cycles with no daemon restart.
+
+> Latent on other platforms: macOS (`NSWorkspace` sleep/wake) and Windows
+> (`WM_POWERBROADCAST` / service power events) likely need the same resume hook —
+> only the Linux logind path is wired up so far.
+
+## 22. Blob store never garbage-collects (unbounded growth) — **OPEN**
+**Tier:** audit (found 2026-07-21 during cleanup) · **Severity:** low (disk only; no correctness impact) · **Status:** open
+
+**Where:** the iroh-blobs `FsStore` under `<data_dir>/blobs`. GC primitives exist
+in `vendor/iroh-blobs/src/store/gc.rs` (`gc_run_once`, `run_gc`, `GcConfig`) but
+are **never invoked** from `seed-core`/`seed-daemon`, and `seed-cli` has no
+cleanup command.
+
+**Symptom:** orphaned blobs — most visibly *incomplete* partials left over from a
+share that was later removed — sit on disk indefinitely. Observed: two stranded
+partials (`13263282…` 997 MB, `1a2095a4…` 1.5 GB) from a deleted share, ~2.5 GB,
+both confirmed unreferenced by the current share's manifest. Harmless but never
+reclaimed; the store grows without bound over a device's lifetime.
+
+**Root cause:** no GC pass runs. Note complete blobs are reference-exported
+(`ExportMode::TryReference`) into the share folder rather than duplicated in
+`blobs/data/`, so the reclaimable garbage is mainly stranded partials + outboards,
+not full copies.
+
+**Disposition (fix is future work):** add a periodic GC pass in the daemon that
+builds the `live` set = every content hash referenced by all current **doc
+replicas** / share manifests (plus doc-internal blobs: ignore list, member
+records), then `gc_run_once(store, live)`. The risk is completeness — a missing
+hash means GC deletes live data — so the live set must come from the doc replicas,
+not just the `sync_index` cache. Until then, a safe manual cleanup is deleting
+only known-unreferenced hashes via the store's tags/delete API with the daemon
+stopped (never a raw `rm` under a live store).
+
+## 23. Fleet-wide silent isolation (phantom liveness + dead presence overlay) — **FIXED**
+**Tier:** user-reported (field) · **Severity:** high (fleet stops propagating changes; self-report lies `Healthy`) · **Status:** fixed
+
+**Where:** `crates/seed-core/src/engine.rs` — the doc-event liveness path and the
+`connectivity_recoveries` self-heal ladders. Full write-up in
+`docs/fleet-isolation-investigation.md`. This is the machinery the resume fix
+(#21) extends via `Engine::on_resume`.
+
+**Symptom:** files stopped propagating fleet-wide and every member flapped
+`Syncing ⇄ all offline`, not recovering until a manual `relay-remove` or a service
+restart. Root-caused to a custom relay that answered its own handshake/ping while
+forwarding no client↔client traffic, so `is_connected()` stayed `true` and nothing
+self-healed.
+
+**Root cause — two independent failure modes:**
+1. **Phantom liveness.** The doc-event task refreshed a peer's `last_seen` on
+   *every* `SyncFinished`, including *failed* syncs. A partitioned node therefore
+   marked every peer online on each retry and reported a vacuous `Healthy 100%`
+   instead of the honest `NoPeers` — so the isolation ladder never engaged.
+2. **Dead presence overlay while transport is alive.** After a partition doc-sync
+   often recovers (successful `SyncFinished` marks peers online) while the gossip
+   *presence* overlay stays silently dead — peers stick at `seqno=0` and the member
+   list flaps on the TTL. Because doc-sync keeps the share non-isolated, the
+   original (total-isolation) ladder never engaged, and only a restart (a fresh
+   subscription) fixed it.
+
+**Fix:**
+- Liveness is honest: `note_sync_finished` refreshes `last_seen`/`last_contact`
+  **only when the sync actually succeeded**; a failed dial records a diagnostic and
+  never touches liveness. Restores real `NoPeers` status. Test
+  `failed_sync_never_marks_a_peer_online`.
+- `isolation_recoveries` generalized to `connectivity_recoveries` with **two
+  ladders**: ladder 1 (total isolation, forces public-relay fallback) and ladder 2
+  (presence overlay dead while transport is alive) which rebuilds the gossip
+  presence subscription in-process — the equivalent of the restart that heals it.
+  Presence liveness is tracked separately from transport (`last_presence` advanced
+  only by `note_presence`, vs `last_contact` also advanced by doc-sync).
