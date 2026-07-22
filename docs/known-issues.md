@@ -15,7 +15,7 @@ why, and the fix or current disposition.
 | 10 | multi-master delete resurrected by a still-seeding master | fixed (timestamped tombstones) |
 | 11 | iroh-docs `del` is prefix deletion (prefix-nested filenames collide) | design note (latent, rare, self-healing) |
 | 12 | LWW: local mtime vs doc record timestamp (publish-lag/skew sensitive) | design note |
-| 13 | master-side in-place corruption propagates (master = source of truth) | design note |
+| 13 | master-side in-place corruption propagates (master = source of truth) | design note (now WARNs on the corruption signature) |
 | 14 | replicated ignore-list *content* never reaches peers (silent local fallback) | fixed (key-encoded `\x00i/` list) |
 | 15 | doc writes during a virgin replica's initial sync churn the session | fixed (ignore publish now gated like the member registry) |
 | 16 | cold-join bootstrap was a single creator endpoint id | fixed (share-key pkarr rendezvous + remembered members) |
@@ -264,9 +264,13 @@ same-mtime in-place corruption that a deep verify surfaces — is indistinguisha
 from a legitimate edit, so it gets published to peers rather than healed. Only
 viewers heal from the manifest. This is fundamental to "master = source of truth",
 but on a multi-master share it means one corrupted master can overwrite good copies
-on the others (LWW decides). Inherent, not a clean bug — worth at least a WARN when
-a deep-verify finds a content-hash change with unchanged (size, mtime) so silent
-corruption isn't silently propagated.
+on the others (LWW decides). Inherent, not a clean bug, so the disposition stays a
+design note — but the silent part is now addressed: a master emits a WARN before
+republishing content whose hash changed under a *forced* deep verify while the
+folder's (path, size, mtime) signature held steady (`is_silent_corruption_scan`
+gates it, so a normal edit — which moves the signature — stays quiet). The publish
+still happens (a master is the source of truth); it is no longer silent. The gate
+logic is unit-tested by `silent_corruption_scan_only_on_forced_verify_with_steady_signature`.
 
 ## 14. Replicated ignore-list content never reaches peers (silent fallback)
 

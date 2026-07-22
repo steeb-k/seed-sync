@@ -1304,6 +1304,16 @@ async fn read_member_records(doc: &Doc) -> anyhow::Result<Vec<MemberIdentity>> {
         .collect())
 }
 
+/// Whether a scan is a *forced* deep verify running against an unchanged
+/// (path, size, mtime) folder signature — the condition under which any surfaced
+/// content-hash change is silent in-place corruption rather than a normal edit
+/// (known-issues #13). A signature-driven scan (`force_scan == false`), or a
+/// forced one where the signature itself moved, reflects a legitimate metadata
+/// change and rides ordinary change detection, so it is not this signal.
+fn is_silent_corruption_scan(force_scan: bool, quick_sig: u64, last_quick_sig: u64) -> bool {
+    force_scan && quick_sig == last_quick_sig
+}
+
 /// Local file mtime as micros since the Unix epoch (for LWW vs. a doc timestamp).
 fn mtime_micros(p: &Path) -> u64 {
     std::fs::metadata(p)
@@ -2157,6 +2167,9 @@ impl ReconcileJob {
         self.set_phase("scan folder");
         let quick_sig = scan::quick_signature(&self.folder, &ignore_set, &prev_skipped_set);
         let do_scan = self.force_scan || quick_sig != self.last_quick_sig;
+        // Corruption signal for known-issues #13 (see [`is_silent_corruption_scan`]).
+        let deep_verify_unchanged_meta =
+            is_silent_corruption_scan(self.force_scan, quick_sig, self.last_quick_sig);
         // Build the local view, plus the candidate paths to (re)attempt reading this
         // pass: when scanning, whatever the scan couldn't read; otherwise the set
         // skipped on the previous pass.
@@ -2444,6 +2457,20 @@ impl ReconcileJob {
                         }
                         Some(bh) if bh == &re.hash => {
                             // Remote untouched, local changed → publish local.
+                            // known-issues #13: if a forced deep verify surfaced this
+                            // change while (size, mtime) held steady, the local bytes
+                            // changed in place with no metadata change — likely silent
+                            // corruption, and a master publishes it over good peer
+                            // copies rather than healing. Can't be auto-distinguished
+                            // from a deliberate same-size+mtime edit, so warn loudly
+                            // instead of propagating it silently.
+                            if deep_verify_unchanged_meta {
+                                tracing::warn!(
+                                    "deep verify: {path} content hash changed with \
+                                     unchanged size+mtime on a master — publishing to \
+                                     peers (possible in-place corruption; known-issues #13)"
+                                );
+                            }
                             if let Some(abs) = le.abs.as_ref() {
                                 match self.import_one(&path, abs).await {
                                     Ok(h) => {
@@ -5574,6 +5601,24 @@ mod tests {
         assert_eq!(decode_ignore_list(b"some/user/path"), None);
         // Right prefix but undecodable CBOR tail → None (forward-compat: skip).
         assert_eq!(decode_ignore_list(b"\x00i/\xff\xff\xff"), None);
+    }
+
+    /// Known-issues #13: a master must warn (not silently propagate) when a
+    /// *forced* deep verify surfaces a content change while the folder's
+    /// (path,size,mtime) signature held steady — the fingerprint of in-place
+    /// corruption. The WARN must NOT fire for ordinary edits: a signature-driven
+    /// scan (metadata moved) or a forced verify whose signature also moved is a
+    /// legitimate change that ordinary detection already explains.
+    #[test]
+    fn silent_corruption_scan_only_on_forced_verify_with_steady_signature() {
+        // Corruption signature: forced verify, unchanged signature.
+        assert!(is_silent_corruption_scan(true, 42, 42));
+        // Not forced (signature drove the scan) → a real edit, not corruption.
+        assert!(!is_silent_corruption_scan(false, 7, 7));
+        assert!(!is_silent_corruption_scan(false, 8, 7));
+        // Forced, but the signature ALSO moved → metadata changed, so a surfaced
+        // hash change is an ordinary edit, not the silent-corruption signal.
+        assert!(!is_silent_corruption_scan(true, 8, 7));
     }
 
     /// Delete-vs-content resolution (known-issues #12): a tombstone deletes a
