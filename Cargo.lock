@@ -5555,7 +5555,7 @@ dependencies = [
 
 [[package]]
 name = "seed-cli"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -5568,7 +5568,7 @@ dependencies = [
 
 [[package]]
 name = "seed-core"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "bao-tree",
@@ -5607,7 +5607,7 @@ dependencies = [
 
 [[package]]
 name = "seed-daemon"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "clap",
@@ -5629,7 +5629,7 @@ dependencies = [
 
 [[package]]
 name = "seed-gui"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -5655,7 +5655,7 @@ dependencies = [
 
 [[package]]
 name = "seed-harness"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5669,7 +5669,7 @@ dependencies = [
 
 [[package]]
 name = "seed-ipc"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "ciborium",
  "interprocess",
@@ -5682,7 +5682,7 @@ dependencies = [
 
 [[package]]
 name = "seed-mobile"
-version = "0.6.8"
+version = "0.6.9"
 dependencies = [
  "anyhow",
  "jni 0.22.4",
