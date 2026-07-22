@@ -232,7 +232,7 @@ pub(crate) async fn serve(
     // Suspend/resume self-heal (Linux): a frequently-suspending laptop otherwise
     // never finishes a large download, because each suspend kills the transfer and
     // iroh doesn't notice the dead connections on an s2idle wake
-    // (docs/sleep-resume-investigation.md).
+    // (known-issues #21).
     #[cfg(target_os = "linux")]
     tokio::spawn(sleep_monitor_loop(daemon.clone()));
 
@@ -269,7 +269,7 @@ pub(crate) async fn serve(
 /// the machine suspends and `false` right after it resumes. On the resume edge we
 /// call [`Engine::on_resume`], which rebinds the iroh socket, re-homes the relay,
 /// and rebuilds gossip presence — the in-process equivalent of the daemon restart
-/// that was previously the only cure (docs/sleep-resume-investigation.md).
+/// that was previously the only cure (known-issues #21).
 ///
 /// Best-effort: if the system bus or logind is unavailable (containers, non-systemd
 /// hosts) we log at debug and retry, never failing the daemon.
@@ -491,7 +491,7 @@ async fn presence_loop(daemon: Daemon) {
                 tokio::spawn(dial.run());
             }
 
-            // Connectivity self-heal (docs/fleet-isolation-investigation.md): a share
+            // Connectivity self-heal (known-issues #23): a share
             // that can reach no member forces the public-relay fallback (blackholed
             // custom relay); a share whose presence overlay has gone silent while
             // doc-sync still works has its gossip subscription rebuilt. The returned

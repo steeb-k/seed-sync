@@ -148,7 +148,7 @@ async fn inplace_overwrite_large_file_converges() -> anyhow::Result<()> {
 /// Two masters each generate a deterministic corpus (hundreds/thousands of
 /// small-to-mid files) into their folders concurrently; the union must
 /// converge byte-identically on both, verified by streaming hashes. Also logs
-/// wall-clock as the baseline for the scan-cost decision (usability-findings #5).
+/// wall-clock as the baseline for the scan-cost decision (known-issues #28).
 #[tokio::test]
 #[ignore = "opens real iroh endpoints; run with --ignored"]
 async fn thousands_small_files() -> anyhow::Result<()> {

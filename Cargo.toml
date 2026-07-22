@@ -87,7 +87,7 @@ codegen-units = 1
 strip = true
 
 # Vendored, minimally-patched iroh-blobs (see vendor/iroh-blobs). Two patches:
-# 1. Cross-volume export (docs/cross-os-testing.md #1): upstream's
+# 1. Cross-volume export (known-issues #25): upstream's
 #    `ExportMode::TryReference` only treated EXDEV (unix, 18) as a cross-volume
 #    move, so on Windows (ERROR_NOT_SAME_DEVICE, 17) a viewer whose mirror is on a
 #    different drive than its data dir failed the reference export and kept a

@@ -1,7 +1,7 @@
 //! seed-soak — spawn a fleet of real `seed-daemon` processes on one machine,
 //! share a deterministic corpus between them, watch health/CPU/convergence for
 //! the run's duration, and write a timestamped markdown report. The watched
-//! production-readiness gate (see `docs/production-readiness-plan.md`).
+//! production-readiness gate.
 //!
 //! Two standard runs:
 //!   seed-soak fleet    --root D:\seed-soak      # 3 masters + 25 viewers, scaled corpus (~1.2 GB)
@@ -682,7 +682,7 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
         }
     }
 
-    // Swarm-deadline retries: grep the daemon logs (usability-findings #7).
+    // Swarm-deadline retries: grep the daemon logs (known-issues #29).
     let mut deadline_retries = 0usize;
     for n in &nodes {
         if let Ok(log) = std::fs::read_to_string(n.dir.join("daemon.log")) {

@@ -166,7 +166,7 @@ impl IrohNode {
         // `Router::shutdown` also closes the store, but in practice a big in-flight
         // download's progress was lost on every restart (reported 0% after reopen,
         // re-fetched from scratch) — fatal on a frequently-suspending laptop that
-        // restarts mid-transfer (docs/sleep-resume-investigation.md). Shutting the
+        // restarts mid-transfer (known-issues #21). Shutting the
         // store down explicitly writes those bitfields so the next start resumes
         // from what's already on disk instead of re-downloading. Best-effort: a
         // store error here must not block tearing the endpoint down.

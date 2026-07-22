@@ -87,8 +87,8 @@ pub(crate) struct PeerRoster {
     /// actually **succeeded**. A *failed* sync deliberately does NOT advance this:
     /// counting failed dials as contact is what made a fully-partitioned node mark
     /// every peer "online" on each retry, flapping the whole fleet "Syncing ↔
-    /// offline" while nothing connected (docs/fleet-isolation-investigation.md,
-    /// known-issues #16). `0` = no contact yet this session.
+    /// offline" while nothing connected (known-issues #23, #16). `0` = no contact
+    /// yet this session.
     last_contact: i64,
     /// The most recent failed doc-sync attempt: (peer id, error, unix secs). Kept
     /// purely for diagnostics and the partition WARN; never affects liveness.
@@ -98,7 +98,7 @@ pub(crate) struct PeerRoster {
     /// doc-sync. The two diverge exactly in the failure this exists to catch: the
     /// presence overlay goes silent (no beats, peers stuck at `seqno=0`) while
     /// doc-sync keeps succeeding, so the member list flaps on the TTL and only a
-    /// fresh subscription heals it (docs/fleet-isolation-investigation.md).
+    /// fresh subscription heals it (known-issues #23).
     /// `0` = no presence heard yet this session.
     last_presence: i64,
 }
@@ -136,7 +136,7 @@ struct RememberedPeer {
 const REMEMBERED_LAST_SEEN_FLUSH_SECS: i64 = 300;
 
 /// Per-share bookkeeping for the connectivity self-heal ladders
-/// (docs/fleet-isolation-investigation.md). Default = healthy. The two episodes are
+/// (known-issues #23). Default = healthy. The two episodes are
 /// tracked independently because they are mutually exclusive but each needs its own
 /// reset: a share that recovers *transport* (leaving total isolation) can still have
 /// a dead *presence* overlay, and vice versa.
@@ -179,7 +179,7 @@ impl PeerRoster {
     /// **failed** one is NOT — it only records a diagnostic and never touches
     /// `last_seen`, so an unreachable peer ages out and stays out instead of being
     /// marked "online" on every failed retry (the phantom-liveness flap;
-    /// docs/fleet-isolation-investigation.md).
+    /// known-issues #23).
     pub(crate) fn note_sync_finished(&mut self, id: &str, ok: bool, err: Option<&str>) {
         if ok {
             self.note(id, None);
@@ -611,7 +611,7 @@ const DIVERGENCE_RESYNC_KICK_SECS: i64 = 30;
 /// member count. Same bounded-repair philosophy as [`PRESENCE_REJOIN_SAMPLE`].
 const DOC_RESYNC_SAMPLE: usize = 3;
 
-/// Provable-partition self-heal (docs/fleet-isolation-investigation.md). A share
+/// Provable-partition self-heal (known-issues #23). A share
 /// that can reach **no** member while it *has* members to reach, continuously for
 /// longer than this, is treated as a real partition (not normal churn) and the
 /// recovery ladder engages: a loud WARN plus the endpoint-wide public-relay
@@ -626,7 +626,7 @@ const ISOLATION_HEAL_SECS: i64 = 120;
 const ISOLATION_PRESENCE_REBUILD_SECS: i64 = 210;
 
 /// Presence-overlay self-heal, the transport-alive twin of the isolation ladder
-/// (docs/fleet-isolation-investigation.md). After a partition, doc-sync can
+/// (known-issues #23). After a partition, doc-sync can
 /// recover (successful `SyncFinished` events mark peers online) while the gossip
 /// presence overlay stays silently dead — the swarm reports healthy (subscribe
 /// alive, `join_peers`/broadcast return Ok) yet delivers no beats, so peers stick
@@ -2647,7 +2647,7 @@ struct ShareState {
     /// Unix seconds of the last rendezvous publish (masters only); throttles it to
     /// one per [`crate::rendezvous::REPUBLISH_SECS`].
     last_rendezvous_publish: i64,
-    /// Connectivity self-heal state (docs/fleet-isolation-investigation.md).
+    /// Connectivity self-heal state (known-issues #23).
     heal: ConnHeal,
 }
 
@@ -2789,7 +2789,7 @@ pub struct Engine {
     /// (reaches no member despite having members and a live rendezvous). Tells the
     /// watchdog to add the public relays even though the custom relay reads
     /// *connected* — the blackhole case that `is_connected()` alone can't catch
-    /// (docs/fleet-isolation-investigation.md).
+    /// (known-issues #23).
     force_relay_fallback: Arc<AtomicBool>,
     /// The watchdog task, aborted on [`Engine::shutdown`] so tests that build
     /// many engines don't accumulate tickers.
@@ -4110,7 +4110,7 @@ impl Engine {
         out
     }
 
-    /// Connectivity self-heal (docs/fleet-isolation-investigation.md): two
+    /// Connectivity self-heal (known-issues #23): two
     /// independent ladders that between them cover both failure modes seen in the
     /// 2026-07 field incident, so neither needs a human to clear.
     ///
@@ -4185,7 +4185,7 @@ impl Engine {
                             "share {id}: PARTITIONED — cannot reach any of {known} known \
                              member(s) for {elapsed}s ({contact}; last dial error — {err}); \
                              forcing public-relay fallback \
-                             (docs/fleet-isolation-investigation.md)"
+                             (known-issues #23)"
                         );
                     }
                     if elapsed >= ISOLATION_PRESENCE_REBUILD_SECS
@@ -4228,7 +4228,7 @@ impl Engine {
                         tracing::warn!(
                             "share {id}: presence overlay silent for {gap}s while doc-sync is \
                              working (peers stuck at seqno=0); rebuilt the presence \
-                             subscription (docs/fleet-isolation-investigation.md)"
+                             subscription (known-issues #23)"
                         );
                     }
                 }
@@ -4256,7 +4256,7 @@ impl Engine {
     /// and nothing self-heals — only a restart fixes it. That is fatal for a
     /// frequently-suspending laptop pulling a large file: every suspend kills the
     /// in-flight transfer and the download never converges
-    /// (docs/sleep-resume-investigation.md).
+    /// (known-issues #21).
     ///
     /// This is that restart, in-process, triggered by the resume edge rather than by
     /// the degradation ladders in [`Engine::connectivity_recoveries`] noticing after
@@ -4969,7 +4969,7 @@ async fn spawn_event_task(
                             // not refresh liveness, or a fully-partitioned node marks
                             // every peer online for the TTL on each retry and the fleet
                             // flaps "Syncing ↔ offline" while nothing actually connects
-                            // (docs/fleet-isolation-investigation.md, known-issues #16).
+                            // (known-issues #23, #16).
                             LiveEvent::SyncFinished(se) => match &se.result {
                                 Ok(_) => r.note(&peer, None),
                                 Err(err) => r.note_sync_finished(&peer, false, Some(err.as_str())),
@@ -5087,7 +5087,7 @@ mod tests {
     }
 
     /// Acceptance test for the phantom-liveness fix
-    /// (docs/fleet-isolation-investigation.md): a **failed** doc-sync must produce
+    /// (known-issues #23): a **failed** doc-sync must produce
     /// zero roster online-flaps. Before the fix, a fully-partitioned node counted
     /// every failed retry as contact, marking peers "online" for the 20s TTL and
     /// flapping the whole fleet "Syncing ↔ offline" while nothing connected.
@@ -5122,7 +5122,7 @@ mod tests {
         assert!(r.last_contact() > 0, "success advances last-contact");
     }
 
-    /// Ladder-2 trigger (docs/fleet-isolation-investigation.md): the presence
+    /// Ladder-2 trigger (known-issues #23): the presence
     /// overlay is judged dead only when transport is alive but presence is silent —
     /// the exact "doc-sync works, seqno stuck at 0, members flap" shape — and never
     /// on a healthy share, a totally-isolated one, or a solo/empty one.

@@ -261,7 +261,7 @@ pub async fn probe_relay(url: &str, token: Option<&str>, timeout: Duration) -> R
 ///
 /// `force_fallback` is the escape hatch for a relay that reads *connected* but is
 /// silently **blackholing** client↔client traffic — the exact shape of the
-/// 2026-07 fleet isolation (docs/fleet-isolation-investigation.md), where every
+/// 2026-07 fleet isolation (known-issues #23), where every
 /// member homed on a custom relay that answered its own ping/handshake while
 /// forwarding nothing, so `is_connected()` stayed true and this watchdog never
 /// engaged. The engine's partition self-heal sets this flag once a share has been
