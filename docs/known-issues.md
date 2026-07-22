@@ -16,8 +16,8 @@ why, and the fix or current disposition.
 | 11 | iroh-docs `del` is prefix deletion (prefix-nested filenames collide) | design note (latent, rare, self-healing) |
 | 12 | LWW: local mtime vs doc record timestamp (publish-lag/skew sensitive) | design note |
 | 13 | master-side in-place corruption propagates (master = source of truth) | design note |
-| 14 | replicated ignore-list *content* never reaches peers (silent local fallback) | open |
-| 15 | doc writes during a virgin replica's initial sync churn the session | latent (member registry gated; ignore publish still exposed) |
+| 14 | replicated ignore-list *content* never reaches peers (silent local fallback) | fixed (key-encoded `\x00i/` list) |
+| 15 | doc writes during a virgin replica's initial sync churn the session | fixed (ignore publish now gated like the member registry) |
 | 16 | cold-join bootstrap was a single creator endpoint id | fixed (share-key pkarr rendezvous + remembered members) |
 | 17 | a fully-partitioned node reports `Healthy 100%` | fixed (`ShareStatus::NoPeers`) |
 | 18 | a locked OS keystore silently demotes a master to viewer, reverting edits | fixed (held inert + auto-retry) |
@@ -278,11 +278,18 @@ peer the entry's metadata syncs but `blobs.has(hash)` stays false forever, so
 locally-configured list. A viewer with local copies of paths a master ignores can
 therefore delete them (the mirror treats not-in-replica as deleted). The fallback
 is silent and the common case (no custom ignores, or identical lists) behaves the
-same, which is why it survived. Open. Found while designing the `\x00m/` member
+same, which is why it survived. Found while designing the `\x00m/` member
 registry, which dodged the same trap by encoding its payload in the doc key (see
-`member-registry.md`). Candidate fixes: ride the key the same way,
-`ensure_download` the ignore hash during reconcile, or set a docs download policy
-of "everything under `\x00`".
+`member-registry.md`).
+
+Fixed by riding the key the same way: the list is now encoded into a `\x00i/` +
+CBOR doc key (`ignore_list_key`/`decode_ignore_list`) with a marker value, so it
+syncs as doc metadata and reaches every peer with no blob fetch. `read_ignore_list`
+reads the `\x00i/` prefix and takes the freshest entry by record timestamp
+(last-writer-wins across masters). The legacy `\x00ignore` value-blob entry is
+ignored and harmlessly orphaned; old readers skip the unknown control key
+(wire-compatible). Covered by `ignore_list_key_roundtrips_and_rejects_foreign_keys`
+(unit) and `viewer_honors_replicated_ignore_list` (loopback, `--ignored`).
 
 ## 15. Doc writes during a virgin replica's initial sync can churn the session
 
@@ -294,11 +301,14 @@ resurrection race from the other side. Reproduced deterministically while buildi
 the member registry (2026-07-10): publishing a member record early in a joining
 co-master's first pass flipped `delete_survives_unseen_master_copy` from ~10 s
 green to a reproducible 120 s timeout. Fixed for member records by publishing only
-at the end of a pass gated on `replica_seen`. Remaining exposure: a joining master
-whose configured ignore list differs from the replicated one publishes `\x00ignore`
-at step 1 of its first pass — same window, not observed in practice (lists usually
-match), inferred from the same mechanism. Candidate fix: gate the ignore publish on
-`replica_seen` the same way.
+at the end of a pass gated on `replica_seen`. The remaining exposure — a joining
+master whose configured ignore list differed from the replicated one published
+`\x00ignore` at step 1 of its first pass — is now closed the same way: the
+key-encoded ignore publish (see #14) is deferred to the end of the pass and gated
+on `replica_seen || we_minted`. A joining master waits for its initial sync; a
+fresh creator (authoritative empty replica, nothing to sync from) still bootstraps
+its list on pass 1, and that first `\x00i/` entry is what flips `replica_seen` true
+thereafter. Guarded against regression by `delete_survives_unseen_master_copy`.
 
 ## 16. Cold-join bootstrap was a single creator endpoint id
 
