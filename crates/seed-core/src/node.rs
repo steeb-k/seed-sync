@@ -10,6 +10,8 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use iroh::{protocol::Router, Endpoint, SecretKey};
+use iroh_blobs::store::fs::options::Options as BlobStoreOptions;
+use iroh_blobs::store::GcConfig;
 use iroh_blobs::{api::downloader::Downloader, store::fs::FsStore, BlobsProtocol};
 use iroh_docs::{api::DocsApi, protocol::Docs};
 use iroh_gossip::net::Gossip;
@@ -41,7 +43,7 @@ impl IrohNode {
     /// Bootstrap the node, creating the data dir layout if needed:
     /// `node.key`, `blobs/`, `docs.redb`. The blob store lives under `data_dir`.
     pub async fn spawn(data_dir: &Path) -> anyhow::Result<Self> {
-        Self::spawn_with_blobs(data_dir, &data_dir.join("blobs"), &Default::default()).await
+        Self::spawn_with_blobs(data_dir, &data_dir.join("blobs"), &Default::default(), None).await
     }
 
     /// Like [`spawn`](Self::spawn) but with the blob store rooted at an explicit
@@ -53,6 +55,7 @@ impl IrohNode {
         data_dir: &Path,
         blobs_dir: &Path,
         relay_settings: &crate::relays::RelaySettings,
+        gc: Option<GcConfig>,
     ) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)
             .with_context(|| format!("create data dir {}", data_dir.display()))?;
@@ -96,7 +99,15 @@ impl IrohNode {
         std::fs::create_dir_all(&blobs_dir).context("create blobs dir")?;
         std::fs::create_dir_all(&docs_dir).context("create docs dir")?;
 
-        let blobs = FsStore::load(&blobs_dir).await.context("open blob store")?;
+        // `FsStore::load` with our own options so a `GcConfig` can enable the
+        // periodic GC sweep (known-issues #22); the db path mirrors `load`'s
+        // (`<blobs_dir>/blobs.db`). With `gc = None` this is exactly the default
+        // `load` behaviour.
+        let mut blob_opts = BlobStoreOptions::new(&blobs_dir);
+        blob_opts.gc = gc;
+        let blobs = FsStore::load_with_opts(blobs_dir.join("blobs.db"), blob_opts)
+            .await
+            .context("open blob store")?;
         let downloader = blobs.downloader(&endpoint);
         let gossip = Gossip::builder().spawn(endpoint.clone());
         // `Docs::persistent` treats its argument as a directory and creates

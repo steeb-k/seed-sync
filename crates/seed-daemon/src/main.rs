@@ -543,6 +543,18 @@ async fn presence_loop(daemon: Daemon) {
             }
         }
 
+        // Every ~2 min: recompute the blob-GC live set from the current replicas
+        // (known-issues #22). The store's GC sweep runs hourly on its own timer and
+        // reads whatever set was last published here; refreshing well inside that
+        // hour keeps the set fresh. Built under a brief lock, the replica reads run
+        // off-lock and bounded, exactly like the other periodic jobs.
+        if tick_n.is_multiple_of(40) {
+            let job = { daemon.engine.lock().await.gc_refresh_job() };
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(Duration::from_secs(60), job.run()).await;
+            });
+        }
+
         // Fingerprint the visible per-share state (membership counts + status)
         // so peer online/offline transitions refresh the GUI even on an
         // otherwise idle tick.

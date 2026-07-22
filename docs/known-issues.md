@@ -24,7 +24,7 @@ why, and the fix or current disposition.
 | 19 | a just-joined member's empty replica trips false `OutOfSync` | fixed (advertise unknown until the replica is seen) |
 | 20 | in-place file overwrite re-downloaded the blob twice | fixed |
 | 21 | large downloads never resume after suspend/resume | fixed (v0.6.9; logind resume hook) |
-| 22 | blob store never garbage-collects; store grows unbounded | open |
+| 22 | blob store never garbage-collects; store grows unbounded | fixed (hourly daemon GC pass, replica-derived live set) |
 | 23 | fleet-wide silent isolation (phantom liveness + dead presence overlay) | fixed |
 | 24 | empty directories are not mirrored (files-only manifest) | design note |
 | 25 | cross-volume viewer dedup left a 2× copy on Windows | fixed (vendored iroh-blobs patch) |
@@ -467,22 +467,32 @@ so far.
 
 ## 22. Blob store never garbage-collects (unbounded growth)
 
-Open, found 2026-07-21 during cleanup. Disk-only; no correctness impact. GC
-primitives exist in `vendor/iroh-blobs/src/store/gc.rs` (`gc_run_once`, `run_gc`,
-`GcConfig`) but are never invoked from `seed-core`/`seed-daemon`, and `seed-cli`
-has no cleanup command. Orphaned blobs — most visibly incomplete partials left over
-from a removed share — sit on disk indefinitely (observed: two stranded partials
-totalling ~2.5 GB from a deleted share). Complete blobs are reference-exported
-(`ExportMode::TryReference`) into the share folder rather than duplicated, so the
-reclaimable garbage is mainly stranded partials and outboards.
+Found 2026-07-21 during cleanup. Disk-only; no correctness impact. GC primitives
+exist in `vendor/iroh-blobs/src/store/gc.rs` (`gc_run_once`, `run_gc`, `GcConfig`)
+but were never invoked from `seed-core`/`seed-daemon`. Orphaned blobs — most
+visibly incomplete partials left over from a removed share — sat on disk
+indefinitely (observed: two stranded partials totalling ~2.5 GB from a deleted
+share). Complete blobs are reference-exported (`ExportMode::TryReference`) into the
+share folder rather than duplicated, so the reclaimable garbage is mainly stranded
+partials and outboards.
 
-Fix (future): a periodic daemon GC pass that builds the live set from all current
-**doc replicas** (every referenced content hash, plus doc-internal blobs — ignore
-list, member records) then calls `gc_run_once(store, live)`. The risk is
-completeness: a missing hash means GC deletes live data, so the live set must come
-from the replicas, not the `sync_index` cache. Until then, a safe manual cleanup is
-deleting only known-unreferenced hashes via the store's tags/delete API with the
-daemon stopped (never a raw `rm` under a live store).
+Fixed: the blob store now runs GC with an hourly sweep (`GC_INTERVAL_SECS`), wired
+via `FsStore::load_with_opts` in `node.rs`. The sweep's protected ("live") set is
+recomputed from **the live replicas** — `Engine::gc_refresh_job` (built under a
+brief lock, run off-lock every ~2 min from the daemon's periodic loop) enumerates
+`Query::all()` over every share's doc and unions **every** entry's content hash
+(all keys and versions, including the tiny marker-value blob that control keys
+`\x00m/`/`\x00i/`/`\x00e/`/`\x00t/` point at), plus in-flight download targets. The
+set is published to a shared `GcProtect` whose store-side `add_protected` callback
+copies it in synchronously (no `await`, so it meets the callback's `Send + Sync`
+bound). Completeness is handled by construction (all entries, not the `sync_index`
+cache) and fail-closed: no set published, or any replica read error, aborts the
+sweep rather than deleting against an unknown set. Even so the sweep only ever
+touches the blob *store*, never a synced folder, so a stale set at worst costs a
+blob re-import/re-download. Removing a share drops its doc from the next refresh, so
+its orphaned blobs become reclaimable. Test: `crates/seed-core/tests/gc.rs`
+(`--ignored`) proves the live set covers a share's content and empties when the
+share is removed.
 
 ## 23. Fleet-wide silent isolation (phantom liveness + dead presence overlay)
 

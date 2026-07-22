@@ -30,6 +30,7 @@ use iroh_blobs::api::blobs::{AddPathOptions, ExportMode, ExportOptions, ImportMo
 use iroh_blobs::api::downloader::{DownloadRequest, Downloader, SplitStrategy};
 use iroh_blobs::get::request::{get_blob, GetBlobItem};
 use iroh_blobs::protocol::GetRequest;
+use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use iroh_blobs::{store::fs::FsStore, BlobFormat, Hash};
 use iroh_docs::{
     api::Doc, engine::LiveEvent, store::Query, sync::Capability, AuthorId, NamespaceId,
@@ -2819,6 +2820,121 @@ pub struct PeerHealthAlert {
     pub recovered: bool,
 }
 
+/// How often the blob store runs a garbage-collection sweep (known-issues #22).
+/// Orphaned blobs — most visibly incomplete partials stranded by a removed share
+/// — are disk-only waste, so an hourly reclaim is ample; a healthy store barely
+/// notices it. The very first sweep only runs after this long, by which point
+/// thousands of reconcile passes have refreshed the live set.
+const GC_INTERVAL_SECS: u64 = 3600;
+
+/// The set of blob hashes GC must NOT delete, recomputed from the live replicas
+/// and shared with the blob store's GC loop (which lives inside the store, spawned
+/// before the [`Engine`] exists). The store's `add_protected` callback copies the
+/// published set in synchronously — so its future holds no `await` and trivially
+/// satisfies the callback's `Send + Sync` bound — while the async work of reading
+/// the replicas happens here, on the engine's schedule (see [`GcRefreshJob`]).
+///
+/// Fail-closed: until the first set is published the callback aborts the sweep,
+/// so GC never runs against an unknown live set. Note the sweep only ever touches
+/// the blob *store*, never a synced folder, so at worst a stale set costs a blob
+/// re-import/re-download — never folder data.
+#[derive(Clone, Default)]
+pub(crate) struct GcProtect {
+    live: Arc<StdMutex<Option<Arc<HashSet<Hash>>>>>,
+}
+
+impl GcProtect {
+    /// Publish a freshly computed live set for the next GC sweep.
+    fn publish(&self, set: HashSet<Hash>) {
+        if let Ok(mut g) = self.live.lock() {
+            *g = Some(Arc::new(set));
+        }
+    }
+
+    /// The current live set, or `None` if none has been published yet.
+    fn current(&self) -> Option<Arc<HashSet<Hash>>> {
+        self.live.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Build the blob store's [`GcConfig`]: an hourly sweep whose protected set is
+    /// this handle's most-recently published live set, copied in synchronously.
+    fn gc_config(&self) -> GcConfig {
+        let protect = self.clone();
+        GcConfig {
+            interval: Duration::from_secs(GC_INTERVAL_SECS),
+            add_protected: Some(Arc::new(move |live: &mut HashSet<Hash>| {
+                // Sync body, no await: the future is trivially Send + Sync.
+                let outcome = match protect.current() {
+                    Some(set) => {
+                        live.extend(set.iter().copied());
+                        ProtectOutcome::Continue
+                    }
+                    // No set yet (or lock poisoned) → skip this sweep entirely
+                    // rather than delete against an unknown live set.
+                    None => ProtectOutcome::Abort,
+                };
+                Box::pin(async move { outcome })
+            })),
+        }
+    }
+}
+
+/// A prepared blob-GC live-set refresh: doc handles + in-flight download hashes
+/// snapshotted under a brief engine lock, so the actual replica reads run
+/// off-lock (mirroring [`DocResync`]/`presence_rejoins`). The daemon builds one
+/// per periodic tick via [`Engine::gc_refresh_job`] and awaits [`run`](Self::run).
+pub struct GcRefreshJob {
+    docs: Vec<Doc>,
+    inflight: Vec<Hash>,
+    protect: GcProtect,
+}
+
+impl GcRefreshJob {
+    /// Enumerate every entry of every replica and publish the union of their
+    /// content hashes (plus in-flight download targets) as the GC live set. A
+    /// replica read failure leaves the previously published set in place — better
+    /// a slightly stale set than none (which would abort GC forever on a transient
+    /// hiccup); GC only ever reclaims store blobs, never folder content.
+    pub async fn run(self) {
+        let mut live: HashSet<Hash> = HashSet::with_capacity(self.inflight.len());
+        live.extend(self.inflight);
+        for doc in &self.docs {
+            if !read_referenced_hashes(doc, &mut live).await {
+                tracing::debug!("gc live-set refresh: a replica read failed; keeping prior set");
+                return;
+            }
+        }
+        self.protect.publish(live);
+    }
+}
+
+/// Insert into `live` the content hash of **every** entry of `doc` — all keys and
+/// all versions, content and control alike. Completeness is safety-critical: any
+/// referenced blob left out could be swept, including the tiny marker-value blob
+/// that control keys (`\x00m/`, `\x00i/`, `\x00e/`, `\x00t/`) point at. Returns
+/// `false` on a read error/timeout so the caller keeps the prior set.
+async fn read_referenced_hashes(doc: &Doc, live: &mut HashSet<Hash>) -> bool {
+    let stream = match tokio::time::timeout(
+        Duration::from_secs(DOC_READ_TIMEOUT_SECS),
+        doc.get_many(Query::all()),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return false,
+    };
+    let mut s = std::pin::pin!(stream);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(DOC_READ_TIMEOUT_SECS), s.next()).await {
+            Ok(Some(Ok(e))) => {
+                live.insert(e.content_hash());
+            }
+            Ok(Some(Err(_))) | Err(_) => return false,
+            Ok(None) => return true,
+        }
+    }
+}
+
 /// The engine owns the iroh node and the set of shares.
 pub struct Engine {
     node: IrohNode,
@@ -2889,6 +3005,10 @@ pub struct Engine {
     /// The watchdog task, aborted on [`Engine::shutdown`] so tests that build
     /// many engines don't accumulate tickers.
     relay_watchdog: tokio::task::AbortHandle,
+    /// Live set for the blob store's GC loop (known-issues #22). Republished from
+    /// the current replicas each periodic tick via [`Engine::gc_refresh_job`];
+    /// the store's GC callback copies it in before each sweep.
+    gc_protect: GcProtect,
 }
 
 /// A deferred kick of one share's doc live-sync, built under the engine lock (cheap:
@@ -2950,7 +3070,17 @@ impl Engine {
             .with_context(|| format!("create data dir {}", data_dir.display()))?;
         let db = crate::db::Db::open(&data_dir.join("state.db"))?;
         let relay_settings = crate::relays::load_relay_settings(&db);
-        let node = IrohNode::spawn_with_blobs(data_dir, blobs_dir, &relay_settings).await?;
+        // The blob store's GC loop is spawned inside the store, so its live-set
+        // protector must exist before the node does; the engine keeps a clone to
+        // republish the set from the live replicas (known-issues #22).
+        let gc_protect = GcProtect::default();
+        let node = IrohNode::spawn_with_blobs(
+            data_dir,
+            blobs_dir,
+            &relay_settings,
+            Some(gc_protect.gc_config()),
+        )
+        .await?;
         let author = node.docs_api().author_default().await?;
         let relay_settings = Arc::new(StdMutex::new(relay_settings));
         let relay_fallback = Arc::new(AtomicBool::new(false));
@@ -2986,8 +3116,13 @@ impl Engine {
             relay_fallback,
             force_relay_fallback,
             relay_watchdog,
+            gc_protect,
         };
         engine.reload_shares().await?;
+        // Prime the GC live set from the shares just loaded, so an early sweep
+        // (unlikely within the first hour, but possible) protects real content
+        // rather than aborting.
+        engine.gc_refresh_job().run().await;
         Ok(engine)
     }
 
@@ -4524,6 +4659,12 @@ impl Engine {
         self.node.byte_totals()
     }
 
+    /// Test/diagnostic: how many blob hashes the current GC live set protects, or
+    /// `None` if none has been published yet (`Some(0)` = published but empty).
+    pub fn debug_gc_live_set_len(&self) -> Option<usize> {
+        self.gc_protect.current().map(|s| s.len())
+    }
+
     /// Diagnostic: list the doc keys currently visible for a share.
     pub async fn debug_doc_keys(&self, share_id: &str) -> anyhow::Result<Vec<String>> {
         let state = self
@@ -5009,6 +5150,25 @@ impl Engine {
 
     /// Remove a share from the engine and persistence. Optionally delete its
     /// local folder contents.
+    /// Build a blob-GC live-set refresh (known-issues #22): snapshot the current
+    /// replica doc handles + in-flight download hashes under the brief engine lock;
+    /// the daemon runs the returned job off-lock to republish the GC live set,
+    /// mirroring the build-under-lock / run-off-lock split of
+    /// [`Engine::diverged_doc_resyncs`].
+    pub fn gc_refresh_job(&self) -> GcRefreshJob {
+        let docs = self.shares.values().map(|s| s.doc.clone()).collect();
+        let inflight = self
+            .downloads_inflight
+            .lock()
+            .map(|m| m.keys().copied().collect())
+            .unwrap_or_default();
+        GcRefreshJob {
+            docs,
+            inflight,
+            protect: self.gc_protect.clone(),
+        }
+    }
+
     pub async fn remove_share(&mut self, share_id: &str, delete_files: bool) -> anyhow::Result<()> {
         if let Some(state) = self.shares.remove(share_id) {
             let _ = state.doc.leave().await;
