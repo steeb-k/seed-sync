@@ -9,7 +9,7 @@
 //! between the local filesystem and the [`crate::manifest`] trust model, and is
 //! unit-tested on its own.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
@@ -168,8 +168,23 @@ pub fn hash_file(path: &Path) -> std::io::Result<(Vec<u8>, u64)> {
 /// must not make the signature look "settled" (which would suppress full scans and
 /// hide later adds/deletes — the poisoning bug). Pass an empty set for "everything".
 pub fn quick_signature(root: &Path, ignore: &IgnoreSet, exclude: &HashSet<String>) -> u64 {
+    signature_map(root, ignore, exclude).0
+}
+
+/// Per-path `(size, mtime_nanos)` as observed by one signature walk. Sorted by
+/// relative path, which is what makes [`hash_signature`] order-independent of the
+/// walk.
+pub type SigMap = BTreeMap<String, (u64, u128)>;
+
+/// One signature walk, returning both the [`quick_signature`] value and the
+/// per-path metadata it was computed from.
+///
+/// The map is what lets a reconcile pass tell *its own* disk writes apart from a
+/// file the user changed underneath it while the pass was running — see
+/// [`settled_signature`].
+pub fn signature_map(root: &Path, ignore: &IgnoreSet, exclude: &HashSet<String>) -> (u64, SigMap) {
     use std::time::UNIX_EPOCH;
-    let mut entries: Vec<(String, u64, u128)> = Vec::new();
+    let mut map = SigMap::new();
     for dent in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -197,17 +212,92 @@ pub fn quick_signature(root: &Path, ignore: &IgnoreSet, exclude: &HashSet<String
                 (m.len(), mt)
             })
             .unwrap_or((0, 0));
-        entries.push((rel, size, mtime));
+        map.insert(rel, (size, mtime));
     }
-    entries.sort();
+    (hash_signature(&map), map)
+}
+
+/// Hash a [`SigMap`] into the folder's change signature. Iteration order is the
+/// map's (sorted by path), so this matches the value a plain walk produces.
+pub fn hash_signature(map: &SigMap) -> u64 {
     let mut hasher = blake3::Hasher::new();
-    for (path, size, mtime) in &entries {
+    for (path, (size, mtime)) in map {
         hasher.update(path.as_bytes());
         hasher.update(&size.to_le_bytes());
         hasher.update(&mtime.to_le_bytes());
     }
     let bytes = hasher.finalize();
     u64::from_le_bytes(bytes.as_bytes()[..8].try_into().unwrap())
+}
+
+/// Domain separator mixed into a signature that is *not* a settled observation of
+/// the folder. It can never appear in a value produced by a plain walk, which is
+/// exactly the point: a drifted signature is guaranteed to differ from the next
+/// pass's [`quick_signature`], forcing the rescan.
+const DRIFT_TAG: &[u8] = b"seed-sync/quick-sig/drifted/v1";
+
+/// The signature to record as "the folder as this reconcile pass left it".
+///
+/// A pass takes real time — on a multi-GB share, over a minute — and the user can
+/// write to the folder throughout it. Recording a fresh end-of-pass walk (which is
+/// what this replaces) silently absorbed those writes into the "settled" value: the
+/// next pass then compared the new signature against a baseline that already
+/// included the change it had never scanned, decided nothing had changed, and
+/// skipped the full scan. A file overwritten while a pass was running therefore
+/// stopped propagating entirely, until some *other* change moved the signature or
+/// the 4-hourly deep verify forced a rescan. See known-issues #30.
+///
+/// So the settled signature covers only paths the pass can actually vouch for:
+///   * paths **we** wrote this pass (`wrote`) — absorb their new metadata, since
+///     re-scanning our own materialize/delete is the churn the signature exists to
+///     avoid;
+///   * paths whose `(size, mtime)` is unchanged since the pass's opening walk.
+///
+/// Anything else *drifted* under us. Drifted paths are left out of the settled set
+/// and the result is tagged, so the next pass's signature cannot match it and a
+/// full scan is guaranteed. Returns the signature and the drifted paths (for
+/// logging). Vanished-under-us paths count as drift too — they are absent from
+/// `after`, so without the tag the next walk would agree and the delete would never
+/// propagate.
+pub fn settled_signature(
+    before: &SigMap,
+    after: &SigMap,
+    wrote: &HashSet<String>,
+) -> (u64, Vec<String>) {
+    let mut settled = SigMap::new();
+    let mut drifted: Vec<String> = Vec::new();
+    for (path, sig) in after {
+        if wrote.contains(path) || before.get(path) == Some(sig) {
+            settled.insert(path.clone(), *sig);
+        } else {
+            // Changed under us, or appeared mid-pass and was never scanned.
+            drifted.push(path.clone());
+        }
+    }
+    // Gone since the opening walk without us removing it: a user delete we haven't
+    // scanned. Nothing to exclude (it isn't in `after`), so it only matters via the
+    // tag below.
+    for path in before.keys() {
+        if !after.contains_key(path) && !wrote.contains(path) {
+            drifted.push(path.clone());
+        }
+    }
+    if drifted.is_empty() {
+        return (hash_signature(&settled), drifted);
+    }
+    drifted.sort();
+    drifted.dedup();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(DRIFT_TAG);
+    hasher.update(&hash_signature(&settled).to_le_bytes());
+    for path in &drifted {
+        hasher.update(path.as_bytes());
+    }
+    let bytes = hasher.finalize();
+    (
+        u64::from_le_bytes(bytes.as_bytes()[..8].try_into().unwrap()),
+        drifted,
+    )
 }
 
 /// Walk `root`, skipping ignored paths, and produce the live (non-deleted)
@@ -379,6 +469,112 @@ mod tests {
         assert_eq!(
             base, with_b_excluded,
             "an excluded file must not affect the signature (no gate poisoning)"
+        );
+    }
+
+    fn sig(pairs: &[(&str, u64, u128)]) -> SigMap {
+        pairs
+            .iter()
+            .map(|(p, s, m)| (p.to_string(), (*s, *m)))
+            .collect()
+    }
+
+    fn set(paths: &[&str]) -> HashSet<String> {
+        paths.iter().map(|p| p.to_string()).collect()
+    }
+
+    /// The steady state: nothing moved under the pass, so the settled signature is
+    /// just the folder's signature and the next pass skips its full scan.
+    #[test]
+    fn settled_signature_absorbs_a_quiet_pass() {
+        let before = sig(&[("a.txt", 1, 10), ("b.txt", 2, 20)]);
+        let (s, drifted) = settled_signature(&before, &before, &HashSet::new());
+        assert!(drifted.is_empty());
+        assert_eq!(
+            s,
+            hash_signature(&before),
+            "an untouched folder settles at its own signature"
+        );
+    }
+
+    /// Files the pass itself materialized/deleted must be absorbed — re-scanning our
+    /// own writes every tick is the churn the quick signature exists to prevent.
+    #[test]
+    fn settled_signature_absorbs_our_own_writes() {
+        let before = sig(&[("a.txt", 1, 10)]);
+        let after = sig(&[("a.txt", 1, 10), ("new.bin", 9, 99)]);
+        let (s, drifted) = settled_signature(&before, &after, &set(&["new.bin"]));
+        assert!(drifted.is_empty(), "our own materialize is not drift");
+        assert_eq!(
+            s,
+            hash_signature(&after),
+            "the folder we just wrote is settled as-is"
+        );
+    }
+
+    /// The regression (known-issues #30): a file overwritten by the *user* while the
+    /// pass was running must NOT be absorbed. If it is, the next pass compares the
+    /// new signature against a baseline that already contains the change it never
+    /// scanned, skips the full scan, and the overwrite never propagates.
+    #[test]
+    fn settled_signature_rejects_a_midpass_overwrite() {
+        let before = sig(&[("iso.bin", 100, 10)]);
+        let after = sig(&[("iso.bin", 200, 50)]); // user replaced it mid-pass
+        let (s, drifted) = settled_signature(&before, &after, &HashSet::new());
+        assert_eq!(drifted, vec!["iso.bin".to_string()]);
+        assert_ne!(
+            s,
+            hash_signature(&after),
+            "a mid-pass overwrite must not settle as scanned — the next pass has to rescan"
+        );
+        // The concrete guarantee: whatever the next pass's walk produces, it differs
+        // from what we recorded, so `do_scan` is true.
+        assert_ne!(s, hash_signature(&before));
+    }
+
+    /// Same trap for a file *created* mid-pass: it was never scanned, so absorbing it
+    /// would make it invisible until something else moved the signature.
+    #[test]
+    fn settled_signature_rejects_a_midpass_create() {
+        let before = sig(&[("a.txt", 1, 10)]);
+        let after = sig(&[("a.txt", 1, 10), ("dropped-in.bin", 5, 55)]);
+        let (s, drifted) = settled_signature(&before, &after, &HashSet::new());
+        assert_eq!(drifted, vec!["dropped-in.bin".to_string()]);
+        assert_ne!(s, hash_signature(&after));
+    }
+
+    /// And for a file the user *deleted* mid-pass. This one can't be handled by
+    /// excluding a path (it isn't in `after` to exclude), so it relies on the drift
+    /// tag — without it the next walk would agree and the delete would never
+    /// propagate to peers.
+    #[test]
+    fn settled_signature_rejects_a_midpass_delete() {
+        let before = sig(&[("a.txt", 1, 10), ("gone.bin", 7, 70)]);
+        let after = sig(&[("a.txt", 1, 10)]);
+        let (s, drifted) = settled_signature(&before, &after, &HashSet::new());
+        assert_eq!(drifted, vec!["gone.bin".to_string()]);
+        assert_ne!(
+            s,
+            hash_signature(&after),
+            "a mid-pass delete must force a rescan, not settle silently"
+        );
+    }
+
+    /// Drift must clear once the folder holds still: otherwise a single mid-pass
+    /// write would pin the share into rescanning forever.
+    #[test]
+    fn settled_signature_converges_once_the_folder_holds_still() {
+        let before = sig(&[("iso.bin", 100, 10)]);
+        let after = sig(&[("iso.bin", 200, 50)]);
+        let (drifted_sig, _) = settled_signature(&before, &after, &HashSet::new());
+
+        // Next pass: opens on the new state, nothing changes under it.
+        let (settled, drifted) = settled_signature(&after, &after, &HashSet::new());
+        assert!(drifted.is_empty());
+        assert_eq!(settled, hash_signature(&after));
+        assert_ne!(
+            settled, drifted_sig,
+            "the rescan pass settles at a different value than the drifted one"
         );
     }
 

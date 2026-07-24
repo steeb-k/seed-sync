@@ -1699,11 +1699,29 @@ pub struct ReconcileJob {
     ///
     /// [`run`]: ReconcileJob::run
     phase: Arc<StdMutex<String>>,
+    /// Test seam: invoked after the merge, immediately before the settle walk.
+    /// A pass takes real time and the folder is live throughout it, so the
+    /// mid-pass write that known-issues #30 turns on is otherwise only reachable
+    /// by racing a timer. See [`ReconcileJob::debug_before_settle`].
+    debug_before_settle: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl ReconcileJob {
     pub fn share_id(&self) -> &str {
         &self.share_id
+    }
+
+    /// Run `hook` after this pass's merge but before it records the folder as
+    /// settled — the window in which a real user's write lands mid-pass. Exists so
+    /// the mid-pass-overwrite regression can be tested deterministically instead of
+    /// by racing a background writer against a multi-second scan.
+    #[doc(hidden)]
+    pub fn debug_before_settle<F>(mut self, hook: F) -> Self
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        self.debug_before_settle = Some(Arc::new(hook));
+        self
     }
 
     /// Cloneable handle to this job's current-phase breadcrumb, so a watchdog can
@@ -2166,7 +2184,11 @@ impl ReconcileJob {
         // gate-poisoning bug). The end-of-pass signature excludes the same way.
         let prev_skipped_set: HashSet<String> = self.prev_skipped.iter().cloned().collect();
         self.set_phase("scan folder");
-        let quick_sig = scan::quick_signature(&self.folder, &ignore_set, &prev_skipped_set);
+        // Keep the per-path metadata this walk saw, not just its hash: the
+        // end-of-pass settle compares against it to tell our own disk writes from a
+        // file the user changed while the pass was running (known-issues #30).
+        let (quick_sig, sig_before) =
+            scan::signature_map(&self.folder, &ignore_set, &prev_skipped_set);
         let do_scan = self.force_scan || quick_sig != self.last_quick_sig;
         // Corruption signal for known-issues #13 (see [`is_silent_corruption_scan`]).
         let deep_verify_unchanged_meta =
@@ -2271,6 +2293,15 @@ impl ReconcileJob {
         // created (and no synced file was ever removed from) is left alone, so it
         // no longer vanishes on the next reconcile.
         let mut emptied_parents: HashSet<PathBuf> = HashSet::new();
+        // Paths whose on-disk bytes *this pass* wrote or removed. The settle walk
+        // absorbs their new metadata instead of treating it as user drift — see
+        // [`scan::settled_signature`].
+        let mut wrote: HashSet<String> = HashSet::new();
+        // Paths whose local content we published this pass, and paths we tombstoned.
+        // Both mean "our disk is the new truth here", so the health accounting below
+        // must not score them against the pass-start (now stale) remote view.
+        let mut published: HashSet<String> = HashSet::new();
+        let mut removed: HashSet<String> = HashSet::new();
 
         for path in keys {
             // Per-file breadcrumb: every branch below can await store/doc/network
@@ -2298,6 +2329,7 @@ impl ReconcileJob {
                         if let Some(p) = target.parent() {
                             emptied_parents.insert(p.to_path_buf());
                         }
+                        wrote.insert(path.clone());
                         if b.is_some() {
                             index_dels.push(path);
                         }
@@ -2310,6 +2342,7 @@ impl ReconcileJob {
                         if let Some(p) = target.parent() {
                             emptied_parents.insert(p.to_path_buf());
                         }
+                        wrote.insert(path.clone());
                         index_dels.push(path);
                         changed = true;
                     } else if let Some(abs) = le.abs.as_ref() {
@@ -2343,6 +2376,7 @@ impl ReconcileJob {
                                 if let Some(p) = abs.parent() {
                                     emptied_parents.insert(p.to_path_buf());
                                 }
+                                wrote.insert(path.clone());
                                 if b.is_some() {
                                     index_dels.push(path);
                                 }
@@ -2358,6 +2392,7 @@ impl ReconcileJob {
                             Ok(h) => {
                                 imported_bytes += le.size;
                                 self.set_progress(imported_bytes, imported_bytes);
+                                published.insert(path.clone());
                                 index_sets.push((path, h));
                                 changed = true;
                             }
@@ -2392,6 +2427,7 @@ impl ReconcileJob {
                         // *different* content at this name isn't mistaken for the
                         // deleted file lingering.
                         self.tombstone(&path, &re.hash).await;
+                        removed.insert(path.clone());
                         index_dels.push(path);
                         changed = true;
                     } else {
@@ -2400,6 +2436,7 @@ impl ReconcileJob {
                             .await
                         {
                             Ok(true) => {
+                                wrote.insert(path.clone());
                                 index_sets.push((path, re.hash.clone()));
                                 changed = true;
                             }
@@ -2428,6 +2465,7 @@ impl ReconcileJob {
                             .await
                         {
                             Ok(true) => {
+                                wrote.insert(path.clone());
                                 index_sets.push((path, re.hash.clone()));
                                 changed = true;
                             }
@@ -2446,6 +2484,7 @@ impl ReconcileJob {
                                 .await
                             {
                                 Ok(true) => {
+                                    wrote.insert(path.clone());
                                     index_sets.push((path, re.hash.clone()));
                                     changed = true;
                                 }
@@ -2475,6 +2514,7 @@ impl ReconcileJob {
                             if let Some(abs) = le.abs.as_ref() {
                                 match self.import_one(&path, abs).await {
                                     Ok(h) => {
+                                        published.insert(path.clone());
                                         index_sets.push((path, h));
                                         changed = true;
                                     }
@@ -2495,6 +2535,7 @@ impl ReconcileJob {
                                 if let Some(abs) = le.abs.as_ref() {
                                     match self.import_one(&path, abs).await {
                                         Ok(h) => {
+                                            published.insert(path.clone());
                                             index_sets.push((path, h));
                                             changed = true;
                                         }
@@ -2513,6 +2554,7 @@ impl ReconcileJob {
                                     .await
                                 {
                                     Ok(true) => {
+                                        wrote.insert(path.clone());
                                         index_sets.push((path, re.hash.clone()));
                                         changed = true;
                                     }
@@ -2546,18 +2588,46 @@ impl ReconcileJob {
         // tracks this at chunk granularity (that's how the resumable swarm works), so
         // it's accurate and survives restarts.
         self.set_phase("compute health (blob store has/local_bytes)");
+        // What our *disk* holds per path as this pass leaves it: the base index
+        // (path → last hash we reconciled to disk) with this pass's mutations
+        // applied. Health is a claim about the mirrored folder, so having the blob
+        // is necessary but not sufficient — a peer that fetched the content and
+        // then failed to write it reported a confident `Healthy 100%` over a stale
+        // file, which is exactly how a silently-unpropagated overwrite hid on the
+        // receiving side (known-issues #30).
+        let mut on_disk: HashMap<&str, &[u8]> = self
+            .base
+            .iter()
+            .map(|(p, h)| (p.as_str(), h.as_slice()))
+            .collect();
+        for p in &index_dels {
+            on_disk.remove(p.as_str());
+        }
+        for (p, h) in &index_sets {
+            on_disk.insert(p.as_str(), h.as_slice());
+        }
         let mut total_bytes: u64 = 0;
         let mut present_bytes: u64 = 0;
-        for re in remote.values() {
+        for (path, re) in &remote {
+            // `remote` was read at the top of the pass, so it is stale for paths we
+            // published or tombstoned since — for those, our disk *is* the new
+            // truth and there is nothing outstanding to hold against it.
+            if published.contains(path) || removed.contains(path) {
+                continue;
+            }
             total_bytes += re.size;
             if re.size == 0 {
                 continue;
             }
             let hash = to_hash(&re.hash)?;
-            if self.blobs.blobs().has(hash).await? {
+            let mirrored = on_disk.get(path.as_str()) == Some(&re.hash.as_slice());
+            if mirrored && self.blobs.blobs().has(hash).await? {
                 present_bytes += re.size;
             } else {
-                present_bytes += self.local_bytes(hash).await.min(re.size);
+                // Not yet on disk. Count the chunk bytes already fetched so the
+                // percent climbs with real download progress, but never let it
+                // reach full credit — an unwritten file is not a mirrored file.
+                present_bytes += self.local_bytes(hash).await.min(re.size.saturating_sub(1));
             }
         }
         // An empty view is 100% (100% of nothing); otherwise the fraction held.
@@ -2585,7 +2655,29 @@ impl ReconcileJob {
         // flips the signature and triggers a full scan.
         let skipped_set: HashSet<String> = still_skipped.iter().cloned().collect();
         self.set_phase("finalize (settle signature)");
-        let new_quick_sig = scan::quick_signature(&self.folder, &ignore_set, &skipped_set);
+        if let Some(hook) = self.debug_before_settle.as_ref() {
+            hook();
+        }
+        let (_, sig_after) = scan::signature_map(&self.folder, &ignore_set, &skipped_set);
+        // Only absorb what this pass can vouch for. A file the user wrote *while the
+        // pass was running* is deliberately left out, so the next pass's signature
+        // can't match this one and the full scan is forced — see
+        // [`scan::settled_signature`] and known-issues #30.
+        let (new_quick_sig, drifted) = scan::settled_signature(&sig_before, &sig_after, &wrote);
+        if !drifted.is_empty() {
+            tracing::info!(
+                "reconcile {}: {} path(s) changed on disk during the pass ({}); \
+                 forcing a rescan next tick",
+                self.share_id,
+                drifted.len(),
+                drifted
+                    .iter()
+                    .take(3)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
 
         // Member-registry publish, LAST and gated: only once the replica has
         // proven contact with the share's state (synced files, tombstones, an
@@ -4786,6 +4878,7 @@ impl Engine {
             force_scan: state.force_deep_verify,
             progress,
             phase: Arc::new(StdMutex::new("queued".to_string())),
+            debug_before_settle: None,
         }))
     }
 
