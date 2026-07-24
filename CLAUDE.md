@@ -46,7 +46,13 @@ The Android app is Kotlin + Jetpack Compose under `android/` (Gradle), wrapping
 cargo build --workspace          # build everything
 cargo test  --workspace          # run tests
 cargo clippy --workspace         # lint (toolchain pins rustfmt + clippy)
-cargo fmt                        # format before committing
+cargo fmt --all                  # format before committing
+
+# The acceptance gate. `cargo test --workspace` runs ZERO integration tests
+# (they are all `#[ignore]`d), so this is what actually proves the app syncs.
+# Required before cutting a release — see docs/testing.md.
+pwsh scripts/test-acceptance.ps1         # Windows
+bash scripts/test-acceptance.sh          # Linux/macOS
 
 bash scripts/run-linux.sh                # build (release) + launch daemon + GUI on Linux/WSL
 bash scripts/run-linux.sh --skip-build   # relaunch without rebuilding
@@ -91,9 +97,11 @@ environment looks off, `scripts/run-linux.sh` self-checks and points at
 
 Architecture / engine internals:
 - `known-issues.md` — the engine bug & design-caveat catalog. **Check here first when something's wrong.**
+- `testing.md` — what's covered, the tiers, and the release gate. **Read before trusting a green test run:** every integration test is `#[ignore]`d, so `cargo test --workspace` runs none of them.
 - `iroh-1.0-api-notes.md` — verified iroh 1.0 stack API reference (versions + exact calls).
 - `distributed-downloads.md` — how blob *content* is fetched between peers; swarming large files.
 - `divergence-detection.md` — cross-member divergence detection, self-heal, deep-verify.
+- `relay-outage-field-note.md` — why a relay outage looked like an app bug, and the follow-ups to make it self-evident next time.
 - `member-registry.md` — replicated last-known member names (`\x00m/` doc records + `peer_names` cache) so the member list survives disconnects/restarts.
 
 Packaging / distribution (maintainer guides):

@@ -32,6 +32,7 @@ why, and the fix or current disposition.
 | 27 | presence is unsigned — name/health/fingerprint spoofable by members | accepted risk (v1) |
 | 28 | full stat-walk per share every reconcile tick | design note (measure, then adaptive backoff) |
 | 29 | swarm deadline is fixed regardless of blob size | design note |
+| 30 | a file written *during* a reconcile pass stops propagating (settled-signature absorb) | fixed |
 
 Three vendored crates carry upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
 `vendor/iroh-docs` — see `[patch.crates-io]` in the workspace `Cargo.toml`).
@@ -588,3 +589,127 @@ signature is stable, snap back on doc events).
 slower links still make progress across attempts, but with deadline-retry noise in
 the logs and status. Design note: if deadline retries recur on LAN-class links,
 scale the deadline with blob size.
+
+## 30. A file written *during* a reconcile pass stops propagating
+
+User-reported, field-diagnosed on the live system. A 1.88 GB ISO was copied over an
+existing file in a share. It did not reach the other members. Every member reported
+`Healthy 100%` throughout, and the peers' fingerprints agreed — the fleet was
+confidently, consistently wrong.
+
+**Field evidence** (master `bigDev`, share `ef455b63…`, ~3 h after the overwrite):
+
+```
+$ seed-cli peers --share ef455b63…
+This device  name=bigDev     Master  online=true  100%
+0f4b6c4987b481a4  name=steebP14s  Master  online=true  100%  path=direct
+1f4137766c083f76  name=lilDev     Viewer  online=true  100%  path=direct
+
+$ cargo run -p seed-core --example showindex -- state.db ef455b63… WinRx
+WinRx_11_25H2.iso
+  base=52f91659…  DIFFERS  disk=63c6426c…
+```
+
+Every member online over a *direct* path, every member at 100%, and the master's own
+base index disagreeing with its own disk. The blob store had no entry for
+`63c6426c…` at all — newest content blob predated the overwrite by two days — so the
+new bytes were never imported, let alone published. Nothing was broken about
+connectivity; the engine had simply stopped looking at the file.
+
+The two diagnostics used are kept as examples: `examples/hashfile.rs` (what hash
+would we publish for this file) and `examples/showindex.rs` (what does the persisted
+base index say, and does it still match disk).
+
+**Mechanism.** A reconcile pass ends by re-walking the folder and recording that walk
+as the share's "settled" `quick_signature`:
+
+```rust
+let new_quick_sig = scan::quick_signature(&self.folder, &ignore_set, &skipped_set);
+```
+
+The intent was right — the pass writes files itself (materialize, revert, delete),
+and re-scanning our own writes on the next tick is pure churn. But the walk cannot
+tell our writes from anyone else's. A pass on this share takes **80 seconds**
+(measured: the 4-hourly deep-verify passes log `pass took 79s`…`85s`), and copying
+a ~1.9 GB file onto a spinning disk takes minutes. So the user's write lands inside
+the pass, and the end-of-pass walk absorbs the new `(size, mtime)` into the baseline
+**without the pass ever having hashed the new content**.
+
+The next tick then computes `quick_sig == last_quick_sig`, sets `do_scan = false`,
+and builds its local view from the *base index* — the old hash. Local and remote
+agree on the old hash, so there is nothing to do. Forever. The master is blind to a
+file sitting in plain sight on its own disk.
+
+Nothing recovers it except an unrelated edit moving the signature, or the periodic
+deep verify — `DEEP_VERIFY_INTERVAL_SECS = 4 * 3600`. **Worst-case propagation delay
+for an overwritten file was four hours**, and the field log shows exactly that
+signature: between restarts, the only reconcile passes long enough to be logged are
+the ones the 4-hourly deep verify forced.
+
+**Why every member still said `Healthy 100%`.** Two independent reasons, both of
+which had to be fixed:
+
+* The **master** was not lying by its own lights — it genuinely believed the old
+  hash was current, so its manifest, its fingerprint and its health were
+  self-consistent. Health could not catch this.
+* **Health never consulted the filesystem.** It scored the merged manifest against
+  `blobs.has(hash)` — the *blob store*. A member that has fetched the content but
+  failed to write it to disk (locked target, failed export, a self-heal that never
+  completed) therefore reported a full 100% over a stale file. That is a second,
+  independent way for `Healthy 100%` to sit on top of wrong bytes, and it is what
+  would have hidden the receiving half of this report.
+
+**Fix.**
+
+1. `scan::signature_map` now returns the per-path `(size, mtime)` the walk saw, and
+   `scan::settled_signature(before, after, wrote)` computes the settled value from
+   only what the pass can vouch for: paths **we** wrote (absorbed — that is the
+   churn the signature exists to prevent) and paths whose metadata is unchanged
+   since the pass's opening walk. Anything else drifted under us: it is excluded and
+   the result is domain-separated with a drift tag, so the next pass's plain walk
+   *cannot* compare equal and the full scan is forced. Mid-pass deletes need the tag
+   rather than exclusion — there is no surviving path to exclude, and without it the
+   next walk agrees and the delete never propagates. The reconcile tracks `wrote`
+   across every disk-mutating branch of the merge.
+2. Health is now a claim about the **mirrored folder**, not the blob store: a path
+   scores full credit only when the post-pass index says the file on disk carries
+   the manifest's hash *and* the blob is complete. Otherwise it scores its fetched
+   bytes, capped strictly below full — an unwritten file can no longer reach 100%.
+   Paths we published or tombstoned this pass are excluded from the comparison,
+   since the pass-start remote view is stale for exactly those.
+
+**Tests.** `crates/seed-core/tests/live_folder.rs` — a suite for writes that land
+*during* a pass, delivered deterministically through the new
+`ReconcileJob::debug_before_settle` seam rather than by racing a background writer:
+mid-pass overwrite (different size and same size), create, delete, a file rewritten
+across four consecutive passes, and the co-master path. Each also asserts
+`assert_healthy_nodes_agree` — any two nodes claiming 100% on the same manifest must
+hold byte-identical folders. Unit coverage of the settle rule itself is in
+`scan.rs` (`settled_signature_*`).
+
+**Open sub-question: the deep verify did not rescue it either.** The 4-hourly
+`periodic_deep_verify` is the designed safety net for exactly this state — it sets
+`force_deep_verify`, which makes the next pass scan regardless of the signature, and
+a forced scan of a file whose disk hash differs from its base *must* reach the
+"remote untouched, local changed → publish local" branch. The log shows one firing
+at 19:30:43 UTC, 11 minutes after the overwrite, and the pass completing in 83 s —
+but no import happened (no new blob, base unchanged), and 83 s is exactly the
+duration of every other deep-verify pass on this share going back days, i.e. the
+duration of a pass that finds nothing to do. Either the force wasn't applied to the
+pass that ran, or the forced pass didn't scan. **Not explained.** The fix above
+addresses the cause of the stuck state, not this failure of the net beneath it;
+`ShareState::full_scans` (`debug_full_scans`) is the counter to instrument next, and
+it is not currently reachable over IPC. Worth resolving before relying on the deep
+verify as a backstop for anything else.
+
+**No user-facing recovery existed.** `Engine::publish` — behind the GUI's Publish
+button and `seed-cli publish` — is just `reconcile`, which honours the signature
+gate. So the one control a user would reach for when a file isn't syncing could not
+fix this state. The workaround, before the fix, is to change *anything* else in the
+folder: that moves the signature and forces the full scan.
+
+**Note on test coverage.** The pre-existing `inplace_overwrite_large_file_converges`
+covers overwrite-*between*-passes and passed throughout; the whole class of
+mid-pass mutation was untested. Every integration test in `seed-core` is also
+`#[ignore]`d and so does not run under a plain `cargo test --workspace` — see
+`docs/testing.md`.
