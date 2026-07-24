@@ -133,7 +133,11 @@ async fn three_masters() -> anyhow::Result<(
     let bootstrap = engines[0].endpoint_addr();
     for i in 1..3 {
         let id = engines[i]
-            .add_share(&created.master_key, folders[i].path(), vec![bootstrap.clone()])
+            .add_share(
+                &created.master_key,
+                folders[i].path(),
+                vec![bootstrap.clone()],
+            )
             .await?;
         assert_eq!(id, created.share_id);
     }
@@ -209,9 +213,8 @@ async fn partial_swarm_download_survives_restart() -> anyhow::Result<()> {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        p_before = caught.ok_or_else(|| {
-            anyhow::anyhow!("node 2 never reached {MIN_FROZEN}% to freeze")
-        })?;
+        p_before = caught
+            .ok_or_else(|| anyhow::anyhow!("node 2 never reached {MIN_FROZEN}% to freeze"))?;
     }
     engines[2].set_paused(&share, true)?;
     eprintln!("froze node 2 mid-transfer at {p_before}%");
