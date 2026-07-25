@@ -35,6 +35,7 @@ why, and the fix or current disposition.
 | 30 | a file written *during* a reconcile pass stops propagating (settled-signature absorb) | fixed |
 | 31 | the OS keystore is per-user, but the share DB is machine-wide (service↔user split) | design note |
 | 32 | a full OS credential store silently downgrades a master seed to plaintext DB | design note |
+| 33 | the hourly GC sweep drops every node to `Syncing 98%` permanently | **open** (pre-existing; no data impact) |
 
 Three vendored crates carry upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
 `vendor/iroh-docs` — see `vendor/README.md` for the per-hunk detail and the
@@ -843,3 +844,53 @@ The *product* behaviour is unchanged and still a design note: the fallback is
 deliberate — losing the keystore should not brick a master — but the silent
 downgrade in secrecy deserves at least a visible, non-dismissable status rather
 than a WARN, in the spirit of #18's "the fault must be visible and name itself".
+
+## 33. The hourly GC sweep drops every node to `Syncing 98%`, permanently
+
+**Open.** Pre-existing (reproduces identically on the pre-0.7.0 tree), no data
+impact, but the status line stops meaning anything an hour after start.
+
+Every node reports `Healthy 100%` until the first blob-store GC sweep
+(`GC_INTERVAL_SECS = 3600`, known-issues #22), then drops to `Syncing` on the
+very next health sample and **never recovers**. It degrades further — 99% → 98%
+about 3.5 minutes later — and holds there for as long as the run continues.
+
+Measured across three 28-node fleet soaks (2026-07-24), two on the 0.7.0 branch
+and one on the pre-0.7.0 baseline. All three are identical to the sample:
+
+```
+gc: start externally_protected=1054      (all 28 daemons, same second)
+gc: sweep total_protected=1054
+
+t+3514s  (-25s from GC)   Healthy 100%     <- last healthy sample
+t+3544s  ( +5s from GC)   Syncing   99%    <- first sample after the sweep
+t+3754s  (+215s from GC)  Syncing   98%
+... 23 consecutive non-Healthy samples, to the end of the window
+```
+
+**Data is unaffected.** All 28 nodes verified byte-identical in every run,
+including the baseline. The mirrored files are correct; it is the *reported*
+health that is wrong. Working hypothesis (unproven): the replica-derived live set
+under-protects, GC deletes blobs the mirror no longer needs but the health metric
+still counts, and only the 4-hourly `DEEP_VERIFY_INTERVAL_SECS` would re-import
+them from disk — which would make "recovery" take up to 4 h rather than never.
+Nobody has run a soak long enough to see whether it self-heals at the 4 h mark.
+
+**Why it matters more than a cosmetic mislabel.** This is the mirror image of
+#17. There, a partitioned node claimed `Healthy` — dangerous because it hid a
+real fault. Here every healthy node claims `Syncing`, which is safe in isolation
+but destroys the signal: after the first hour a user cannot distinguish "fine"
+from "actually broken", and neither can the soak harness. It violates the same
+rule #17 established — *if the app claims X, then X is true* — from the other
+direction.
+
+**It also breaks the soak gate.** Any `seed-soak` run longer than ~1 h fails on
+`all nodes Healthy at end: false` regardless of how well it went. Two runs were
+spent establishing that the FAIL was this and not a real regression. Until it is
+fixed, read a soak verdict alongside the convergence section rather than trusting
+the headline.
+
+Found because the run window happened to straddle the sweep. Soaks are normally
+shorter than the GC interval, which is why an hourly job that has shipped since
+#22 went unnoticed until now. The `iroh_blobs::store::gc=debug` line in
+`seed-soak` exists to make the sweep visible in the timeline next time.

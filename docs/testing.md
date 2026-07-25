@@ -158,3 +158,13 @@ Honest list; not yet written.
 drivers; `seed-soak` is the runner. Multi-GB and fleet-scale runs are what surfaced
 known-issues #5–#9. Notes on running soaks on the maintainer box (disk class matters
 for the numbers) are in the maintainer's own notes, not here.
+
+**Do not trust a soak's headline verdict on its own — read the convergence section
+too.** Known-issues #33 is open: the hourly GC sweep (`GC_INTERVAL_SECS = 3600`)
+drops every node to `Syncing 98%` on the next health sample and it never recovers,
+so *any* run longer than about an hour fails on `all nodes Healthy at end: false`
+no matter how well it went. A run that reports FAIL but lists every node
+`byte-identical ✓` with no anomalies has almost certainly hit this and nothing else.
+Two full soaks were spent proving that once. The `iroh_blobs::store::gc=debug` line
+in `seed-soak` puts the sweep in the timeline so the correlation is visible rather
+than inferred.
