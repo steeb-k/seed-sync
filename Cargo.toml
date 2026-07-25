@@ -86,29 +86,45 @@ lto = true
 codegen-units = 1
 strip = true
 
-# Vendored, minimally-patched iroh-blobs (see vendor/iroh-blobs). Two patches:
+# Three vendored, minimally-patched crates carrying fixes for upstream bugs.
+# `vendor/README.md` has the full per-hunk detail and the re-vendor checklist —
+# read it before bumping any of these. Issue numbers below are the CURRENT
+# docs/known-issues.md numbering (the doc was renumbered; older source comments
+# may cite the pre-renumber ids).
+#
+# Vendored, two-hunk-patched iroh-blobs 0.103.0 (see vendor/iroh-blobs):
 # 1. Cross-volume export (known-issues #25): upstream's
 #    `ExportMode::TryReference` only treated EXDEV (unix, 18) as a cross-volume
 #    move, so on Windows (ERROR_NOT_SAME_DEVICE, 17) a viewer whose mirror is on a
 #    different drive than its data dir failed the reference export and kept a
 #    second full copy. The patch adds the Windows code so the export falls back to
-#    copy + sets External there too.
-# 2. Bounded provider accept loop (docs/known-issues.md #11): upstream spawns one
-#    detached task per inbound request stream with no cap, so a fleet's swarm
-#    retry storm piles unbounded stream tasks + send buffers onto a serving node
-#    (soak-observed OOM aborts). The patch holds a semaphore permit per in-flight
-#    stream (16/connection) so QUIC flow control pushes back instead.
+#    copy + sets External there too. Still unfixed on upstream main (2026-07-24);
+#    NOT reported upstream yet.
+# 2. Bounded provider accept loop (known-issues #9, defense-in-depth): upstream
+#    spawns one detached task per inbound request stream with no cap, so a
+#    fleet's swarm retry storm piles unbounded stream tasks + send buffers onto a
+#    serving node (soak-observed OOM aborts). The patch holds a semaphore permit
+#    per in-flight stream (16/connection) so QUIC flow control pushes back
+#    instead. Still unfixed on upstream main (2026-07-24); NOT reported upstream
+#    yet.
 #
-# Vendored, one-hunk-patched iroh 1.0.0 (see vendor/iroh, docs/known-issues.md #11):
+# Vendored, one-hunk-patched iroh 1.0.3 (see vendor/iroh, known-issues #9):
 # upstream's per-remote path-open retry queue (`pending_open_paths`,
 # socket/remote_map/remote_state.rs) pushes without dedup and the 333 ms drain
-# re-pushes every entry that still fails, so a remote with exhausted CIDs (dead
-# or stalled peer) multiplies the queue without bound — fleet-soak daemons died
-# on the deque's doubling realloc (single 5-80 GiB allocation failures). The
-# patch dedups the queue and caps it at 64 entries. Not fixed upstream as of
-# iroh 1.0.2 (2026-07-06); report upstream before any iroh bump.
-# Vendored, two-hunk-patched iroh-docs 0.101 (see vendor/iroh-docs,
-# docs/known-issues.md #7): the single-threaded docs sync actor deadlocked
+# re-opens each entry on EVERY connection to the remote, re-pushing each one that
+# still fails — so with C connections at the path-id cap the queue is multiplied
+# by ~C per cycle. A remote whose CIDs stay exhausted (an unroutable advertised
+# address, a dead or stalled peer) grows it without bound; fleet-soak daemons
+# died on the deque's doubling realloc (single 5-80 GiB allocation failures).
+# The patch dedups the queue and caps it at 64 entries, in the same shape as the
+# fix proposed upstream so it drops out cleanly when that merges.
+# Reported upstream (independently, by another fleet):
+# https://github.com/n0-computer/iroh/issues/4390 — OPEN as of iroh 1.0.3
+# (2026-07-20); introduced in 1.0.0 by n0-computer/iroh#4296. Re-check that
+# issue on every iroh bump.
+#
+# Vendored, two-hunk-patched iroh-docs 0.101.0 (see vendor/iroh-docs,
+# known-issues #5): the single-threaded docs sync actor deadlocked
 # against the LiveActor at fleet scale — per-insert event emission AWAITED a
 # bounded subscriber channel while holding the actor thread (sync.rs
 # Subscribers::send), and the LiveActor that drains that channel polled
@@ -116,7 +132,8 @@ strip = true
 # (live.rs run loop). Under a divergence-driven sync-report storm this froze
 # the actor permanently; every doc read (get_one/get_many/open/subscribe)
 # queued behind it forever. Patches: try_send (drop event on full) + fair
-# polling. Not fixed upstream as of 0.101; report before any bump.
+# polling. Still unfixed on upstream main (2026-07-24); NOT reported upstream
+# yet.
 [patch.crates-io]
 iroh-blobs = { path = "vendor/iroh-blobs" }
 iroh = { path = "vendor/iroh" }

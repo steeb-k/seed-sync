@@ -13,7 +13,7 @@
 edition = "2024"
 rust-version = "1.91"
 name = "iroh"
-version = "1.0.0"
+version = "1.0.3"
 authors = [
     "dignifiedquire <me@dignifiedquire.com>",
     "n0 team",
@@ -231,7 +231,7 @@ features = [
 ]
 
 [dependencies.ed25519-dalek]
-version = "=3.0.0-rc.0"
+version = ">=3.0.0-rc.0,<4.0.0"
 features = [
     "serde",
     "rand_core",
@@ -250,7 +250,7 @@ version = "1"
 version = "2"
 
 [dependencies.iroh-base]
-version = "1.0.0"
+version = "1.0.3"
 features = [
     "key",
     "relay",
@@ -258,14 +258,14 @@ features = [
 default-features = false
 
 [dependencies.iroh-dns]
-version = "1.0.0"
+version = "1.0.3"
 
 [dependencies.iroh-metrics]
 version = "1.0.1"
 default-features = false
 
 [dependencies.iroh-relay]
-version = "1.0.0"
+version = "1.0.3"
 default-features = false
 
 [dependencies.n0-error]
@@ -278,19 +278,19 @@ version = "0.3"
 version = "1.0.0"
 
 [dependencies.netwatch]
-version = "0.19"
+version = "0.19.1"
 
 [dependencies.noq]
-version = "1.0.0"
+version = "1.1.0"
 features = ["rustls"]
 default-features = false
 
 [dependencies.noq-proto]
-version = "1.0.0"
+version = "1.1.0"
 default-features = false
 
 [dependencies.noq-udp]
-version = "1.0.0"
+version = "1.1.0"
 default-features = false
 
 [dependencies.papaya]
@@ -389,7 +389,7 @@ version = "0.3"
 features = ["env-filter"]
 
 [build-dependencies.cfg_aliases]
-version = "0.2.1"
+version = "0.2.2"
 
 [target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dependencies.getrandom]
 version = "0.4"
@@ -413,7 +413,7 @@ version = "0.26.0"
 default-features = false
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies.noq]
-version = "1.0.0"
+version = "1.0.1"
 features = [
     "runtime-tokio",
     "rustls",
@@ -421,7 +421,7 @@ features = [
 default-features = false
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies.portmapper]
-version = "0.19"
+version = "0.19.1"
 optional = true
 default-features = false
 
@@ -436,6 +436,9 @@ features = [
     "fs",
     "io-std",
 ]
+
+[target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dev-dependencies.assert_matches]
+version = "1.5.0"
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dev-dependencies.axum]
 version = "0.8"
@@ -452,7 +455,7 @@ version = "0.18"
 features = ["tokio"]
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dev-dependencies.iroh-base]
-version = "1.0.0"
+version = "1.0.3"
 features = [
     "key",
     "relay",
@@ -460,7 +463,7 @@ features = [
 default-features = false
 
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dev-dependencies.iroh-relay]
-version = "1.0.0"
+version = "1.0.3"
 features = [
     "test-utils",
     "server",

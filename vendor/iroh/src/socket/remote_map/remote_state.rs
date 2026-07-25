@@ -72,6 +72,43 @@ const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 /// in a high frequency, and to keep data about previous path around for subsequent connections.
 const ACTOR_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// SEED-SYNC PATCH (see `[patch.crates-io]` in the app's workspace `Cargo.toml`).
+///
+/// Upper bound on [`State::pending_open_paths`]. Upstream has no bound at all:
+/// a failed `open_path_ensure` pushes unconditionally, and the 333 ms drain
+/// re-opens each entry on *every* connection to the remote, re-pushing each one
+/// that still fails. With C connections at the path-id cap the queue is
+/// multiplied by ~C every cycle, so a remote whose CIDs stay exhausted (an
+/// unroutable advertised address, a dead or overloaded peer) grows it without
+/// bound. At 28-node fleet scale this VecDeque's doubling realloc OOM-aborted
+/// our daemons with single failed allocations of 5-80 GiB.
+///
+/// Reported upstream: <https://github.com/n0-computer/iroh/issues/4390>
+/// (open as of iroh 1.0.3; introduced in 1.0.0 by n0-computer/iroh#4296). This
+/// is deliberately the same shape as the fix proposed in that issue, so the
+/// hunk drops out cleanly once upstream merges it.
+const MAX_PENDING_OPEN_PATHS: usize = 64;
+
+/// SEED-SYNC PATCH: enqueues `addr` for a later path-open retry, deduplicated
+/// and capped at [`MAX_PENDING_OPEN_PATHS`].
+///
+/// One entry per distinct address is all the retry needs; the cap is a hard
+/// backstop. Note the drain in [`RemoteStateActor`] takes the whole queue
+/// (`mem::take`), so this only ever bounds a single refill cycle.
+fn enqueue_pending_open_path(
+    queue: &mut VecDeque<transports::FourTuple>,
+    addr: transports::FourTuple,
+) {
+    if queue.contains(&addr) {
+        // Already pending → already going to be retried.
+        return;
+    }
+    if queue.len() >= MAX_PENDING_OPEN_PATHS {
+        queue.pop_front();
+    }
+    queue.push_back(addr);
+}
+
 /// A stream of events from all paths for all connections.
 ///
 /// The connection is identified using [`ConnId`].  The event `Err` variant happens when the
@@ -1059,22 +1096,14 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        // SEED-SYNC PATCH (see [patch.crates-io] in the app's
-                        // workspace Cargo.toml): dedup + cap this retry queue.
-                        // Upstream pushes unconditionally, and the scheduled
-                        // drain re-runs open_path_on_all_conns per entry — so a
-                        // remote whose CIDs stay exhausted (a dead, stalled, or
-                        // overloaded peer) re-pushes every entry each 333 ms
-                        // cycle and the queue multiplies without bound. At
-                        // 28-node fleet scale this VecDeque's doubling realloc
-                        // OOM-aborted daemons with single failed allocations of
-                        // 5-80 GiB. One entry per distinct address is all the
-                        // retry needs; the cap is a hard backstop.
-                        if !self.pending_open_paths.contains(open_addr)
-                            && self.pending_open_paths.len() < 64
-                        {
-                            self.pending_open_paths.push_back(open_addr.clone());
-                        }
+                        // SEED-SYNC PATCH: see `enqueue_pending_open_path`.
+                        // Upstream pushes unconditionally here, which grows the
+                        // queue without bound. Reported upstream as
+                        // https://github.com/n0-computer/iroh/issues/4390.
+                        enqueue_pending_open_path(
+                            &mut self.pending_open_paths,
+                            open_addr.clone(),
+                        );
                         trace!(?open_addr, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
