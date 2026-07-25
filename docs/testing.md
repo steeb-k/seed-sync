@@ -49,6 +49,7 @@ tier 0.
 | `isolation` | partition detection and self-heal |
 | `resume` | download resume across suspend/restart |
 | `gc` | blob-store GC against a replica-derived live set |
+| `tombstone_race` | a master that joins holding a copy of a deleted file must not resurrect the delete, even when it reconciles before its replica syncs (known-issues #10) |
 | `persistence` / `keystore` | state survives restart; locked-keystore behaviour |
 | `seed-daemon/loopback_ipc`, `health_ipc` | the same through the real IPC surface the GUI uses |
 
@@ -95,6 +96,42 @@ stall you can't see is a data-loss story. Prefer assertions of the form "if the 
 
 **Prove the test fails without the fix.** Revert the fix, run the test, confirm it
 fails, restore. A regression test that has never been seen red is a guess.
+
+**Make a failing test able to explain itself.** known-issues #10's reopening is the
+worked example. `delete_survives_unseen_master_copy` *did* catch a real
+data-loss bug — but it drove its convergence loop with `let _ = engine.reconcile(..)`,
+discarding every error, and no integration test installed a tracing subscriber. So
+all it could report was "the files still disagree", which read like a hang and cost a
+day of misdirected triage. Once the loop printed reconcile errors and a periodic
+`A.x/B.x` heartbeat, the answer was immediate: 451 passes, zero errors, healthy sync
+of the *other* file — not a hang at all, but a stable convergence on the wrong state.
+Two cheap habits pay for themselves here:
+
+- Never `let _ =` a drive-loop call. Print the error (deduplicated, so a repeating
+  one doesn't flood) and include the last one in the assertion message.
+- Call `common::init_tracing()` at the top of the test. It's a no-op unless `RUST_LOG`
+  is set, so tests stay quiet and fast by default:
+  `RUST_LOG=seed_core=debug cargo test -p seed-core --test multi_master -- --ignored --nocapture`
+
+**Clean up OS-level state, not just temp dirs.** Creating a master share writes a
+seed to the **OS keystore**, and only `Engine::remove_share` deletes it — tests tear
+down with `shutdown()`, so for a long time every master share a test created leaked
+one credential permanently. Windows caps credentials per logon session (~512), and
+past the cap `CredWrite` fails with `ERROR_NOT_ENOUGH_MEMORY` (8), at which point the
+engine silently stores master keys in its DB instead and the `keystore` suite can no
+longer establish its preconditions. This box reached **639** stale entries at roughly
+34 per acceptance run before anyone noticed, and the resulting failure looked
+convincingly like "the box is broken" rather than "we leaked". Bind
+`common::SecretGuard::new(&created.share_id)` right after every `create_share`;
+`Cluster` carries one already. It is a `Drop` guard on purpose — red runs are exactly
+when tests leak, so cleanup must survive a panic.
+
+**A load-dependent failure is a race, not a flake.** The same bug reproduced 4/4
+under the full gate and passed standalone, which is exactly what "one side wins a
+race more often when the box is busy" looks like. Before muting anything, reach for
+a seam that makes the ordering deterministic — for #10 that was `add_share_open`,
+which opens a joining master's replica *without* starting live-sync, so it provably
+reconciles blind (`tests/tombstone_race.rs`).
 
 ## Known coverage gaps
 

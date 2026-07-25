@@ -12,7 +12,7 @@ why, and the fix or current disposition.
 | 7 | presence mesh fragmentation at ~28 members | fixed (subset rejoin) |
 | 8 | OutOfSync doc-resync storm (O(N²) sessions) | fixed (bounded kicks) |
 | 9 | unbounded iroh path-retry queue → OOM abort | fixed (vendored iroh patch) |
-| 10 | multi-master delete resurrected by a still-seeding master | fixed (timestamped tombstones) |
+| 10 | multi-master delete resurrected by a still-seeding master | fixed (timestamped tombstones + `replica_seen` publish gate) |
 | 11 | iroh-docs `del` is prefix deletion (prefix-nested filenames collide) | design note (latent, rare, self-healing) |
 | 12 | LWW: local mtime vs doc record timestamp (publish-lag/skew sensitive) | design note |
 | 13 | master-side in-place corruption propagates (master = source of truth) | design note (now WARNs on the corruption signature) |
@@ -33,11 +33,20 @@ why, and the fix or current disposition.
 | 28 | full stat-walk per share every reconcile tick | design note (measure, then adaptive backoff) |
 | 29 | swarm deadline is fixed regardless of blob size | design note |
 | 30 | a file written *during* a reconcile pass stops propagating (settled-signature absorb) | fixed |
+| 31 | the OS keystore is per-user, but the share DB is machine-wide (service↔user split) | design note |
+| 32 | a full OS credential store silently downgrades a master seed to plaintext DB | design note |
 
 Three vendored crates carry upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
-`vendor/iroh-docs` — see `[patch.crates-io]` in the workspace `Cargo.toml`).
-Report those bugs upstream before any iroh-stack bump. The divergence-detection
-design lives in `divergence-detection.md`.
+`vendor/iroh-docs` — see `vendor/README.md` for the per-hunk detail and the
+re-vendor checklist, and `[patch.crates-io]` in the workspace `Cargo.toml`). Of
+those five hunks only #9's is reported upstream ([iroh#4390](https://github.com/n0-computer/iroh/issues/4390),
+open); the other four are still unreported and unfixed on upstream `main`. The
+divergence-detection design lives in `divergence-detection.md`.
+
+**Numbering caveat:** this doc was renumbered. Source comments and some
+`Cargo.toml` history cite the pre-renumber ids — notably #11 for what is now #9
+(the OOM) and #7 for what is now #5 (the docs actor deadlock). Cross-reference by
+title, not by number.
 
 ---
 
@@ -201,10 +210,33 @@ exhausted — a dead or overloaded peer, of which a struggling fleet has plenty 
 turns the queue into unbounded growth until the deque's doubling realloc fails.
 
 Fixed with a vendored iroh patch (`vendor/iroh`, one hunk): dedup
-`pending_open_paths` on push and cap it at 64 entries. Report upstream before any
-iroh bump. Kept as defense-in-depth: the iroh-blobs provider accept loop is capped
-at 16 concurrent streams per connection, and swarm part-primaries rotate only over
-members that can serve a range.
+`pending_open_paths` on push and cap it at 64 entries. Kept as defense-in-depth:
+the iroh-blobs provider accept loop is capped at 16 concurrent streams per
+connection, and swarm part-primaries rotate only over members that can serve a
+range.
+
+**Upstream (2026-07-24).** Independently reported by another operator as
+[iroh#4390](https://github.com/n0-computer/iroh/issues/4390) — same code path,
+same backtrace, a single ~24 GB allocation measured on macOS. **Open as of iroh
+1.0.3**, so our patch is still required. Their report adds two things we did not
+know:
+
+- The multiplier is the **connection count**. The drain calls
+  `open_path_on_all_conns`, so draining one address with C connections at the cap
+  re-queues it C times. With a single connection it is steady-state — this only
+  manifests at **≥ 2 connections** to the same peer, which is why it took fleet
+  scale to surface.
+- It was **introduced in 1.0.0** by [iroh#4296](https://github.com/n0-computer/iroh/pull/4296),
+  which wired `MaxPathIdReached` into a requeue branch that previously handled
+  only `RemoteCidsExhausted`. The trigger is peers advertising addresses the host
+  cannot route to (NAT-mapped IPv6, overlay-network addresses).
+
+Our patch was re-shaped to match the fix proposed in that issue (a dedup + cap
+helper) so the hunk drops out cleanly when upstream merges. **Not addressed by
+either patch:** the issue's closing note that persistent `MaxPathIdReached`
+implies unreachable candidate paths are never abandoned to free path-id budget.
+Dedup+cap bounds the memory; that path-lifecycle question is still open upstream
+and remains a plausible source of wasted path-open churn for us.
 
 ## 10. Multi-master delete raced a peer's still-pending initial publish
 
@@ -228,6 +260,38 @@ mtime, so the earlier mtime-only rule deleted every replace-after-delete forever
 Legacy tombstones (no hash) fall back to the time-only rule. Covered by
 `tombstone_suppresses`, `delete_survives_unseen_master_copy`, and
 `replaced_file_survives_stale_mtime`.
+
+**Reopened and re-fixed (2026-07-24): the tombstone fix had a hole.** The
+suppression above only works if the joining master has *already received* the
+tombstone — `tombstones.get(&path)` must be populated. Nothing enforced that
+ordering. A master that reconciled before its initial doc sync landed saw an
+empty `tombstones` map, fell through to the "brand-new local file" arm, and
+published its copy. Because that publish carries a record timestamp NEWER than
+the delete, `resolve_tombstones` then awarded the path to the content and
+**dropped the tombstone permanently** — the delete was undone on every member,
+with no later pass able to repair it (the tombstone no longer exists to win).
+
+This surfaced as an intermittent `delete_survives_unseen_master_copy` failure
+that only appeared under load (a busy box makes the reconcile beat the sync).
+It read like a hang; instrumentation showed the opposite — 451 reconcile passes
+in 120 s with zero errors and healthy sync of the *other* file, converged stably
+on the resurrected one. Not a flaky test: a real, silent, data-loss-adjacent
+bug. In production the trigger is ordinary — a laptop that was offline, or a
+device re-seeded from a backup, rejoins holding old copies and undoes deletes
+fleet-wide.
+
+Fixed by extending the `replica_seen` gate — which already guarded the
+ignore-list and member-registry publishes for exactly this "a virgin replica
+can't tell deleted from unsynced" reason — to the **file content publish** in
+the merge's new-local-file arm. `replica_seen` is now computed before the merge
+(it only needs the doc reads, all of which precede it) and a share we minted
+ourselves stays exempt, since its replica is authoritatively empty. A deferred
+file goes onto `still_skipped`, so it can't mark the folder settled and is
+retried next pass: publication of genuinely new content is delayed by a pass or
+two, never dropped. Regression test: `tests/tombstone_race.rs`, which uses
+`add_share_open` to reconcile a joining master provably blind (replica opened,
+live-sync not yet started), making the race deterministic instead of
+load-dependent.
 
 ## 11. iroh-docs `del` is prefix deletion — prefix-nested filenames collide
 
@@ -713,3 +777,67 @@ covers overwrite-*between*-passes and passed throughout; the whole class of
 mid-pass mutation was untested. Every integration test in `seed-core` is also
 `#[ignore]`d and so does not run under a plain `cargo test --workspace` — see
 `docs/testing.md`.
+
+## 31. The OS keystore is per-user, but the share DB is machine-wide
+
+On Windows the daemon ships as a service running as **LocalSystem**
+(`SeedSyncDaemon`), while the GUI runs as the logged-in user. `default_data_dir`
+deliberately returns the *machine-wide* `%PROGRAMDATA%\SeedSync` for exactly that
+reason — the comment on it reasons explicitly about "the service↔user account
+boundary" so both sides derive the same socket and read the same `state.db`.
+
+The **keystore has the same boundary and no equivalent handling.** Windows
+Credential Manager is per-user, so `secrets::store_seed` writes into whichever
+account's store the writing process happens to be running as. A share created
+while running the daemon in console/dev mode (as the logged-in user) stores its
+seed in *that* user's credential store; the LocalSystem service then reads the
+same machine-wide `state.db`, sees `seed_in_keyring = 1`, finds no credential,
+and correctly refuses to act — landing in #18's "held inert" path. The reverse
+happens too: a share created by the service is invisible to a console-mode
+daemon.
+
+Harmless in normal operation, because the GUI is only an IPC client and never
+opens the engine itself — only the daemon needs the seed, and a given install
+runs it one way. It bites when switching between dev and service mode on one box.
+The same applies to a Linux `systemd --system` unit vs a `--user` one.
+
+Found while auditing #32: the production DB held one master share with
+`seed_in_keyring = 1`, yet the logged-in user's credential store contained no
+entry for it — the seed was in LocalSystem's store all along.
+
+No fix attempted. Options if this ever bites for real: key the credential by
+account, store the seed in the machine-wide DB encrypted with a DPAPI *machine*
+key, or refuse to open a share whose seed was written by a different account with
+an explicit error instead of the generic inert state.
+
+## 32. A full OS credential store silently downgrades a master seed to plaintext
+
+`persist_share` stores a master's seed in the OS keystore and, on failure, falls
+back to writing the **full master key into `state.db`** (`key.encode()` rather
+than `key.encode_viewer()`, `seed_in_keyring = 0`) behind a single
+`tracing::warn!`. The share keeps working, so nothing surfaces to the user: a
+secret that was meant to live in the OS keystore is now sitting in a plaintext
+SQLite row, announced only in a log line nobody reads.
+
+The trigger is not hypothetical. Windows Credential Manager caps credentials per
+logon session (~512) and then fails `CredWrite` with `ERROR_NOT_ENOUGH_MEMORY`
+(8) — which is what happened on the maintainer box (see below), and which *any*
+application filling the store can cause. macOS Keychain and Secret Service have
+their own failure and denial modes.
+
+**How it surfaced.** The `keystore` suite began failing mid-session with
+`OS keystore unavailable; storing key in DB instead: Windows error code 8`. Error
+8 was initially dismissed as environmental. It was not: the integration tests had
+leaked **639** `seed-sync` credentials into the user's store, because creating a
+master share writes a seed but only `Engine::remove_share` deletes one, and tests
+tear down with `shutdown()`. Roughly 34 leak per full acceptance run, so the box
+crossed the cap and every subsequent master share silently took the plaintext
+fallback. Clearing the stale entries made the suite pass again, confirming the
+mechanism. Test-side fix: `common::SecretGuard`, a `Drop` guard (panic-safe,
+because red runs are exactly when tests leak) bound at every share-creating site,
+plus a guard field on `Cluster`.
+
+The *product* behaviour is unchanged and still a design note: the fallback is
+deliberate — losing the keystore should not brick a master — but the silent
+downgrade in secrecy deserves at least a visible, non-dismissable status rather
+than a WARN, in the spirit of #18's "the fault must be visible and name itself".

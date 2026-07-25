@@ -1,9 +1,72 @@
-# iroh 1.0 stack — API notes (verified 2026-06-17)
+# iroh 1.0 stack — API notes (verified 2026-06-17, re-verified 2026-07-24)
 
-Quick reference for the exact API we build against. Versions: **iroh 1.0.0,
+Quick reference for the exact API we build against. Versions: **iroh 1.0.3,
 iroh-blobs 0.103.0, iroh-docs 0.101.0, iroh-gossip 0.101.0, iroh-tickets 1.0.0**.
 The protocol crates (blobs/docs/gossip) stay on 0.10x even though they target
 iroh 1.0 — this skew is expected.
+
+## 1.0.0 → 1.0.3 (bumped 2026-07-24)
+
+Only `iroh` moved; every other crate above was already at its newest published
+version. **Our API surface is unchanged** — the whole 1.0.0→1.0.3 diff was
+re-verified file by file, and both semver-exempt features we depend on came
+through clean:
+
+- `unstable-custom-transports` — the public `PathSelector` / `PathSelection` /
+  `PathSelectionContext` / `FourTuple` surface is byte-identical. `custom.rs`
+  only gained a `Display` impl for `Box<dyn CustomEndpoint>`. `relays.rs` needed
+  no changes.
+- `unstable-net-report` — `net_report.rs` changed only `warn_span!` →
+  `info_span!`. `ep.net_report()` unchanged.
+
+Behaviour changes that matter to us:
+
+- **Transport-lane fairness (1.0.2, iroh#4384).** 1.0.0's
+  `inner_poll_recv` did `let counter = self.poll_recv_counter.wrapping_add(1)`
+  and never stored the result, so the counter was pinned at 0 and the polling
+  order never alternated. We register no custom transports, so our fixed order
+  was **relay before IP, on every poll** — and the poll macro returns on the
+  first lane with data, so sustained relay traffic could starve the direct-UDP
+  lane. Now genuinely alternates.
+- **Windows transient recv errors against a dead relay (1.0.2, iroh#4348 +
+  net-tools#166).** On Windows a QAD probe to an unreachable relay draws ICMP
+  port-unreachable, which the socket reports as a recv error on the *next*
+  recv. Those count toward `MAX_CONSECUTIVE_RECV_ERRORS`, and hitting the cap
+  tears the QUIC endpoint down with `NetworkDown`. Fixed in `noq-udp` 1.1.0 /
+  `netwatch` 0.19.1, which this bump pulls in. Directly relevant to us: Windows
+  is our primary platform and we run a custom relay that has gone down before
+  (see `relay-outage-field-note.md`).
+- **`PkarrResolver` added to the `N0` preset (1.0.3, iroh#4412).** 1.0.0
+  published to pkarr but, outside browsers, resolved only via n0 DNS. 1.0.3
+  resolves directly from the pkarr relay as well. `node.rs` uses `presets::N0`,
+  so this lands on us for free and should tighten cold-join via the share-key
+  pkarr rendezvous (known-issues #16) — no DNS propagation/TTL wait.
+- **Empty ALPN now errors** with `ConnectWithOptsError::InvalidAlpn` (new enum
+  variant). We never match on that type and always pass a real ALPN.
+- **Keep-alive docs corrected (1.0.1, iroh#4352):** the default is **5 s**, not
+  `None`/disabled as 1.0.0's docs claimed. Behaviour did not change — only the
+  documentation was wrong.
+- **`PortmapperConfig::Disabled`** is now documented as the way to skip UPnP
+  SSDP multicast discovery, which raises firewall dialogs (notably on macOS).
+  We do not set it; worth remembering if macOS users report a firewall prompt.
+
+**Watch out — log levels dropped.** iroh#4378 moved the transports recv-error
+from `warn!` to `debug!`, and net-report / reportgen / pkarr spans from
+`warn_span!`/`error_span!` to `info_span!`. Our whole relay-outage follow-up was
+about making an outage self-evident in logs, so re-check the daemon's tracing
+filter still surfaces what `relays.rs` needs before trusting a quiet log.
+
+**Still patched, still required:** `vendor/iroh` carries the
+`pending_open_paths` dedup+cap (known-issues #9,
+[iroh#4390](https://github.com/n0-computer/iroh/issues/4390) — open as of 1.0.3).
+`remote_state.rs` was untouched between 1.0.0 and 1.0.3. See `vendor/README.md`.
+
+**Bump gotcha:** `[patch.crates-io]` is silently ignored when the patched
+version differs from what `Cargo.lock` pins — cargo emits only a *warning*
+(`patch ... was not used in the crate graph`) and builds green against the
+stock, unpatched crate. After re-vendoring at a new version you must run
+`cargo update -p iroh@<OLD> --precise <NEW>` and then confirm with
+`cargo tree -i iroh` that the path entry is in the graph.
 
 ## Big 1.0 renames
 - `NodeId` → `EndpointId` (alias for `PublicKey`); `NodeAddr` → `EndpointAddr`.
