@@ -189,6 +189,16 @@ Honest list; not yet written.
   materializing it) are untested.
 - **Windows file-locking during sync** — a file open in another app while the engine
   wants to write it — is unit-tested in `scan.rs` but not end-to-end.
+- **Nothing can take a blob away the way GC does.** Neither `Blobs::delete` nor
+  `gc_run_once` is public in iroh-blobs, so no tier-1 test can put a share into the
+  state known-issues #33 is about — a correct file on disk whose content blob is
+  gone — and the re-import repair for it is covered by the fleet soak alone. A
+  fourth vendored patch hunk exporting one of those would close it; weigh that
+  against the cost of carrying another hunk across every iroh bump.
+- **#33's permanent form needs a 70-minute soak.** `health_quiesce` pins the
+  invariant (a quiet, correct fleet must report 100%, and must mean it) and catches
+  the index-lag defect red/green, but the GC race itself only appears in a run long
+  enough to straddle an hourly sweep. `GC_INTERVAL_SECS` is not injectable.
 - **No GUI test at all.** Everything the user actually looks at is unverified.
 - **Cross-platform pairs are untested in CI** (there is no CI). Windows↔Linux and
   Windows↔Android sync is only ever exercised by hand.
