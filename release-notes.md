@@ -37,10 +37,12 @@ is targeted for 0.7.1.
 
 ### Downloads
 - **Linux x86_64** — `seed-sync-0.7.0-linux-x86_64.tar.gz`
-- **macOS universal** (Apple Silicon + Intel) — `seed-sync-0.7.0-macos-universal.tar.gz`
 - **Windows x86_64** (signed MSI) — `seed-sync-0.7.0-windows-x86_64.msi`
 - **Windows ARM64** (signed MSI) — `seed-sync-0.7.0-windows-arm64.msi`
 - **Android** (universal APK) — `seed-sync-0.7.0-android-universal.apk`
+- **macOS universal** (Apple Silicon + Intel) — *building separately; will be
+  added to this release shortly.* macOS machines will pick up 0.7.0 automatically
+  once it lands.
 
 ### System requirements
 
