@@ -8,7 +8,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use seed_core::Engine;
@@ -244,6 +244,26 @@ impl Cluster {
             .unwrap_or_else(|| "<missing>".into())
     }
 
+    /// The share's self-reported sync percent on `node`, from the same summaries
+    /// the GUI shows. Note [`Cluster::converged`] deliberately does *not* require
+    /// this to be 100 — a node can hold a byte-identical folder and still claim
+    /// `Syncing 98%` (known-issues #33), so tests that care about the honesty of
+    /// the status line have to assert on it explicitly.
+    pub fn percent(&self, node: usize) -> u8 {
+        self.nodes[node]
+            .engine
+            .list_summaries()
+            .into_iter()
+            .find(|s| s.share_id == self.share_id)
+            .map(|s| s.percent)
+            .unwrap_or(0)
+    }
+
+    /// Every node reports a fully-synced 100%.
+    pub fn all_full(&self) -> bool {
+        (0..self.nodes.len()).all(|i| self.percent(i) == 100)
+    }
+
     /// Converged = every folder matches `want`, all fingerprints agree, and no
     /// node reports OutOfSync or NoPeers.
     ///
@@ -293,6 +313,12 @@ pub fn snapshot(root: &Path) -> BTreeMap<String, Vec<u8>> {
         }
     }
     map
+}
+
+/// A `/`-separated share-relative path (the form `snapshot` returns and the
+/// engine speaks) as a native path fragment, to join onto a folder root.
+pub fn rel_to_path(rel: &str) -> PathBuf {
+    rel.split('/').collect()
 }
 
 /// Deterministic, varied (non-compressible-ish) bytes of length `n`.

@@ -32,6 +32,7 @@ ALL_SUITES=(
   "seed-core:resume"
   "seed-core:gc"
   "seed-core:tombstone_race"
+  "seed-core:health_quiesce"
   "seed-core:multi_master"
   "seed-daemon:loopback_ipc"
   "seed-daemon:health_ipc"

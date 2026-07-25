@@ -845,52 +845,98 @@ deliberate — losing the keystore should not brick a master — but the silent
 downgrade in secrecy deserves at least a visible, non-dismissable status rather
 than a WARN, in the spirit of #18's "the fault must be visible and name itself".
 
-## 33. The hourly GC sweep drops every node to `Syncing 98%`, permanently
+## 33. The hourly GC sweep deletes live content blobs; the fleet loses the ability to serve them
 
-**Open.** Pre-existing (reproduces identically on the pre-0.7.0 tree), no data
-impact, but the status line stops meaning anything an hour after start.
+**Open (fix written, verification soak running).** Pre-existing — reproduces
+identically on 0.6.10 and 0.7.0. Files on disk are never harmed, but the fleet can
+be left holding content **no member is able to serve**, and the status line stops
+meaning anything an hour after start.
 
-Every node reports `Healthy 100%` until the first blob-store GC sweep
-(`GC_INTERVAL_SECS = 3600`, known-issues #22), then drops to `Syncing` on the
-very next health sample and **never recovers**. It degrades further — 99% → 98%
-about 3.5 minutes later — and holds there for as long as the run continues.
+### What actually happens
 
-Measured across three 28-node fleet soaks (2026-07-24), two on the 0.7.0 branch
-and one on the pre-0.7.0 baseline. All three are identical to the sample:
+Two independent faults share one symptom, which is why reading the samples alone
+misled this investigation twice.
+
+**`Syncing 99%` — not a byte shortfall at all.** `list_summaries` caps a node at a
+hardcoded 99 when `s.health >= 100` but any online peer advertises a different
+manifest fingerprint. The node holds every byte; it just has not heard agreement
+yet. Normally transient, and it logs no shortfall because none exists.
+
+**`Syncing 98%` — real content loss from the blob store.** `GcProtect` publishes a
+protected set recomputed from the replicas every ~120 s (`presence_loop`, every
+40th 3 s tick). The store's GC sweep runs on its **own** hourly timer and does not
+wait for it. Any blob imported or downloaded inside that window is referenced by
+the replica but absent from the snapshot the sweep reads — so the sweep deletes it.
+Churn at ~10 paths/minute puts ~20 paths in every 120 s window; the soak lost 18.
 
 ```
-gc: start externally_protected=1054      (all 28 daemons, same second)
-gc: sweep total_protected=1054
-
-t+3514s  (-25s from GC)   Healthy 100%     <- last healthy sample
-t+3544s  ( +5s from GC)   Syncing   99%    <- first sample after the sweep
-t+3754s  (+215s from GC)  Syncing   98%
-... 23 consecutive non-Healthy samples, to the end of the window
+14:41:12.431  gc: start externally_protected=1054
+14:41:12.440  deleted 213 blobs
+14:41:12.608  health 99% - 20 path(s) outstanding:
+              d01/f00404-small.bin (size=255333 mirrored=true in_store=false local=0)
 ```
 
-**Data is unaffected.** All 28 nodes verified byte-identical in every run,
-including the baseline. The mirrored files are correct; it is the *reported*
-health that is wrong. Working hypothesis (unproven): the replica-derived live set
-under-protects, GC deletes blobs the mirror no longer needs but the health metric
-still counts, and only the 4-hourly `DEEP_VERIFY_INTERVAL_SECS` would re-import
-them from disk — which would make "recovery" take up to 4 h rather than never.
-Nobody has run a soak long enough to see whether it self-heals at the 4 h mark.
+168 ms. `mirrored=true` means the index is correct and the file is right on disk;
+`in_store=false` means the blob is gone.
 
-**Why it matters more than a cosmetic mislabel.** This is the mirror image of
-#17. There, a partitioned node claimed `Healthy` — dangerous because it hid a
-real fault. Here every healthy node claims `Syncing`, which is safe in isolation
-but destroys the signal: after the first hour a user cannot distinguish "fine"
-from "actually broken", and neither can the soak harness. It violates the same
-rule #17 established — *if the app claims X, then X is true* — from the other
-direction.
+### Why it does not recover, and why it is not cosmetic
 
-**It also breaks the soak gate.** Any `seed-soak` run longer than ~1 h fails on
-`all nodes Healthy at end: false` regardless of how well it went. Two runs were
-spent establishing that the FAIL was this and not a real regression. Until it is
-fixed, read a soak verdict alongside the convergence section rather than trusting
-the headline.
+Nothing re-imports a file whose bytes are already correct. `materialize` returns
+early on a file that hashes right and queues no fetch; a master's scan finds
+`le.hash == re.hash` and `continue`s without calling `import_one`. Not even the
+4-hourly deep verify re-imports, because there is no mismatch to detect.
 
-Found because the run window happened to straddle the sweep. Soaks are normally
-shorter than the GC interval, which is why an hourly job that has shipped since
-#22 went unnoticed until now. The `iroh_blobs::store::gc=debug` line in
-`seed-soak` exists to make the sweep visible in the timeline next time.
+Every member runs the same sweep on the same schedule, so they lose the same blobs
+at the same time. Measured on the 28-node fleet soak:
+
+```
+d03/d07/f00211-small.bin -> missing from the store on 28 / 28 nodes
+d01/f00404-small.bin     -> missing from the store on 28 / 28 nodes
+d16/f00029-mid.bin       -> missing from the store on 28 / 28 nodes
+```
+
+Existing members keep perfect copies on disk. But a **new member joining** asks for
+those hashes and no peer can serve them, and a member that loses or corrupts one of
+those files **cannot self-heal** from the fleet. That is a data-availability fault,
+not a mislabel.
+
+### The fix
+
+1. **`GcProtect::note_added`** — every hash this node puts in the store (import,
+   completed download, re-import) is protected for `RECENT_PROTECT_SECS` (10 min)
+   independently of the snapshot, which is far longer than the ~120 s refresh, so a
+   sweep can no longer outrun a refresh. Unit-tested through the real
+   `add_protected` callback; red without it.
+2. **Re-import on detection** — when the health pass finds a file whose bytes on
+   disk are correct but whose blob is missing, it re-imports from disk
+   (`reimport_local`) and only then counts it present. Crediting it *without*
+   restoring it would report `Healthy 100%` over content the share cannot hand out
+   — #17's rule inverted. Repairs damage already done, whatever the cause.
+3. **Health consults the disk before docking a file**, and repairs the stale index
+   row it finds, so an index that merely lagged no longer costs a permanent
+   percent. (With the `size - 1` floor and integer truncation, one such path turned
+   a complete share into `Syncing 99%`: observed at `394287/394290 bytes`.)
+
+`tests/health_quiesce.rs` covers 3; `engine::tests::gc_protects_blobs_stored_since_the_last_live_set_refresh`
+covers 1. **2 has no tier-1 test**: neither `Blobs::delete` nor `gc_run_once` is
+public in iroh-blobs, so no test can take a blob away the way GC does without a
+fourth vendored patch hunk. It is covered by the fleet soak only.
+
+### How it was mis-attributed twice
+
+Worth recording, because both were process errors rather than analysis errors —
+see the lessons in `docs/testing.md`.
+
+First it was blamed on GC by reading a timestamp wrong: the drop was logged at
+t+3544 s and the sweep placed at "t+3539", when the sweep actually runs at t+3600.
+Then GC was *exonerated* on that same 56 s gap plus a true-but-irrelevant argument
+(the live set is built from `Query::all()`, a superset of health's
+`single_latest_per_key` view — which constrains a refresh's *contents* and says
+nothing about its *age*, which is the actual defect). Both readings survived
+because the samples recorded *that* a node was short and never *why*. One `debug!`
+naming the outstanding paths and their failing predicate settled it in one run.
+
+The maintainer's live share — `Healthy 100%` for four hours across four sweeps —
+was the control that showed the published "every device drops to 98% after an hour"
+claim was wrong. A real share is quiescent, so nothing is stored in the 120 s
+before a sweep and nothing is lost. It takes sustained write activity to hit this.

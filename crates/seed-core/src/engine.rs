@@ -1704,6 +1704,10 @@ pub struct ReconcileJob {
     /// mid-pass write that known-issues #30 turns on is otherwise only reachable
     /// by racing a timer. See [`ReconcileJob::debug_before_settle`].
     debug_before_settle: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// GC's protected-set handle, so every blob this pass puts in the store is
+    /// shielded from a sweep that fires before the next live-set refresh sees it
+    /// (known-issues #33). See [`GcProtect::note_added`].
+    gc_protect: GcProtect,
 }
 
 impl ReconcileJob {
@@ -1747,6 +1751,37 @@ impl ReconcileJob {
     /// matching doc entry. Empty files ride the `\x00e/<path>` control keyspace
     /// (iroh-docs filters 0-byte entries out as deletions). Returns the stored
     /// 32-byte hash.
+    /// Put a file that is *already correct on disk* back into the blob store,
+    /// without touching the replica.
+    ///
+    /// A blob can go missing from under a correct file (known-issues #33: a GC
+    /// sweep firing before the live-set refresh has seen it). Nothing else repairs
+    /// that — `materialize` returns early on a file that hashes correctly, and a
+    /// master's scan finds local == remote and moves on — so the content stays on
+    /// disk while the node silently loses the ability to *serve* it. When every
+    /// member sweeps the same blob, as a fleet on one schedule does, the content
+    /// becomes unfetchable for anyone joining later even though every existing copy
+    /// is intact.
+    ///
+    /// This is a local store operation and is correct for viewers as much as
+    /// masters: it publishes nothing, it only restores what we can hand to a peer.
+    async fn reimport_local(&self, abs: &Path) -> anyhow::Result<Hash> {
+        let tag = self
+            .blobs
+            .blobs()
+            .add_path_with_opts(AddPathOptions {
+                path: abs.to_path_buf(),
+                format: BlobFormat::Raw,
+                mode: ImportMode::TryReference,
+            })
+            .temp_tag()
+            .await
+            .with_context(|| format!("re-import {}", abs.display()))?;
+        let hash = tag.hash();
+        self.gc_protect.note_added(hash);
+        Ok(hash)
+    }
+
     async fn import_one(&self, path: &str, abs: &Path) -> anyhow::Result<Vec<u8>> {
         let tag = self
             .blobs
@@ -1760,6 +1795,10 @@ impl ReconcileJob {
             .await
             .with_context(|| format!("import {}", abs.display()))?;
         let hash = tag.hash();
+        // The temp tag dies with this function; from then on the only thing keeping
+        // this blob alive is GC's protected set, which is a snapshot that may
+        // predate it by up to ~120 s (known-issues #33).
+        self.gc_protect.note_added(hash);
         let size = match self.blobs.blobs().status(hash).await {
             Ok(iroh_blobs::api::proto::BlobStatus::Complete { size }) => size,
             _ => 0,
@@ -1988,6 +2027,7 @@ impl ReconcileJob {
         let master_id = self.master_id;
         let inflight = self.downloads_inflight.clone();
         let share = self.share_id.clone();
+        let gc_protect = self.gc_protect.clone();
         let handle = tokio::spawn(async move {
             let res = if swarm {
                 swarm_download(&downloader, &blobs, hash, size, &roster, self_id, master_id).await
@@ -1997,8 +2037,14 @@ impl ReconcileJob {
                     .await
                     .map_err(|e| anyhow!("{e}"))
             };
-            if let Err(e) = res {
-                tracing::debug!("download {hash} for share {share} failed (will retry): {e}");
+            match res {
+                // Freshly fetched content is exactly what the live-set snapshot is
+                // too old to know about, and a sweep landing here would delete a
+                // blob we just spent bandwidth on (known-issues #33).
+                Ok(_) => gc_protect.note_added(hash),
+                Err(e) => {
+                    tracing::debug!("download {hash} for share {share} failed (will retry): {e}")
+                }
             }
             if let Ok(mut g) = inflight.lock() {
                 g.remove(&hash);
@@ -2641,6 +2687,18 @@ impl ReconcileJob {
         }
         let mut total_bytes: u64 = 0;
         let mut present_bytes: u64 = 0;
+        // Which paths health is still holding against us, and which predicate said
+        // so. A share parked below 100% over a folder that is byte-for-byte correct
+        // is otherwise inexplicable from outside the process — two full soak cycles
+        // went to guessing at exactly that (known-issues #33). Name the paths.
+        let mut short: Vec<String> = Vec::new();
+        // Counted separately from `short`, which is capped: reporting the capped
+        // length as "N path(s) outstanding" would understate a big backlog as
+        // exactly 20 every time.
+        let mut short_total: usize = 0;
+        // Index rows this pass proved stale by hashing the file itself. Collected
+        // rather than pushed straight onto `index_sets`, which `on_disk` borrows.
+        let mut index_repairs: Vec<(String, Vec<u8>)> = Vec::new();
         for (path, re) in &remote {
             // `remote` was read at the top of the pass, so it is stale for paths we
             // published or tombstoned since — for those, our disk *is* the new
@@ -2653,21 +2711,106 @@ impl ReconcileJob {
                 continue;
             }
             let hash = to_hash(&re.hash)?;
-            let mirrored = on_disk.get(path.as_str()) == Some(&re.hash.as_slice());
-            if mirrored && self.blobs.blobs().has(hash).await? {
+            let indexed = on_disk.get(path.as_str()) == Some(&re.hash.as_slice());
+            let in_store = self.blobs.blobs().has(hash).await?;
+            if indexed && in_store {
                 present_bytes += re.size;
-            } else {
-                // Not yet on disk. Count the chunk bytes already fetched so the
-                // percent climbs with real download progress, but never let it
-                // reach full credit — an unwritten file is not a mirrored file.
-                present_bytes += self.local_bytes(hash).await.min(re.size.saturating_sub(1));
+                continue;
+            }
+            // The index says we don't hold it. Ask the *disk* before docking the file.
+            // The index can lag what the folder actually holds — a path the scan
+            // skipped because the user was mid-write, a pass that exported the bytes
+            // and then bailed — and `materialize` already treats a correctly-hashing
+            // file as done and queues no fetch. So if health disagreed with repair
+            // here, it would report a deficit that nothing will ever clear: a share
+            // parked below 100% over a byte-perfect folder, forever, with
+            // `retrying=0` and no way to tell from the outside (known-issues #33).
+            //
+            // Size is checked first so a large file mid-overwrite (old bytes on disk,
+            // new blob still downloading) is not re-hashed every pass only to be
+            // rejected; it only costs a `stat` per outstanding path.
+            let target = self.folder.join(rel_to_native(path));
+            let same_size = std::fs::metadata(&target)
+                .map(|m| m.is_file() && m.len() == re.size)
+                .unwrap_or(false);
+            if same_size && file_matches(&target, &re.hash) {
+                // The folder is right. Two different things can still be wrong, and
+                // they need different repairs:
+                //
+                //  - the index lagged        → record the hash we just proved
+                //  - the blob left the store → put it back from disk
+                //
+                // The second is not bookkeeping. A blob we do not hold is a blob we
+                // cannot *serve*, so a peer needing this file cannot get it from us;
+                // when a whole fleet sweeps on one schedule, nobody can. Counting it
+                // as present without restoring it would report `Healthy 100%` over
+                // content the share can no longer hand out — known-issues #17's rule
+                // ("if the app claims X, then X is true") from the other side. So
+                // credit it only once it is genuinely servable again.
+                let servable = in_store
+                    || match self.reimport_local(&target).await {
+                        Ok(h) => h == hash,
+                        Err(e) => {
+                            tracing::warn!(
+                                "{path}: bytes on disk are correct but the blob is gone from the \
+                                 store and re-importing it failed (peers cannot fetch this file \
+                                 from us until it succeeds): {e:#}"
+                            );
+                            false
+                        }
+                    };
+                if servable {
+                    present_bytes += re.size;
+                    // Record the truth we just established, so the next pass takes
+                    // the cheap indexed path above instead of re-hashing forever.
+                    index_repairs.push((path.clone(), re.hash.clone()));
+                    continue;
+                }
+            }
+            // Genuinely outstanding. Count the chunk bytes already fetched so the
+            // percent climbs with real download progress, but never let it reach
+            // full credit — an unwritten file is not a mirrored file.
+            let local = self.local_bytes(hash).await;
+            present_bytes += local.min(re.size.saturating_sub(1));
+            short_total += 1;
+            if short.len() < 20 {
+                // Both predicates are reported because "the index disagrees" and
+                // "the blob is gone" are very different faults with one symptom.
+                short.push(format!(
+                    "{path} (size={} indexed={indexed} in_store={in_store} local={local})",
+                    re.size
+                ));
             }
         }
+        // `on_disk` borrows `index_sets`; done with it, so the repairs can land.
+        drop(on_disk);
+        index_sets.extend(index_repairs);
+
         // An empty view is 100% (100% of nothing); otherwise the fraction held.
         // `checked_div` folds the `total_bytes == 0` guard into the division.
         let health = (present_bytes.min(total_bytes) * 100)
             .checked_div(total_bytes)
             .unwrap_or(100) as u8;
+        if !short.is_empty() {
+            // Own target so this can be turned on alone — `seed_core=debug` across a
+            // 28-node soak buries it, and this line is the whole point of looking.
+            //   RUST_LOG=seed_core=info,seed_core::health=debug
+            tracing::debug!(
+                target: "seed_core::health",
+                "reconcile {}: health {}% ({}/{} bytes) — {} path(s) outstanding{}: {}",
+                self.share_id,
+                health,
+                present_bytes,
+                total_bytes,
+                short_total,
+                if short_total > short.len() {
+                    format!(" (first {} shown)", short.len())
+                } else {
+                    String::new()
+                },
+                short.join(", ")
+            );
+        }
 
         still_skipped.sort();
         still_skipped.dedup();
@@ -2957,13 +3100,37 @@ const GC_INTERVAL_SECS: u64 = 3600;
 /// the replicas happens here, on the engine's schedule (see [`GcRefreshJob`]).
 ///
 /// Fail-closed: until the first set is published the callback aborts the sweep,
-/// so GC never runs against an unknown live set. Note the sweep only ever touches
-/// the blob *store*, never a synced folder, so at worst a stale set costs a blob
-/// re-import/re-download — never folder data.
+/// so GC never runs against an unknown live set.
+///
+/// **The published set is a snapshot, and the sweep does not wait for it.** The
+/// daemon recomputes it every ~120 s (`presence_loop`, every 40th 3 s tick) while
+/// the store's GC loop fires on its own independent hourly timer. So a blob
+/// imported or downloaded *after* the last refresh is referenced by the replica
+/// but absent from the set the sweep reads — and gets deleted. That is not
+/// hypothetical: a 28-node fleet soak lost 18 currently-referenced files' blobs on
+/// **every** node at the first sweep, leaving content that no member could serve
+/// (known-issues #33). It never came back, because nothing re-imports a file whose
+/// bytes on disk are already correct.
+///
+/// [`Self::note_added`] closes that window: every hash this node puts in the store
+/// is protected for [`RECENT_PROTECT_SECS`] regardless of the snapshot, which is
+/// comfortably longer than the refresh interval, so by the time a hash ages out of
+/// `recent` a real refresh has either picked it up from the replica or established
+/// that nothing references it.
 #[derive(Clone, Default)]
 pub(crate) struct GcProtect {
     live: Arc<StdMutex<Option<Arc<HashSet<Hash>>>>>,
+    /// Hashes recently added to the store by this node, with the instant of the
+    /// add — protection for content newer than the published snapshot.
+    recent: Arc<StdMutex<Vec<(Hash, std::time::Instant)>>>,
 }
+
+/// How long a freshly stored blob is protected from GC on the strength of having
+/// just been written. Must exceed the live-set refresh interval (~120 s) by enough
+/// to absorb a slow or failed refresh — a replica read that times out keeps the
+/// *prior* set, so more than one interval can pass without new content appearing in
+/// it. Ten minutes costs a few hundred hashes of memory at most.
+const RECENT_PROTECT_SECS: u64 = 600;
 
 impl GcProtect {
     /// Publish a freshly computed live set for the next GC sweep.
@@ -2971,6 +3138,30 @@ impl GcProtect {
         if let Ok(mut g) = self.live.lock() {
             *g = Some(Arc::new(set));
         }
+    }
+
+    /// Record that `hash` was just written to the blob store, protecting it from
+    /// the next sweep even though no live-set refresh has seen it yet.
+    pub(crate) fn note_added(&self, hash: Hash) {
+        if let Ok(mut g) = self.recent.lock() {
+            let now = std::time::Instant::now();
+            g.retain(|(_, t)| now.duration_since(*t).as_secs() < RECENT_PROTECT_SECS);
+            g.push((hash, now));
+        }
+    }
+
+    /// The recently-added hashes still inside their protection window.
+    fn recent_hashes(&self) -> Vec<Hash> {
+        self.recent
+            .lock()
+            .map(|g| {
+                let now = std::time::Instant::now();
+                g.iter()
+                    .filter(|(_, t)| now.duration_since(*t).as_secs() < RECENT_PROTECT_SECS)
+                    .map(|(h, _)| *h)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// The current live set, or `None` if none has been published yet.
@@ -2989,6 +3180,11 @@ impl GcProtect {
                 let outcome = match protect.current() {
                     Some(set) => {
                         live.extend(set.iter().copied());
+                        // Plus anything stored since that snapshot was taken. The
+                        // sweep fires on its own timer and will not wait for a
+                        // refresh, so without this every blob written in the last
+                        // ~120 s is unprotected — see [`GcProtect`].
+                        live.extend(protect.recent_hashes());
                         ProtectOutcome::Continue
                     }
                     // No set yet (or lock poisoned) → skip this sweep entirely
@@ -4787,6 +4983,33 @@ impl Engine {
         self.gc_protect.current().map(|s| s.len())
     }
 
+    /// Test/diagnostic: drop one path from the local index (path → last hash we
+    /// reconciled to disk) without touching the folder or the replica.
+    ///
+    /// This is the seam for known-issues #33: it puts the share into the state
+    /// where the index lags a file that is *correct on disk*, which is what a pass
+    /// that skipped an unreadable mid-write path leaves behind. Reached
+    /// organically it is a race; reached this way it is deterministic. Health must
+    /// still report 100%, because the repair path (`materialize`) already
+    /// considers such a file done and will never queue a fetch for it.
+    pub fn debug_forget_index_entry(&mut self, share_id: &str, path: &str) {
+        let _ = self.db.del_index_entry(share_id, path);
+    }
+
+    /// Test/diagnostic: whether this node can actually **serve** a path's content —
+    /// i.e. holds its blob, not merely a correct file on disk. The two come apart,
+    /// which is the whole point of [`Self::debug_drop_blob_for`].
+    pub async fn debug_can_serve(&self, share_id: &str, path: &str) -> bool {
+        let idx = self.db.get_index(share_id).unwrap_or_default();
+        let Some(h) = idx.get(path) else {
+            return false;
+        };
+        let Ok(hash) = to_hash(h) else {
+            return false;
+        };
+        self.node.blobs.blobs().has(hash).await.unwrap_or(false)
+    }
+
     /// Diagnostic: list the doc keys currently visible for a share.
     pub async fn debug_doc_keys(&self, share_id: &str) -> anyhow::Result<Vec<String>> {
         let state = self
@@ -4909,6 +5132,7 @@ impl Engine {
             progress,
             phase: Arc::new(StdMutex::new("queued".to_string())),
             debug_before_settle: None,
+            gc_protect: self.gc_protect.clone(),
         }))
     }
 
@@ -5826,6 +6050,67 @@ mod tests {
     /// makes a virgin node advertise the `0` "unknown" sentinel that the divergence
     /// comparison already excludes; an *established* empty share (replica seen) still
     /// advertises the real empty fingerprint so two empty masters converge to Healthy.
+    /// known-issues #33: the protected set the GC sweep reads is a *snapshot*, and
+    /// the sweep does not wait for it to be refreshed.
+    ///
+    /// The daemon recomputes it from the replicas every ~120 s; the store's sweep
+    /// fires on its own hourly timer. A blob imported or downloaded in between is
+    /// referenced by the replica but absent from the snapshot, so the sweep deleted
+    /// it. That is not theoretical: a 28-node fleet soak lost the blobs of 18
+    /// currently-referenced files on **28 of 28 nodes** at the first sweep — every
+    /// file still byte-perfect on disk, and no member left able to serve the
+    /// content. Nothing re-imports a file whose bytes are already correct, so it
+    /// never came back.
+    ///
+    /// Exercised through the real `add_protected` callback, because the wiring is
+    /// the part that was wrong.
+    #[tokio::test]
+    async fn gc_protects_blobs_stored_since_the_last_live_set_refresh() {
+        let protect = GcProtect::default();
+        let refreshed = Hash::from([1u8; 32]);
+        let stored_after = Hash::from([2u8; 32]);
+
+        // A refresh happened, and saw only what the replica held at that moment…
+        protect.publish(HashSet::from([refreshed]));
+        // …then this node stored another blob, as a churning share does constantly.
+        protect.note_added(stored_after);
+
+        let cfg = protect.gc_config();
+        let cb = cfg
+            .add_protected
+            .expect("a protect callback is always installed");
+        let mut live: HashSet<Hash> = HashSet::new();
+        assert!(matches!(cb(&mut live).await, ProtectOutcome::Continue));
+
+        assert!(
+            live.contains(&refreshed),
+            "the published live set must be protected"
+        );
+        assert!(
+            live.contains(&stored_after),
+            "a blob stored since the last refresh must survive the next sweep — it is \
+             referenced content, and the snapshot is simply too old to know it"
+        );
+    }
+
+    /// Fail-closed: with no live set ever published, a sweep must be aborted rather
+    /// than run against an unknown protected set (which would delete everything).
+    #[tokio::test]
+    async fn gc_aborts_when_no_live_set_has_been_published() {
+        let protect = GcProtect::default();
+        protect.note_added(Hash::from([9u8; 32]));
+        let cfg = protect.gc_config();
+        let cb = cfg
+            .add_protected
+            .expect("a protect callback is always installed");
+        let mut live: HashSet<Hash> = HashSet::new();
+        assert!(
+            matches!(cb(&mut live).await, ProtectOutcome::Abort),
+            "without a published live set the sweep must abort, not proceed on the \
+             recently-added hashes alone"
+        );
+    }
+
     #[test]
     fn advertised_fp_is_zero_until_replica_seen() {
         let mut populated = HashMap::new();
