@@ -108,18 +108,40 @@ function Unregister-UpdateTask {
 # So: stop the tray BEFORE msiexec, restart it after.
 $GuiProcName = 'seed-gui'
 
+# The owner of a running process, as DOMAIN\user, or $null.
+function Get-ProcessOwner {
+    param([string]$Name)
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='$Name'" -ErrorAction SilentlyContinue)) {
+        try {
+            $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
+            if ($o.User) { return "$($o.Domain)\$($o.User)" }
+        } catch { }
+    }
+    return $null
+}
+
+# Returns the account whose tray we stopped (DOMAIN\user), or $null if the GUI
+# wasn't running. Capturing the owner *before* killing it is the whole point: it
+# is by definition the user whose tray has to come back, and it is readable no
+# matter what state the session is in.
 function Stop-Tray {
     $procs = @(Get-Process -Name $GuiProcName -ErrorAction SilentlyContinue)
-    if (-not $procs) { return $false }
-    Write-Log "stopping the tray GUI ($($procs.Count) process(es)) so the MSI can replace seed-gui.exe"
+    if (-not $procs) { return $null }
+    $owner = Get-ProcessOwner "$GuiProcName.exe"
+    Write-Log "stopping the tray GUI ($($procs.Count) process(es), owner $(if ($owner) { $owner } else { 'unknown' })) so the MSI can replace seed-gui.exe"
     $procs | Stop-Process -Force -ErrorAction SilentlyContinue
     for ($i = 0; $i -lt 50 -and (Get-Process -Name $GuiProcName -ErrorAction SilentlyContinue); $i++) {
         Start-Sleep -Milliseconds 100
     }
-    return $true
+    # Never return $null for a GUI that *was* running — the caller uses the return
+    # value to decide whether a relaunch is owed, and "running but owner unreadable"
+    # still owes one (Restart-Tray falls back to Explorer's owner).
+    if ($owner) { return $owner } else { return '' }
 }
 
 function Restart-Tray {
+    param([string]$Owner)
+
     $exe = Join-Path $BinDir 'seed-gui.exe'
     if (-not (Test-Path $exe)) { Write-Log "seed-gui.exe not found; skipping tray relaunch"; return }
 
@@ -133,9 +155,21 @@ function Restart-Tray {
         return
     }
 
-    $console = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+    # Who to relaunch as. This used to be `Win32_ComputerSystem.UserName`, which is
+    # empty whenever the session isn't an attached console one — including a *locked*
+    # workstation, which is precisely the state the machine is in at 03:00 when the
+    # daily task fires. So every unattended update killed the tray, logged "no
+    # interactive user logged on", and left the user with no tray icon until they
+    # opened the GUI by hand; the service kept syncing, so nothing else looked wrong.
+    # (It is also empty in plenty of *unlocked* states, so this was never reliable.)
+    # Prefer the owner of the GUI we just stopped, then whoever owns Explorer.
+    $console = $Owner
+    if (-not $console) { $console = Get-ProcessOwner 'explorer.exe' }
     if (-not $console) {
-        Write-Log "no interactive user logged on; the tray will start at next login"
+        # No Explorer either: genuinely nobody logged on. Note the autostart entry
+        # runs at *logon*, so this really does wait for a login — unlike the locked
+        # case above, where no logon was ever going to happen.
+        Write-Log "no interactive session found; the tray will start at next logon"
         return
     }
 
@@ -145,8 +179,18 @@ function Restart-Tray {
         $principal = New-ScheduledTaskPrincipal -UserId $console -LogonType Interactive -RunLevel Limited
         Register-ScheduledTask -TaskName $task -Action $action -Principal $principal -Force | Out-Null
         Start-ScheduledTask -TaskName $task
-        Start-Sleep -Seconds 2
-        Write-Log "relaunched the tray GUI (hidden) as $console"
+        # `Start-ScheduledTask` only *requests* a start, so wait for the process to
+        # actually exist rather than sleeping a fixed 2 s and claiming success. A
+        # post-MSI cold start pulls in the whole GTK DLL closure and can take a while.
+        $deadline = (Get-Date).AddSeconds(60)
+        while ((Get-Date) -lt $deadline -and -not (Get-Process -Name $GuiProcName -ErrorAction SilentlyContinue)) {
+            Start-Sleep -Milliseconds 250
+        }
+        if (Get-Process -Name $GuiProcName -ErrorAction SilentlyContinue) {
+            Write-Log "relaunched the tray GUI (hidden) as $console"
+        } else {
+            Write-Log "WARNING: tray relaunch task started as $console but no $GuiProcName process appeared"
+        }
     } catch {
         Write-Log "WARNING: could not relaunch the tray GUI: $($_.Exception.Message)"
     } finally {
@@ -220,7 +264,8 @@ function Invoke-Update {
     Write-Log "downloading $($asset.name)"
     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $tmp -UseBasicParsing -Headers @{ 'User-Agent' = 'seed-sync-update' }
 
-    $guiWasRunning = Stop-Tray
+    # $null = wasn't running; otherwise the owning account ('' if unreadable).
+    $guiUser = Stop-Tray
 
     $msiLog = Join-Path $DataDir 'update-msi.log'
     Write-Log "applying $tmp (msiexec /qn)"
@@ -237,7 +282,9 @@ function Invoke-Update {
     # Unconditional: on success this is the point of the exercise, and on failure
     # we still killed the tray, so the user must not be left without a GUI.
     Assert-DaemonRunning
-    if ($guiWasRunning) { Restart-Tray }
+    # Explicit $null test: an empty string (GUI was running, owner unreadable) is
+    # falsy in PowerShell, and that case still owes the user a relaunch.
+    if ($null -ne $guiUser) { Restart-Tray $guiUser }
 
     Remove-Item $tmp -ErrorAction SilentlyContinue
 }
