@@ -28,12 +28,27 @@ every device, and it changes when a newly-joined master starts publishing.
 
 ### Known issue
 
-After roughly an hour of running, every device reports **`Syncing 98%`** instead
-of `Healthy 100%`, caused by the routine hourly storage-cleanup pass. **Your files
-are not affected.** This is a status-display fault only — verified across three
-28-device test runs in which every device's files stayed byte-for-byte identical
-throughout. It is **not new in this release**; v0.6.10 behaves the same way. A fix
-is targeted for 0.7.1.
+On a folder being **actively and continuously written to**, the routine hourly
+storage-cleanup pass can discard its copy of content that was saved in the couple
+of minutes before it ran. Devices then report **`Syncing 98%`** instead of
+`Healthy 100%` and stay there.
+
+**Your files are not damaged** — every device keeps a correct copy on disk, and
+this was verified byte-for-byte across four 28-device test runs. But because every
+device cleans up on the same schedule, they can *all* discard the same content at
+once, and then:
+
+- a **device joining the folder later** cannot download those particular files;
+- a device that loses or corrupts one of them cannot repair it from the others.
+
+A quiet folder is not affected: with no writes just before the cleanup pass there
+is nothing to discard. A folder that has been sitting idle stays `Healthy 100%`
+indefinitely.
+
+This is **not new in this release** — v0.6.10 and earlier behave the same way. A
+fix is written and in verification for 0.7.1. If you are running a folder under
+heavy continuous writes and want to be certain nothing is unreachable, the 0.7.1
+update repairs it automatically on the next sync pass.
 
 ### Downloads
 - **Linux x86_64** — `seed-sync-0.7.0-linux-x86_64.tar.gz`
