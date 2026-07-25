@@ -2173,6 +2173,23 @@ impl ReconcileJob {
         let remote = remote_view.files;
         let tombstones = remote_view.tombstones;
 
+        // Has our replica proven contact with the share's state? Computed HERE,
+        // before the merge, because the merge's "new local file" arm needs it
+        // too — not just the deferred publishes at the end of the pass.
+        //
+        // A virgin replica cannot distinguish "absent because deleted" from
+        // "absent because we haven't synced yet": `tombstones` is empty either
+        // way. Publishing a pre-existing local file in that state can outrun an
+        // inbound tombstone, and because the publish carries a NEWER record
+        // timestamp than the delete, `resolve_tombstones` then hands the path to
+        // the content and drops the tombstone — permanently resurrecting the
+        // delete on every member, with no pass that ever repairs it. See
+        // known-issues #10.
+        let replica_seen = replica_had_ignore
+            || !remote.is_empty()
+            || !tombstones.is_empty()
+            || !member_records.is_empty();
+
         // 3. Local view. Hashing the whole folder is costly, so only do it when the
         //    cheap (path,size,mtime) signature changed since last reconcile;
         //    otherwise the on-disk content equals our recorded base. Both roles
@@ -2383,6 +2400,22 @@ impl ReconcileJob {
                                 changed = true;
                                 continue;
                             }
+                        }
+                        // Hold the publish until the replica has proven contact
+                        // with the share (known-issues #10). On a virgin replica
+                        // "absent from the replica" is ambiguous — it may simply
+                        // be unsynced — and the tombstone check above is blind,
+                        // so publishing here can outrun an inbound delete and
+                        // resurrect it permanently (the publish timestamp beats
+                        // the tombstone, so the tombstone is dropped for good).
+                        // A share we minted ourselves is exempt: its replica is
+                        // authoritatively empty, so there is nothing to wait for.
+                        // Anything genuinely new is published on a later pass,
+                        // once the initial sync has landed — a bounded delay in
+                        // exchange for never silently undoing a delete.
+                        if !(replica_seen || self.we_minted) {
+                            still_skipped.push(path.clone());
+                            continue;
                         }
                         // Brand-new local file (or locally edited after a
                         // remote delete): publish it. A per-file import failure (the
@@ -2679,19 +2712,16 @@ impl ReconcileJob {
             );
         }
 
-        // Member-registry publish, LAST and gated: only once the replica has
-        // proven contact with the share's state (synced files, tombstones, an
-        // ignore entry, or existing member records). A virgin replica means our
-        // initial doc-sync may still be in flight, and a doc write can churn
-        // that session — see [`publish_member_records`] for the failure this
-        // prevents. Genesis costs one pass of delay: the creator's own ignore
-        // entry satisfies the gate from pass 2 on.
+        // Member-registry publish, LAST and gated on the same `replica_seen`
+        // computed before the merge: only once the replica has proven contact
+        // with the share's state (synced files, tombstones, an ignore entry, or
+        // existing member records). A virgin replica means our initial doc-sync
+        // may still be in flight, and a doc write can churn that session — see
+        // [`publish_member_records`] for the failure this prevents. Genesis
+        // costs one pass of delay: the creator's own ignore entry satisfies the
+        // gate from pass 2 on.
         //
         // [`publish_member_records`]: ReconcileJob::publish_member_records
-        let replica_seen = replica_had_ignore
-            || !remote.is_empty()
-            || !tombstones.is_empty()
-            || !member_records.is_empty();
 
         // Ignore-list publish (masters only), LAST and gated like the member
         // registry (known-issues #15): a drifted list is written only once the
