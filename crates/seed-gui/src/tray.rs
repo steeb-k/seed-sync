@@ -180,6 +180,12 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow, wiring: 
         if open_window {
             window.set_visible(true);
             window.present();
+            // macOS: the click went to our status item, which does NOT activate the
+            // app — so `present()` orders the window only within our own process and
+            // it surfaces *behind* whatever was frontmost. This also undoes the
+            // `hide:` and the `.accessory` activation policy that hide-to-tray set.
+            // No-op everywhere else.
+            crate::macos_activate();
         }
         if quit_app {
             app.quit();

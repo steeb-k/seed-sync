@@ -351,6 +351,60 @@ fn macos_resign_active() {
 #[cfg(not(target_os = "macos"))]
 fn macos_resign_active() {}
 
+/// macOS: bring the app to the front, and put it back in the Dock / ⌘-Tab.
+///
+/// A click on the tray's status item does **not** activate the app, so
+/// `window.present()` alone raises the window only *within* our own process — it
+/// comes up behind whatever was frontmost, which is the "opening from the tray
+/// shows the window behind other windows" report. Hide-to-tray also calls `hide:`
+/// and drops the activation policy to `.accessory`, so both have to be undone
+/// before presenting.
+///
+/// `activateIgnoringOtherApps:` is formally deprecated in favour of `activate`,
+/// but it is the one that reliably front-most's a process activated from a status
+/// item rather than the Dock, and it still works on every version we support.
+#[cfg(target_os = "macos")]
+fn macos_activate() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+    if let Some(mtm) = MainThreadMarker::new() {
+        let app = NSApplication::sharedApplication(mtm);
+        // Back into the Dock/switcher first: an `.accessory` app can be activated
+        // but has no Dock tile or menu bar, and we are about to show real UI.
+        // Returns false if AppKit refused; nothing useful to do about it, and the
+        // present/activate below still gives the user their window.
+        let _ = app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+        app.unhide(None);
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn macos_activate() {}
+
+/// macOS: leave the Dock and the ⌘-Tab switcher while living in the tray.
+///
+/// SEED Sync is tray-resident — closing the window hides it rather than quitting —
+/// so with the default `.regular` policy the process sits in ⌘-Tab (and the Dock)
+/// with no window to switch to. `.accessory` is the policy menu-bar/tray apps use:
+/// no Dock tile, no switcher entry, status item completely unaffected.
+/// [`macos_activate`] restores `.regular` whenever a window is shown again, so the
+/// app looks and behaves normally the whole time it has visible UI.
+///
+/// Note the Dock tile and the ⌘-Tab entry are the same switch — AppKit offers no
+/// way to drop out of the switcher while keeping a Dock icon.
+#[cfg(target_os = "macos")]
+fn macos_hide_from_switcher() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
+    if let Some(mtm) = MainThreadMarker::new() {
+        let _ = NSApplication::sharedApplication(mtm)
+            .setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    }
+}
+#[cfg(not(target_os = "macos"))]
+fn macos_hide_from_switcher() {}
+
 fn main() -> glib::ExitCode {
     setup_runtime_env();
 
@@ -418,6 +472,10 @@ fn main() -> glib::ExitCode {
         if let Some(win) = app.windows().first() {
             win.set_visible(true);
             win.present();
+            // Un-hide + re-enter the Dock/switcher + come to the front. `present()`
+            // only orders the window within our own app, which is not enough when
+            // the reveal came from a status-item click (macOS only).
+            macos_activate();
             return;
         }
         build_ui(app, handle.clone(), socket.clone(), hidden, show_rx.clone());
@@ -1091,6 +1149,8 @@ fn build_ui(
         tracing::debug!("close-request -> hide to tray");
         w.set_visible(false);
         macos_resign_active();
+        // No window left to switch to, so stop advertising one (macOS only).
+        macos_hide_from_switcher();
         glib::Propagation::Stop
     });
 
@@ -1105,6 +1165,7 @@ fn build_ui(
         hide.connect_activate(move |_, _| {
             w.set_visible(false);
             macos_resign_active();
+            macos_hide_from_switcher();
         });
         app.add_action(&hide);
         app.set_accels_for_action("app.hide-to-tray", &["<Meta>q"]);
@@ -1129,7 +1190,9 @@ fn build_ui(
         let window = window.clone();
         glib::spawn_future_local(async move {
             while show_rx.recv().await.is_ok() {
+                window.set_visible(true);
                 window.present();
+                macos_activate();
             }
         });
     }
@@ -1138,7 +1201,11 @@ fn build_ui(
     ensure_autostart();
 
     // Autostart launches us hidden (tray only); otherwise show the window.
-    if !hidden {
+    if hidden {
+        // Started straight into the tray with no window, so don't claim a Dock tile
+        // or a ⌘-Tab slot for UI that isn't there (macOS only).
+        macos_hide_from_switcher();
+    } else {
         window.present();
     }
 }

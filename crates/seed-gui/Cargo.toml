@@ -46,5 +46,12 @@ ksni = "0.3.5"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSNotification", "NSOperation", "NSString", "NSObject", "NSThread", "block2"] }
-objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSResponder"] }
+# `NSRunningApplication` is what gates `NSApplication::setActivationPolicy` and the
+# `NSApplicationActivationPolicy` constants — needed to drop out of the Dock/⌘-Tab
+# while tray-resident and to come back when a window is shown.
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSRunningApplication",
+] }
 block2 = "0.6"
