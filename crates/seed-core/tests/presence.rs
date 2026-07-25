@@ -1,6 +1,8 @@
 //! Presence: pool members exchange their display name + sync health over gossip,
 //! and it shows up in `Engine::peers()`.
 
+mod common;
+
 use std::time::Duration;
 
 use seed_core::Engine;
@@ -41,6 +43,7 @@ async fn presence_propagates_name_and_health() -> anyhow::Result<()> {
     viewer.set_device_name("bob")?;
 
     let created = master.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let master_addr = master.endpoint_addr();
     let share_id = viewer
         .add_share(&created.viewer_key, b_folder.path(), vec![master_addr])
@@ -137,6 +140,7 @@ async fn presence_three_masters_all_to_all() -> anyhow::Result<()> {
     // A creates; B and C join from the *master* key (so all three are masters),
     // bootstrapping only from A — reproducing the star topology.
     let created = a.create_share(folders[0].path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let a_addr = a.endpoint_addr();
     let share = created.share_id.clone();
     let share_b = b

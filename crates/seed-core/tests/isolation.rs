@@ -22,6 +22,8 @@
 //! `#[ignore]` like the other engine tests: opens real iroh endpoints. Run with:
 //!   cargo test -p seed-core --test isolation -- --ignored
 
+mod common;
+
 use seed_core::identity::ShareKey;
 use seed_core::Engine;
 
@@ -47,6 +49,7 @@ async fn lone_creator_is_healthy_not_stranded() -> anyhow::Result<()> {
     let mut engine = Engine::new(data.path()).await?;
     let created = engine.create_share(folder.path(), vec![]).await?;
 
+    let _seed = common::SecretGuard::new(&created.share_id);
     assert_eq!(
         status(&engine, &created.share_id),
         "Healthy",

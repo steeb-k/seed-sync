@@ -130,6 +130,7 @@ async fn three_masters() -> anyhow::Result<(
         engines.push(e);
     }
     let created = engines[0].create_share(folders[0].path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let bootstrap = engines[0].endpoint_addr();
     for i in 1..3 {
         let id = engines[i]

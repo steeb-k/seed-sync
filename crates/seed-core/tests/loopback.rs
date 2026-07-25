@@ -6,6 +6,8 @@
 //! `#[ignore]` because it opens real iroh endpoints; run with:
 //!   cargo test -p seed-core --test loopback -- --ignored --nocapture
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -103,6 +105,7 @@ async fn master_viewer_mirror_lifecycle() -> anyhow::Result<()> {
     std::fs::write(a_folder.path().join("bin/tool.sh"), b"#!/bin/sh\necho hi\n")?;
 
     let created = master.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let master_addr = master.endpoint_addr();
 
     // Viewer joins with the read-only key, bootstrapped to the master's addr.
@@ -179,6 +182,7 @@ async fn viewer_honors_replicated_ignore_list() -> anyhow::Result<()> {
     let created = master
         .create_share(a_folder.path(), vec!["*.log".to_string()])
         .await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let master_addr = master.endpoint_addr();
     let share_id = viewer
         .add_share(&created.viewer_key, b_folder.path(), vec![master_addr])
@@ -264,6 +268,7 @@ async fn empty_files_sync() -> anyhow::Result<()> {
     std::fs::write(a_folder.path().join("readme.txt"), b"hello")?;
 
     let created = master.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let master_addr = master.endpoint_addr();
     let share_id = viewer
         .add_share(&created.viewer_key, b_folder.path(), vec![master_addr])
@@ -317,6 +322,7 @@ async fn viewer_stores_by_reference_not_copy() -> anyhow::Result<()> {
     std::fs::write(a_folder.path().join("big.bin"), &big)?;
 
     let created = master.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let master_addr = master.endpoint_addr();
     let share_id = viewer
         .add_share(&created.viewer_key, b_folder.path(), vec![master_addr])
@@ -370,6 +376,7 @@ async fn viewer_auto_heals_corrupted_file() -> anyhow::Result<()> {
     let content = gen_bytes(300_000);
     std::fs::write(a_folder.path().join("data.bin"), &content)?;
     let created = master.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let master_addr = master.endpoint_addr();
     let share_id = viewer
         .add_share(&created.viewer_key, b_folder.path(), vec![master_addr])
@@ -426,6 +433,7 @@ async fn referenced_viewer_serves_peers() -> anyhow::Result<()> {
     std::fs::write(a_folder.path().join("payload.bin"), &content)?;
     let created = master.create_share(a_folder.path(), vec![]).await?;
 
+    let _seed = common::SecretGuard::new(&created.share_id);
     // viewer1 syncs from the master and references the file.
     let share_id = viewer1
         .add_share(
@@ -509,6 +517,7 @@ async fn second_viewer_sources_from_peer_not_master() -> anyhow::Result<()> {
     let content = gen_bytes(4 * 1024 * 1024);
     std::fs::write(a_folder.path().join("payload.bin"), &content)?;
     let created = master.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let master_addr = master.endpoint_addr();
 
     // viewer1 joins (bootstrapped to the master) and syncs the file: the master
@@ -610,6 +619,7 @@ async fn large_blob_swarms_across_two_seeders() -> anyhow::Result<()> {
     let content = gen_bytes(8 * 1024 * 1024);
     std::fs::write(a_folder.path().join("disk.iso"), &content)?;
     let created = master.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let master_addr = master.endpoint_addr();
     let want = snapshot(a_folder.path());
 
@@ -721,6 +731,7 @@ async fn health_reflects_incomplete_master() -> anyhow::Result<()> {
     std::fs::write(a_folder.path().join("big.bin"), &content)?;
     let created = a.create_share(a_folder.path(), vec![]).await?;
 
+    let _seed = common::SecretGuard::new(&created.share_id);
     // Source master holds all content → 100% (computed from completeness, not a
     // hardcoded master=100).
     let a_pct = a
@@ -805,6 +816,7 @@ async fn cold_start_relief_spreads_master_load() -> anyhow::Result<()> {
     let content = gen_bytes(8 * 1024 * 1024);
     std::fs::write(a_folder.path().join("disk.iso"), &content)?;
     let created = master.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let m = master.endpoint_addr();
     let want = snapshot(a_folder.path());
 
@@ -939,6 +951,7 @@ async fn locked_files_do_not_block_share_and_sync_after_unlock() -> anyhow::Resu
     }
 
     let created = master.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let share_id = viewer
         .add_share(
             &created.viewer_key,
@@ -1063,6 +1076,7 @@ async fn health_reports_partial_progress_during_download() -> anyhow::Result<()>
     let content = gen_bytes(32 * 1024 * 1024);
     std::fs::write(a_folder.path().join("big.bin"), &content)?;
     let created = master.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let share_id = viewer
         .add_share(
             &created.viewer_key,
@@ -1147,6 +1161,7 @@ async fn pausing_a_share_stops_in_flight_download() -> anyhow::Result<()> {
     let content = gen_bytes(256 * 1024 * 1024);
     std::fs::write(a_folder.path().join("big.bin"), &content)?;
     let created = master.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let share_id = viewer
         .add_share(
             &created.viewer_key,
@@ -1269,6 +1284,7 @@ async fn two_masters_converge_bidirectionally() -> anyhow::Result<()> {
     // A creates the share with one file.
     std::fs::write(a_folder.path().join("a.txt"), b"from A")?;
     let created = a.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let a_addr = a.endpoint_addr();
 
     // B joins with the **master** key (becomes a co-master), bootstrapped to A, and
@@ -1400,6 +1416,7 @@ async fn agreeing_masters_share_fingerprint_and_never_out_of_sync() -> anyhow::R
 
     std::fs::write(a_folder.path().join("a.txt"), b"from A")?;
     let created = a.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let a_addr = a.endpoint_addr();
     let share_id = b
         .add_share(&created.master_key, b_folder.path(), vec![a_addr])
@@ -1523,6 +1540,7 @@ async fn deep_verify_heals_corruption_a_normal_reconcile_misses() -> anyhow::Res
     let good = gen_bytes(4096);
     std::fs::write(a_folder.path().join("x.bin"), &good)?;
     let created = master.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let share_id = viewer
         .add_share(
             &created.viewer_key,
@@ -1598,6 +1616,7 @@ async fn doc_resync_does_not_break_replication() -> anyhow::Result<()> {
 
     std::fs::write(a_folder.path().join("a.txt"), b"from A")?;
     let created = a.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let a_addr = a.endpoint_addr();
     let share_id = b
         .add_share(&created.master_key, b_folder.path(), vec![a_addr])

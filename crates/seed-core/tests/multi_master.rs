@@ -431,6 +431,8 @@ async fn no_rescan_thrash_while_out_of_sync() -> anyhow::Result<()> {
 async fn delete_survives_unseen_master_copy() -> anyhow::Result<()> {
     use seed_core::Engine;
 
+    common::init_tracing();
+
     let a_data = tempfile::tempdir()?;
     let b_data = tempfile::tempdir()?;
     let a_folder = tempfile::tempdir()?;
@@ -447,6 +449,7 @@ async fn delete_survives_unseen_master_copy() -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("A endpoint never came online"))?;
     let created = a.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let share_id = created.share_id.clone();
     a.reconcile(&share_id).await?;
 
@@ -472,12 +475,41 @@ async fn delete_survives_unseen_master_copy() -> anyhow::Result<()> {
     assert_eq!(share_id_b, share_id);
 
     // Drive both until B honors the delete: X gone on BOTH, Y intact on both.
+    //
+    // Reconcile errors are reported, not discarded: this loop used to `let _ =`
+    // them, so when it hung the *reason* was invisible and the only output was
+    // the assertion below. A wedged doc read in particular surfaces here as an
+    // error after `DOC_READ_TIMEOUT_SECS` (120s) — the same budget as this
+    // timeout, so it would otherwise expire silently at the same moment.
+    let started = std::time::Instant::now();
+    let mut last_a_err = String::new();
+    let mut last_b_err = String::new();
+    let mut passes: u32 = 0;
     let deadline = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
-            let _ = a.reconcile(&share_id).await;
-            let _ = b.reconcile(&share_id).await;
-            let x_gone =
-                !a_folder.path().join("x.bin").exists() && !b_folder.path().join("x.bin").exists();
+            if let Err(e) = a.reconcile(&share_id).await {
+                let s = format!("{e:#}");
+                if s != last_a_err {
+                    println!(
+                        "  [{:>5.1}s] A reconcile error: {s}",
+                        started.elapsed().as_secs_f32()
+                    );
+                    last_a_err = s;
+                }
+            }
+            if let Err(e) = b.reconcile(&share_id).await {
+                let s = format!("{e:#}");
+                if s != last_b_err {
+                    println!(
+                        "  [{:>5.1}s] B reconcile error: {s}",
+                        started.elapsed().as_secs_f32()
+                    );
+                    last_b_err = s;
+                }
+            }
+            let a_x = a_folder.path().join("x.bin").exists();
+            let b_x = b_folder.path().join("x.bin").exists();
+            let x_gone = !a_x && !b_x;
             let y_ok = std::fs::read(a_folder.path().join("y.bin")).ok().as_deref()
                 == Some(&y_bytes[..])
                 && std::fs::read(b_folder.path().join("y.bin")).ok().as_deref()
@@ -485,15 +517,36 @@ async fn delete_survives_unseen_master_copy() -> anyhow::Result<()> {
             if x_gone && y_ok {
                 return;
             }
+            passes += 1;
+            // Heartbeat every ~5s so a hang shows whether passes are still
+            // running (and what each side sees) versus wedged inside reconcile.
+            if passes % 20 == 0 {
+                println!(
+                    "  [{:>5.1}s] pass {passes}: A.x={a_x} B.x={b_x} y_ok={y_ok}",
+                    started.elapsed().as_secs_f32()
+                );
+            }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     })
     .await;
     assert!(
         deadline.is_ok(),
-        "delete did not survive B's unseen copy: A has x.bin={}, B has x.bin={}",
+        "delete did not survive B's unseen copy after {passes} passes in {:.1}s: \
+         A has x.bin={}, B has x.bin={} (last A err: {}; last B err: {})",
+        started.elapsed().as_secs_f32(),
         a_folder.path().join("x.bin").exists(),
         b_folder.path().join("x.bin").exists(),
+        if last_a_err.is_empty() {
+            "none"
+        } else {
+            &last_a_err
+        },
+        if last_b_err.is_empty() {
+            "none"
+        } else {
+            &last_b_err
+        },
     );
     println!("tombstone beat the unseen copy (X deleted on both, Y intact)");
 
@@ -550,6 +603,7 @@ async fn replaced_file_survives_stale_mtime() -> anyhow::Result<()> {
         .await
         .map_err(|_| anyhow::anyhow!("A endpoint never came online"))?;
     let created = a.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let share_id = created.share_id.clone();
     a.reconcile(&share_id).await?; // publish v1
 

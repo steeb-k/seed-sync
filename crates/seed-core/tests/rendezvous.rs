@@ -11,6 +11,8 @@
 //! `#[ignore]` twice over: it opens real iroh endpoints *and* requires internet.
 //!   cargo test -p seed-core --test rendezvous -- --ignored --nocapture
 
+mod common;
+
 use seed_core::identity::ShareKey;
 use seed_core::{rendezvous, Engine};
 
@@ -118,6 +120,7 @@ async fn a_master_resolving_its_own_record_does_not_become_its_own_peer() -> any
 
     let mut a = Engine::new(a_data.path()).await?;
     let created = a.create_share(a_folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let share_id = created.share_id.clone();
     let a_addr = a.endpoint_addr();
 
@@ -210,6 +213,7 @@ async fn joiner_with_a_dead_creator_still_syncs_via_rendezvous() -> anyhow::Resu
 
     let created = live_master.create_share(a_folder.path(), vec![]).await?;
 
+    let _seed = common::SecretGuard::new(&created.share_id);
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while live_master.endpoint_addr().addrs.is_empty() {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;

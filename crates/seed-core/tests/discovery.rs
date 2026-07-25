@@ -4,6 +4,8 @@
 //! `#[ignore]` — needs real network reachability to n0 discovery and some
 //! propagation time; run with `-- --ignored`.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -53,6 +55,7 @@ async fn viewer_joins_via_discovery_without_bootstrap() -> anyhow::Result<()> {
     .map_err(|_| anyhow::anyhow!("not online"))?;
 
     let created = master.create_share(&m_folder, vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     // Give discovery a moment to publish the master's record.
     tokio::time::sleep(Duration::from_secs(3)).await;
 

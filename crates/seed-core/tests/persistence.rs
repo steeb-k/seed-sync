@@ -4,6 +4,8 @@
 //!
 //! `#[ignore]` (opens real iroh endpoints); run with `-- --ignored`.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -68,6 +70,9 @@ async fn master_keeps_write_capability_after_restart() -> anyhow::Result<()> {
         m.shutdown().await?;
         (c.share_id, c.master_key)
     };
+    // Outside the block on purpose: the whole point of this test is that the
+    // seed survives the restart below, so the guard must outlive it.
+    let _seed = common::SecretGuard::new(&share_id);
 
     // Restart on the same data dir.
     let mut m2 = Engine::new(&data).await?;
@@ -123,6 +128,9 @@ async fn viewer_restores_from_local_store_after_restart() -> anyhow::Result<()> 
         master.shutdown().await?;
         viewer.shutdown().await?;
     }
+    // `vid` is the share id (master and viewer share one). Guard at function
+    // scope so the master's seed outlives the restarts below.
+    let _seed = common::SecretGuard::new(&vid);
 
     // Simulate the viewer's files being lost while it was down.
     for entry in std::fs::read_dir(&v_folder)? {

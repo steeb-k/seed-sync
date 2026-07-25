@@ -5,6 +5,8 @@
 //!
 //! `#[ignore]` (opens real iroh endpoints); run with `-- --ignored`.
 
+mod common;
+
 use std::time::Duration;
 
 use seed_core::Engine;
@@ -56,6 +58,7 @@ async fn member_names_survive_offline_masters_and_restarts() -> anyhow::Result<(
     bob.set_device_name("bob")?;
 
     let created = alice.create_share(&a_folder, vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let share = created.share_id.clone();
     let alice_addr = alice.endpoint_addr();
     let share_b = bob

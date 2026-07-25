@@ -9,6 +9,8 @@
 //!
 //! `#[ignore]` (opens a real iroh endpoint); run with `-- --ignored`.
 
+mod common;
+
 use std::time::Duration;
 
 use seed_core::Engine;
@@ -34,6 +36,7 @@ async fn gc_live_set_tracks_live_blobs_and_releases_a_removed_share() -> anyhow:
         std::fs::write(folder.path().join(name), body)?;
     }
     let created = engine.create_share(folder.path(), vec![]).await?;
+    let _seed = common::SecretGuard::new(&created.share_id);
     let share = created.share_id.clone();
 
     // A refreshed live set must protect every referenced content blob. Drive a few
