@@ -15,9 +15,9 @@ Current state (verified 2026-07-24):
 
 | Crate | Version | Hunks | Issue | Upstream status |
 |-------|---------|-------|-------|-----------------|
-| `iroh` | 1.0.3 | 1 | known-issues #9 | **reported**, [iroh#4390](https://github.com/n0-computer/iroh/issues/4390) — open |
-| `iroh-blobs` | 0.103.0 | 2 | known-issues #25, #9 | not reported |
-| `iroh-docs` | 0.101.0 | 2 | known-issues #5 | not reported |
+| `iroh` | 1.0.3 | 1 | known-issues #9 | tracked as [iroh#4390](https://github.com/n0-computer/iroh/issues/4390) — open |
+| `iroh-blobs` | 0.103.0 | 2 | known-issues #25, #9 | unfixed on `main` |
+| `iroh-docs` | 0.101.0 | 2 | known-issues #5 | unfixed on `main` |
 
 Issue numbers are the **current** `docs/known-issues.md` numbering. That doc was
 renumbered at some point and older source comments still cite the pre-renumber
@@ -49,7 +49,7 @@ This is deliberately the **same shape as the fix proposed in
 [iroh#4390](https://github.com/n0-computer/iroh/issues/4390)**, so the hunk drops
 out cleanly once upstream merges it.
 
-**Status:** reported upstream by another operator hitting the identical stack
+**Status:** filed upstream by another operator hitting the identical stack
 (their evidence: a single ~24 GB allocation on macOS, same backtrace). Introduced
 in iroh 1.0.0 by [iroh#4296](https://github.com/n0-computer/iroh/pull/4296).
 **Open as of 1.0.3.** Re-check that issue on every iroh bump — this is the one
@@ -75,7 +75,7 @@ redundant owned `.data` is then reclaimed by `seed-core`'s reclaim-retry queue
 
 Inert on Linux/macOS (they hit 18, already handled).
 
-**Status:** still unfixed on upstream `main`; not reported.
+**Status:** still unfixed on upstream `main` (re-check before re-vendoring).
 
 ## iroh-blobs 0.103.0 — bounded provider accept loop (hunk 2 of 2)
 
@@ -89,7 +89,7 @@ semaphore permit for each in-flight stream so QUIC flow control pushes back
 instead of the node buffering without limit. 16 matches one full swarm's part
 fan-out on the requesting side.
 
-**Status:** still unfixed on upstream `main`; not reported.
+**Status:** still unfixed on upstream `main` (re-check before re-vendoring).
 
 ## iroh-docs 0.101.0 — sync-actor / LiveActor deadlock (2 hunks)
 
@@ -111,7 +111,7 @@ See known-issues #5 — 10 of 28 fleet nodes wedged before the fix, 0 after.
 The app keeps a backstop regardless: `DOC_READ_TIMEOUT_SECS = 120` in
 `seed-core`, so a future actor stall degrades instead of wedging.
 
-**Status:** still unfixed on upstream `main`; not reported.
+**Status:** still unfixed on upstream `main` (re-check before re-vendoring).
 
 ---
 

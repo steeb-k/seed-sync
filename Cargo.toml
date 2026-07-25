@@ -98,15 +98,13 @@ strip = true
 #    move, so on Windows (ERROR_NOT_SAME_DEVICE, 17) a viewer whose mirror is on a
 #    different drive than its data dir failed the reference export and kept a
 #    second full copy. The patch adds the Windows code so the export falls back to
-#    copy + sets External there too. Still unfixed on upstream main (2026-07-24);
-#    NOT reported upstream yet.
+#    copy + sets External there too. Still unfixed on upstream main (2026-07-24).
 # 2. Bounded provider accept loop (known-issues #9, defense-in-depth): upstream
 #    spawns one detached task per inbound request stream with no cap, so a
 #    fleet's swarm retry storm piles unbounded stream tasks + send buffers onto a
 #    serving node (soak-observed OOM aborts). The patch holds a semaphore permit
 #    per in-flight stream (16/connection) so QUIC flow control pushes back
-#    instead. Still unfixed on upstream main (2026-07-24); NOT reported upstream
-#    yet.
+#    instead. Still unfixed on upstream main (2026-07-24).
 #
 # Vendored, one-hunk-patched iroh 1.0.3 (see vendor/iroh, known-issues #9):
 # upstream's per-remote path-open retry queue (`pending_open_paths`,
@@ -118,10 +116,10 @@ strip = true
 # died on the deque's doubling realloc (single 5-80 GiB allocation failures).
 # The patch dedups the queue and caps it at 64 entries, in the same shape as the
 # fix proposed upstream so it drops out cleanly when that merges.
-# Reported upstream (independently, by another fleet):
+# Tracked upstream (filed independently by another fleet):
 # https://github.com/n0-computer/iroh/issues/4390 — OPEN as of iroh 1.0.3
 # (2026-07-20); introduced in 1.0.0 by n0-computer/iroh#4296. Re-check that
-# issue on every iroh bump.
+# issue on every iroh bump — it is the one hunk with a path to deletion.
 #
 # Vendored, two-hunk-patched iroh-docs 0.101.0 (see vendor/iroh-docs,
 # known-issues #5): the single-threaded docs sync actor deadlocked
@@ -132,8 +130,7 @@ strip = true
 # (live.rs run loop). Under a divergence-driven sync-report storm this froze
 # the actor permanently; every doc read (get_one/get_many/open/subscribe)
 # queued behind it forever. Patches: try_send (drop event on full) + fair
-# polling. Still unfixed on upstream main (2026-07-24); NOT reported upstream
-# yet.
+# polling. Still unfixed on upstream main (2026-07-24).
 [patch.crates-io]
 iroh-blobs = { path = "vendor/iroh-blobs" }
 iroh = { path = "vendor/iroh" }

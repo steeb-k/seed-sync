@@ -38,10 +38,12 @@ why, and the fix or current disposition.
 
 Three vendored crates carry upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
 `vendor/iroh-docs` — see `vendor/README.md` for the per-hunk detail and the
-re-vendor checklist, and `[patch.crates-io]` in the workspace `Cargo.toml`). Of
-those five hunks only #9's is reported upstream ([iroh#4390](https://github.com/n0-computer/iroh/issues/4390),
-open); the other four are still unreported and unfixed on upstream `main`. The
-divergence-detection design lives in `divergence-detection.md`.
+re-vendor checklist, and `[patch.crates-io]` in the workspace `Cargo.toml`). All
+five hunks are still needed: four are unfixed on upstream `main`, and the fifth
+(#9's) is tracked as [iroh#4390](https://github.com/n0-computer/iroh/issues/4390),
+still open. **Before re-vendoring at a new version, re-check each patch site
+upstream** — a hunk that has been fixed there should be dropped, not carried
+forward. The divergence-detection design lives in `divergence-detection.md`.
 
 **Numbering caveat:** this doc was renumbered. Source comments and some
 `Cargo.toml` history cite the pre-renumber ids — notably #11 for what is now #9
