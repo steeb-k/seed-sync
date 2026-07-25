@@ -227,7 +227,11 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
         std::fs::create_dir_all(&folder)?;
         let sock = dir.join("sock");
         let mut spawn = DaemonSpawn::new(&a.daemon_bin, dir.join("data"), &sock)
-            .rust_log("seed_daemon=info,seed_core=info")
+            // `iroh_blobs::store::gc` at debug is two lines per sweep per daemon
+            // (hourly), which is free at this volume and makes the GC pass visible
+            // in the timeline. A soak whose run window straddles a sweep otherwise
+            // shows an unexplained fleet-wide health dip with nothing in the logs.
+            .rust_log("seed_daemon=info,seed_core=info,iroh_blobs::store::gc=debug")
             .log_to(dir.join("daemon.log"));
         if let Some(hs) = &a.health_secs {
             let (u, r) = hs
