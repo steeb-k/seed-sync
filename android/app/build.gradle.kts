@@ -28,8 +28,8 @@ android {
         targetSdk = 35
         // versionCode scheme: MAJOR*10000 + MINOR*100 + PATCH (so 1.2.0 -> 10200),
         // monotonic and decodable. versionName tracks the workspace version.
-        versionCode = 610
-        versionName = "0.6.10"
+        versionCode = 700
+        versionName = "0.7.0"
     }
 
     signingConfigs {
