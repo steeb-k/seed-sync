@@ -50,6 +50,7 @@ tier 0.
 | `resume` | download resume across suspend/restart |
 | `gc` | blob-store GC against a replica-derived live set |
 | `tombstone_race` | a master that joins holding a copy of a deleted file must not resurrect the delete, even when it reconciles before its replica syncs (known-issues #10) |
+| `health_quiesce` | a quiet fleet whose folders are correct must *say* 100% — health may not dock a file whose bytes are right on disk just because the index lagged (known-issues #33) |
 | `persistence` / `keystore` | state survives restart; locked-keystore behaviour |
 | `seed-daemon/loopback_ipc`, `health_ipc` | the same through the real IPC surface the GUI uses |
 
@@ -126,6 +127,46 @@ convincingly like "the box is broken" rather than "we leaked". Bind
 `Cluster` carries one already. It is a `Drop` guard on purpose — red runs are exactly
 when tests leak, so cleanup must survive a panic.
 
+**A signal you have to warn people about is a broken signal.** This document used
+to open its soak section with "do not trust a soak's headline verdict on its own",
+because every long run reported `FAIL` while mirroring all 28 folders perfectly.
+Documenting that a signal lies is not a mitigation — it trains everyone to discount
+the one number the harness exists to produce, and the next real failure gets
+discounted with it. Fix the signal. (Here: grade data and status separately.)
+
+**Instrument the failure; do not correlate timestamps.** Known-issues #33 got
+attributed to the hourly GC sweep because a health drop sat near one in the
+timeline — with the sweep's anchor read wrong by 56 seconds — and that reached a
+known-issues entry *and* a published release note unchallenged. It was then
+*exonerated* on the corrected gap, which was worse: the drop at t+3544 really is a
+different fault, but a second drop at t+3784 was the sweep, deleting live content
+blobs. Two faults, one symptom, and the timeline could not tell them apart because
+the samples recorded *that* a node was short and never *why*. One `debug!` naming
+the outstanding paths and their failing predicate settled in a single run what two
+soak cycles of timeline-staring had not — and the decisive evidence was a 168 ms
+gap between `deleted 213 blobs` and the first `in_store=false`.
+
+**Beware the true-but-irrelevant argument.** The exoneration leaned on a fact that
+is entirely correct — GC's live set comes from `Query::all()`, a superset of the
+`single_latest_per_key` view health uses, so a sweep cannot delete a hash health
+counts. It constrains what a refresh *contains*. The bug was in how *old* a refresh
+is. A sound sub-argument about the wrong axis will carry a conclusion further than
+a wrong one, because it survives checking.
+
+**Check a real share before writing a known-issue.** The definitive control for
+"every device drops to 98% after an hour" was a live share on the same build, one
+CLI call away: it had been `Healthy 100%` for four hours across four GC sweeps. The
+maintainer's "I've never seen this on an actual share" was better evidence than
+either soak, and it only entered the investigation because they volunteered it.
+Field state is a data source; use it.
+
+**Identical repeat runs are one sample, not two.** Two soaks agreeing to the byte
+(`externally_protected=1054`, `deleted 213`) read as powerful reproduction and were
+cited as proof of a systematic cause. Everything the harness generates derives from
+one seed, so they had explored exactly one interleaving — repeatability, not
+coverage. Keep the default seed for regressions; pass `--seed` to widen coverage
+(the value used is recorded in every report).
+
 **A load-dependent failure is a race, not a flake.** The same bug reproduced 4/4
 under the full gate and passed standalone, which is exactly what "one side wins a
 race more often when the box is busy" looks like. Before muting anything, reach for
@@ -159,12 +200,29 @@ drivers; `seed-soak` is the runner. Multi-GB and fleet-scale runs are what surfa
 known-issues #5–#9. Notes on running soaks on the maintainer box (disk class matters
 for the numbers) are in the maintainer's own notes, not here.
 
-**Do not trust a soak's headline verdict on its own — read the convergence section
-too.** Known-issues #33 is open: the hourly GC sweep (`GC_INTERVAL_SECS = 3600`)
-drops every node to `Syncing 98%` on the next health sample and it never recovers,
-so *any* run longer than about an hour fails on `all nodes Healthy at end: false`
-no matter how well it went. A run that reports FAIL but lists every node
-`byte-identical ✓` with no anomalies has almost certainly hit this and nothing else.
-Two full soaks were spent proving that once. The `iroh_blobs::store::gc=debug` line
-in `seed-soak` puts the sweep in the timeline so the correlation is visible rather
-than inferred.
+**The verdict grades data and status separately.** A run reports
+
+```
+- verdict: **FAIL (status only) — every folder verified byte-identical, but the
+  fleet will not report Healthy...**
+- data: all folders byte-identical ✓; status: not all nodes Healthy ✗
+- quiescence: last write t+4024s → 176s quiet before window close, then 600s of
+  convergence wait (776s total idle)
+```
+
+so a status-line fault can never again be read as a data-loss story, or vice versa.
+`FAIL (data)` is the serious one; `FAIL (status only)` means every byte is where it
+belongs and the app is lying about it — still a real bug (see below), just not one
+that risks anybody's files.
+
+When a run ends short of Healthy the report grows a **Nodes not Healthy at end**
+section naming each node, its percent, and the last `seed_core::health` line it
+logged — the paths it was still counting against itself and which predicate failed
+for each (`indexed` / `in_store` / `local`). A node below 100% that logged *no*
+shortfall is itself the finding: its percent is not missing content at all, and the
+answer is in `list_summaries` (a node holding every byte is deliberately capped at
+99% while an online peer advertises a different manifest fingerprint).
+
+**Quiescence is the context every status verdict needs.** A fleet still being
+written to is *expected* to dip below 100%; only a quiet one owes a straight
+answer. The report states how long the fleet was actually left alone.

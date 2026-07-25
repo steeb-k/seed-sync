@@ -28,6 +28,21 @@ use seed_harness::proc::{request, wait_for_socket, DaemonSpawn, Daemons};
 use seed_ipc::transport::{self, read_frame, write_frame};
 use seed_ipc::{Frame, IpcEvent, IpcRequest, IpcResponse, Message};
 
+/// The most recent `seed_core::health` line from a node's log: the paths that node
+/// was still counting against itself, and which predicate failed for each.
+///
+/// Depends on `seed_core::health=debug` being in the daemon's `RUST_LOG` (set in
+/// the spawn below). `None` from a node that is *not* reporting 100% is itself the
+/// finding — it means the shortfall is not missing content at all, so the answer is
+/// in `list_summaries`, not in the byte accounting.
+fn last_health_diagnostic(dir: &Path) -> Option<String> {
+    let log = std::fs::read_to_string(dir.join("daemon.log")).ok()?;
+    log.lines()
+        .rev()
+        .find(|l| l.contains("path(s) outstanding"))
+        .map(|l| l.trim().to_string())
+}
+
 #[derive(Parser)]
 #[command(name = "seed-soak", version, about)]
 struct Cli {
@@ -83,6 +98,14 @@ struct RunArgs {
     /// Poll/sample interval, seconds.
     #[arg(long, default_value_t = 30)]
     interval: u64,
+    /// Override the corpus/churn seed. Everything the harness generates derives
+    /// from it, so the default makes runs byte-for-byte repeatable — which is what
+    /// you want for a regression, and a trap otherwise: two runs agreeing exactly
+    /// look like strong reproduction when they have in fact explored a single
+    /// interleaving. Vary this to widen coverage; the chosen seed is recorded in
+    /// the report so any run can be replayed.
+    #[arg(long)]
+    seed: Option<u64>,
     /// Alternate working root for the LAST `--alt-nodes` nodes (split-disk A/B:
     /// e.g. seeder + most nodes on an SSD root, the tail nodes on an HDD root,
     /// so per-node rates in the SAME run compare disk classes with identical
@@ -183,6 +206,10 @@ struct NodeHandle {
 }
 
 async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
+    let mut spec = spec;
+    if let Some(s) = a.seed {
+        spec.seed = s;
+    }
     let viewers = a.viewers.unwrap_or(0);
     let total = a.masters + viewers;
     let root = a.root.clone();
@@ -231,7 +258,16 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
             // (hourly), which is free at this volume and makes the GC pass visible
             // in the timeline. A soak whose run window straddles a sweep otherwise
             // shows an unexplained fleet-wide health dip with nothing in the logs.
-            .rust_log("seed_daemon=info,seed_core=info,iroh_blobs::store::gc=debug")
+            //
+            // `seed_core::health` at debug names the paths behind any percent below
+            // 100, and only prints when there are some — so it is silent on a healthy
+            // run and is the entire diagnosis on a run that ends short of 100%
+            // (known-issues #33). Its own target precisely so it doesn't require
+            // `seed_core=debug`, which at 28 daemons buries it.
+            .rust_log(
+                "seed_daemon=info,seed_core=info,seed_core::health=debug,\
+                 iroh_blobs::store::gc=debug",
+            )
             .log_to(dir.join("daemon.log"));
         if let Some(hs) = &a.health_secs {
             let (u, r) = hs
@@ -384,6 +420,11 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
     let mut out_of_sync_since: BTreeMap<usize, u64> = BTreeMap::new();
     let mut hot_since: BTreeMap<usize, u64> = BTreeMap::new();
     let mut churn_round: u64 = 0;
+    // Elapsed seconds of the most recent write into any folder, so the report can
+    // state how long the fleet had actually been left alone. A fleet still being
+    // written to is *expected* to read below 100%; only a quiet one owes a straight
+    // answer, and that distinction was missing entirely.
+    let mut last_churn_elapsed: u64 = 0;
     let mut last_churn = Instant::now();
     let mut degraded_done = false;
     let mut resumed_done = false;
@@ -478,6 +519,7 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
                 && elapsed + CHURN_QUIET_TAIL_SECS < a.duration
             {
                 last_churn = Instant::now();
+                last_churn_elapsed = elapsed;
                 let m = (churn_round as usize) % a.masters;
                 match corpus::mutate(&nodes[m].folder, &mut manifest, spec.seed, churn_round, 0.02)
                 {
@@ -633,18 +675,24 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
     // --- final convergence check ---
     println!("run window over — waiting up to 10 min for full convergence, then verifying bytes…");
     let deadline = Instant::now() + Duration::from_secs(600);
+    let wait_started = Instant::now();
     let mut all_healthy = false;
+    // Last (status, percent) seen per node. A status failure used to be a bare
+    // boolean, which is why two soak cycles went into guessing *which* nodes were
+    // short and why; now the report can name them.
+    let mut final_state: Vec<(String, u8)> = vec![("unknown".to_string(), 0); total];
     while Instant::now() < deadline && !interrupted {
         let mut healthy = 0;
-        for n in &nodes {
+        for (i, n) in nodes.iter().enumerate() {
             if let Ok(IpcResponse::Shares(shares)) =
                 request_bounded(&n.sock, IpcRequest::ListShares).await
             {
-                if shares
-                    .iter()
-                    .any(|s| s.share_id == share_id && format!("{:?}", s.status) == "Healthy")
-                {
-                    healthy += 1;
+                if let Some(s) = shares.iter().find(|s| s.share_id == share_id) {
+                    let st = format!("{:?}", s.status);
+                    if st == "Healthy" {
+                        healthy += 1;
+                    }
+                    final_state[i] = (st, s.percent);
                 }
             }
         }
@@ -654,6 +702,7 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
     }
+    let convergence_wait_secs = wait_started.elapsed().as_secs();
     // The sub-second race has an arbitrary but fleet-consistent winner: pin the
     // expected content to whatever node-00 settled on before verifying everyone.
     if conflict_done {
@@ -695,15 +744,26 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
     }
 
     // --- report ---
+    // DATA and STATUS are graded separately, and the verdict says which failed.
+    // Folding them together produced runs headlined `FAIL` whose every node was
+    // byte-identical — a status-line fault wearing a data-loss costume. That cost
+    // two full soak cycles and a wrong "known issue" in a shipped release note, and
+    // `docs/testing.md` ended up *documenting that the verdict lies* rather than
+    // fixing it. A run that mirrors every byte correctly must never read the same
+    // as one that lost data.
+    let data_ok = verify_lines.iter().all(|l| l.ends_with('✓'));
+    let status_ok = all_healthy;
     let verdict = if interrupted {
         "INTERRUPTED (no verdict)"
-    } else if all_healthy && verify_lines.iter().all(|l| l.ends_with('✓')) && anomalies.is_empty()
-    {
-        "PASS"
-    } else if all_healthy && verify_lines.iter().all(|l| l.ends_with('✓')) {
+    } else if !data_ok {
+        "FAIL (data) — folders differ; this is the serious one"
+    } else if !status_ok {
+        "FAIL (status only) — every folder verified byte-identical, but the fleet \
+         will not report Healthy. No data is at risk; see 'Nodes not Healthy at end'"
+    } else if !anomalies.is_empty() {
         "PASS with anomalies (see timeline)"
     } else {
-        "FAIL"
+        "PASS"
     };
     let mut report = String::new();
     let _ = writeln!(report, "# seed-soak {kind} report ({start_unix})\n");
@@ -721,6 +781,18 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
         "- scenarios: churn={:?} degrade_viewer={:?} conflict={} health_secs={:?}",
         a.churn, a.degrade_viewer, a.conflict, a.health_secs
     );
+    // Recorded so any run can be replayed exactly — and so two reports agreeing
+    // are visibly the *same* interleaving rather than independent confirmation.
+    let _ = writeln!(
+        report,
+        "- seed: 0x{:016X}{}",
+        spec.seed,
+        if a.seed.is_some() {
+            " (overridden via --seed)"
+        } else {
+            " (default)"
+        }
+    );
     if let Some(alt) = &a.alt_root {
         let _ = writeln!(
             report,
@@ -733,11 +805,61 @@ async fn run(a: RunArgs, spec: CorpusSpec, kind: &str) -> anyhow::Result<()> {
     let _ = writeln!(report, "- verdict: **{verdict}**");
     let _ = writeln!(
         report,
-        "- all nodes Healthy at end: {all_healthy}; swarm-deadline log hits: {deadline_retries}\n"
+        "- data: {}; status: {}",
+        if data_ok {
+            "all folders byte-identical ✓"
+        } else {
+            "FOLDERS DIFFER ✗"
+        },
+        if status_ok {
+            "all nodes Healthy ✓"
+        } else {
+            "not all nodes Healthy ✗"
+        }
     );
+    // How long the fleet had been left alone. A fleet that is still being written
+    // to is *expected* to dip below 100%; only a quiet one owes you a straight
+    // answer, so the quiet interval is the context every status verdict needs.
+    let quiet_before_close = a.duration.saturating_sub(last_churn_elapsed);
+    let _ = writeln!(
+        report,
+        "- quiescence: last write t+{last_churn_elapsed}s → {quiet_before_close}s quiet before \
+         window close, then {convergence_wait_secs}s of convergence wait ({}s total idle)",
+        quiet_before_close + convergence_wait_secs
+    );
+    let _ = writeln!(report, "- swarm-deadline log hits: {deadline_retries}\n");
     let _ = writeln!(report, "## Convergence verification\n");
     for l in &verify_lines {
         let _ = writeln!(report, "- {l}");
+    }
+    if !status_ok {
+        // Name the nodes and, where the engine logged one, the paths each was still
+        // counting against itself. Previously the report said only "all nodes Healthy
+        // at end: false" and the diagnosis had to be reconstructed afterwards from
+        // timestamps — which is how the hourly GC sweep got blamed for a drop that
+        // happened 56 seconds before it ran.
+        let _ = writeln!(report, "\n## Nodes not Healthy at end\n");
+        for (i, (st, pct)) in final_state.iter().enumerate() {
+            if st == "Healthy" {
+                continue;
+            }
+            let _ = writeln!(report, "- node-{i:02}: {st} {pct}%");
+            match last_health_diagnostic(&nodes[i].dir) {
+                Some(l) => {
+                    let _ = writeln!(report, "  - last byte shortfall: `{l}`");
+                }
+                None => {
+                    let _ = writeln!(
+                        report,
+                        "  - **no byte shortfall was ever logged** — this percent is not missing \
+                         content. A node holding every byte is still capped below 100% when an \
+                         online peer advertises a different manifest fingerprint (the \
+                         `s.health >= 100` arm of `list_summaries`), so look there, not at \
+                         content accounting."
+                    );
+                }
+            }
+        }
     }
     let _ = writeln!(report, "\n## PeerHealth events (observed on node-00)\n");
     for e in health_events.lock().unwrap().iter() {
