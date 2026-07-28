@@ -18,10 +18,19 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 # turns CI permanently red for something we cannot fix.
 unmaintained = "workspace"
 #
-# THIS LIST IS NOT A COMPLETE INVENTORY OF KNOWN ADVISORIES. It only contains
+# THIS LIST IS NOT A COMPLETE INVENTORY OF KNOWN ADVISORIES, and a green
+# cargo-deny run is not proof that a given advisory is gone. It only contains
 # things that would otherwise FAIL the build. RustSec marks some advisories
 # `informational = "unsound"` (or "notice"), and cargo-deny does not fail on
-# those — so they never appear here even though they are real and open.
+# those — so they never appear here even though they are real and open, and
+# removing one from this list proves nothing because the check passes either
+# way.
+#
+# RUSTSEC-2026-0190 (anyhow), removed below, is one of those: the bump to
+# 1.0.104 was verified by reading the resolved version in Cargo.lock, NOT by
+# the green check. Note also that such advisories can cover several version
+# ranges at once — if a crate appears more than once in Cargo.lock, check every
+# instance, not just the one you bumped.
 #
 # Worked example, because the discrepancy is confusing if you meet it cold:
 # GHSA-wrw7-89jp-8q8g / RUSTSEC-2024-0429 (unsoundness in glib's
@@ -43,10 +52,12 @@ unmaintained = "workspace"
 # list is how each one gets fixed — re-run `cargo deny check advisories`
 # after any dependency bump to see if it can go.
 ignore = [
-    # FIXED and removed, not suppressed — cargo-deny passing without them is the
-    # proof:
-    #   RUSTSEC-2026-0190  anyhow 1.0.102 -> 1.0.104
+    # FIXED and removed, not suppressed:
     #   RUSTSEC-2026-0204  crossbeam-epoch 0.9.18 -> 0.9.20
+    #     a real vulnerability, so cargo-deny passing without it IS proof.
+    #   RUSTSEC-2026-0190  anyhow 1.0.102 -> 1.0.104
+    #     informational, so cargo-deny is NOT proof here — verified by reading
+    #     the resolved version in Cargo.lock instead.
     # quick-xml — NOT APPLICABLE rather than deferred:
     #
     #   0194  quadratic run time on duplicate attribute names
