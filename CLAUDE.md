@@ -85,9 +85,25 @@ environment looks off, `scripts/run-linux.sh` self-checks and points at
   `vendor/iroh-blobs`, a one-line patch for cross-volume export on Windows. See
   the comment in `Cargo.toml` and known-issues #25 before touching it or bumping
   iroh-blobs.
-- **No CI.** All releases are built **locally on each platform's own machine**
-  and published to the public `steeb-k/seed-sync-binaries` repo. The old GitHub
-  Actions workflow was removed. See `docs/releasing.md`.
+- **No releases from CI.** All releases are built **locally on each platform's
+  own machine** and published to the public `steeb-k/seed-sync-binaries` repo.
+  The old release-building Actions workflow was removed and must not come back —
+  no workflow may produce, sign, or upload an artifact. See `docs/releasing.md`.
+- **CI checks, it never ships.** Two workflows run on push + PR, neither
+  emitting an artifact:
+  - `.github/workflows/ci.yml` — `cargo build --workspace --locked
+    --all-targets` then `cargo test --workspace --locked` on ubuntu, installing
+    the same `libgtk-4-dev libadwaita-1-dev libdbus-1-dev` listed above.
+    **This is not the acceptance gate.** Every integration test is `#[ignore]`d
+    (~61 of ~128), so a green run proves the workspace compiles and the unit
+    tests pass — nothing about whether the app actually syncs. That remains
+    `scripts/test-acceptance.{ps1,sh}`, which needs multiple peers and cannot
+    run on a single runner. See `docs/testing.md`.
+  - `.github/workflows/cargo-deny.yml` — supply-chain checks (advisories,
+    licenses, sources). `deny.toml`'s `ignore` list is the open-advisory
+    backlog; removing an entry is how one gets fixed. Note it checks the
+    **vendored** `iroh*` copies as path deps, so advisories filed against the
+    real upstream versions will not match them.
 - **Version** is set once in `[workspace.package]` in `Cargo.toml`.
 - **License:** GPL-3.0-or-later.
 - Match the surrounding code's style; run `cargo fmt` and `cargo clippy` before
