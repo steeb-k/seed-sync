@@ -126,6 +126,18 @@ Self-replacement of `seed-sync` is safe: `apply_tree` writes the new file to a t
   the working tree on every platform, and `package-linux.sh` copies text files through
   `install_text`, which strips CR at package time. To check a built tarball:
   `tar -xzf dist/*.tar.gz -O */seed-sync | head -1 | od -c | head -1`.
+  **`.gitattributes` does not repair a clone that was already CRLF**, and it hides the fact
+  that it hasn't: `text=auto` normalizes on read, so the blobs compare equal and `git status`
+  reports a *clean* tree while the files on disk still have CRLF. A checkout predating the
+  attributes file — or any clone made with `core.autocrlf=true` — therefore stays corrupt
+  until it is re-checked-out: `git rm --cached -r . && git reset --hard` (commit or stash
+  first; this touches every tracked file). Verify with
+  `git ls-files -z | xargs -0 grep -lIU $'\r'` — `android/gradlew.bat` is the only permitted
+  match (a clone predating `.gitattributes` may have it as LF and match nothing). Keep the
+  `-I`: without it the icons, the Gradle jar and the `.xcf` sources match on stray CR bytes
+  and bury the real hits.
+  `install_text` is what actually makes packaging safe from such a tree; prefer it over `cp`
+  for any new text file added to the tarball.
 - **An update must cycle the tray GUI, not just the daemon.** `seed-sync --update`
   restarts `seed-daemon.service`, but the GUI is a plain user process — left alone it
   keeps running the **old binary** against the new daemon indefinitely. `apply_tree`
