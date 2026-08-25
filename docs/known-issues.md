@@ -36,6 +36,7 @@ why, and the fix or current disposition.
 | 31 | the OS keystore is per-user, but the share DB is machine-wide (service↔user split) | design note |
 | 32 | a full OS credential store silently downgrades a master seed to plaintext DB | design note |
 | 33 | the hourly GC sweep drops every node to `Syncing 98%` permanently | **open** (pre-existing; no data impact) |
+| 34 | a removed or paused share keeps reconciling: the in-flight pass writes files, dials peers and stalls every other share | fixed (cancellable passes + hard pass timeout) |
 
 Three vendored crates carry upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
 `vendor/iroh-docs` — see `vendor/README.md` for the per-hunk detail and the
@@ -940,3 +941,92 @@ The maintainer's live share — `Healthy 100%` for four hours across four sweeps
 was the control that showed the published "every device drops to 98% after an hour"
 claim was wrong. A real share is quiescent, so nothing is stored in the 120 s
 before a sweep and nothing is lost. It takes sustained write activity to hit this.
+
+---
+
+## 34. A removed share keeps reconciling — the pass outlives the share
+
+**Where:** `engine::Engine::remove_share` / `engine::ReconcileJob`, and the
+daemon's `reconcile_loop`.
+
+### What actually happens
+
+Remove a share in the GUI. The share disappears from the engine map, its rows are
+deleted from the DB, its seed is deleted from the keystore, and its doc is left.
+`ListShares` returns nothing, so the GUI *and* `seed-cli list` both correctly
+report no shares.
+
+The daemon then keeps syncing that share. It writes files back into the folder
+the user just detached, dials peers for content, and — because the reconcile loop
+is sequential — stalls every *other* share for as long as it runs.
+
+Field report: a share removed at 11:11 was still being reconciled at 11:26, the
+daemon logging one `skip syncing <path> (will retry)` every ~10 s while
+re-materializing a folder the origin member had deleted, with the UI showing zero
+shares throughout. It only stopped when the process was killed.
+
+### Why
+
+A `ReconcileJob` is a **snapshot**. `make_reconcile_job` clones the doc, folder
+path, blob store, downloader, in-flight map and roster into it under the engine
+lock; `run()` is then deliberately executed *off* the lock, so the hashing and
+blob streaming don't freeze IPC. That is the right design, and it is why nothing
+the engine subsequently does to `ShareState` can reach a pass already running:
+
+- dropping `ShareState` doesn't — the job holds its own clones;
+- `doc.leave()` doesn't — it stops live sync on *the state's* handle, not the
+  job's clone, and local reads keep working either way;
+- the `publishing` gate doesn't — it only prevents the *next* job being built.
+
+`remove_share` did none of the three things that would have worked: it never
+raised a cancel signal, never called `cancel_downloads_for_share` (which
+`set_paused` had called for exactly this reason since it was written), and had no
+way to abort the task.
+
+Two things then turned a leak into an unbounded one:
+
+1. The slow-pass watchdog (#5's diagnostic) logged `pass still running after Ns`
+   once a minute and was explicitly *"diagnostic only — the pass is not
+   aborted."* Nothing else bounded a pass, so an unbounded pass was unbounded in
+   practice.
+2. `self_heal_file` re-dialed the same unreachable provider **once per path**,
+   each dial costing up to `SELF_HEAL_DIAL_SECS` (15 s). Against a peer with no
+   addressing information, a folder of N files became N × 15 s of stall — which
+   is why the pass never reached its end and the watchdog never stopped warning.
+
+`set_paused` had the same hole in smaller form: pausing cancelled the downloads
+but left the pass merging, materializing and publishing to the end of its walk.
+`set_paused_all` / `set_sync_suspended` likewise stopped only downloads.
+
+### The fix
+
+- `ShareState` owns an `Arc<AtomicBool>` cancel flag, cloned into every
+  `ReconcileJob` built from it. `run()` checks it at the top of each per-file
+  loop iteration and returns `ReconcileCancelled`, a marker error the daemon
+  logs quietly and — crucially — commits nothing for, so a cancelled pass cannot
+  re-create `sync_index` rows for a share whose rows were just deleted.
+- `remove_share`, `set_paused(true)`, `set_paused_all(true)` and
+  `set_sync_suspended(true)` raise it (and cancel downloads). The flag is cleared
+  in `make_reconcile_job`, which keeps a single invariant — *the flag only ever
+  stops the pass running right now* — instead of a reset on every resume path.
+  Both the setters and the clear run under the engine lock, so a cancel can't be
+  lost to a rebuild race.
+- The watchdog now gives up at `RECONCILE_PASS_HARD_TIMEOUT` (30 min). Abandoning
+  is safe: nothing is committed and the next tick rebuilds the job, redoing the
+  work idempotently. This also bounds the collateral stall on other shares.
+- `self_heal_file` remembers providers that failed to *connect* for the rest of
+  the pass and skips them, so an unreachable peer costs one dial per pass rather
+  than one per file. A provider that connects but can't serve a given blob is not
+  marked dead.
+
+`tests/share_removal.rs` covers it, including a positive control (an untouched
+pass still completes) and a poisoning check (the pass after a resume runs
+normally). With the cancel check disabled, the removal test fails with
+*"a pass whose share was removed ran to completion"* — the production symptom.
+
+### Not fixed here
+
+The folder in the field report was being *resurrected* because this node's
+replica still held those entries and it could not reach the origin to learn about
+the delete — it self-heals what it believes exists. That is #10/#12 territory and
+is unchanged. This entry is only about the removed share continuing to act at all.

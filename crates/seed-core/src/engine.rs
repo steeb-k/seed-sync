@@ -910,6 +910,16 @@ fn select_rejoin_targets<R: Rng>(
     unheard
 }
 
+/// How long a single self-heal dial may take before it is treated as a failure.
+const SELF_HEAL_DIAL_SECS: u64 = 15;
+
+/// Note a provider as unreachable for the remainder of the current reconcile pass.
+fn mark_dead(dead: &StdMutex<HashSet<String>>, pid: EndpointId) {
+    dead.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(pid.to_string());
+}
+
 /// Re-fetch a blob's verified bytes from a peer and atomically rewrite the mirror
 /// file at `target`. Used when a referenced file diverged from its manifest hash
 /// (e.g. a viewer edited it): the local reference is stale and can't self-repair,
@@ -920,26 +930,52 @@ async fn self_heal_file(
     providers: &[EndpointId],
     hash: Hash,
     target: &Path,
+    dead: &StdMutex<HashSet<String>>,
 ) -> anyhow::Result<()> {
     if providers.is_empty() {
         anyhow::bail!("no known providers to repair {}", target.display());
     }
+    // Providers that already failed to *connect* earlier in this same pass are
+    // skipped rather than re-dialed (known-issues #34). Each dial costs up to
+    // SELF_HEAL_DIAL_SECS, and a pass merges one path at a time, so re-dialing a
+    // provider that has no addressing information turns a folder of N files into
+    // N * 15s of pure stall — the fleet-visible symptom being a pass that never
+    // returns while logging "will retry" forever. A provider is marked dead only
+    // on a connect failure: one that connects but can't serve this blob is still
+    // worth trying for the next one.
+    let live: Vec<EndpointId> = {
+        let d = dead.lock().unwrap_or_else(|e| e.into_inner());
+        providers
+            .iter()
+            .copied()
+            .filter(|pid| !d.contains(&pid.to_string()))
+            .collect()
+    };
+    if live.is_empty() {
+        anyhow::bail!(
+            "all {} provider(s) unreachable this pass; repair of {} deferred",
+            providers.len(),
+            target.display()
+        );
+    }
     let mut last_err = None;
-    for &pid in providers {
+    for pid in live {
         // Bound the dial so a self-heal can't hang the whole reconcile pass if a
         // provider is unreachable/stalled (e.g. during a multi-master churn storm).
         let conn = match tokio::time::timeout(
-            Duration::from_secs(15),
+            Duration::from_secs(SELF_HEAL_DIAL_SECS),
             endpoint.connect(EndpointAddr::new(pid), iroh_blobs::ALPN),
         )
         .await
         {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
+                mark_dead(dead, pid);
                 last_err = Some(anyhow!("connect {pid}: {e}"));
                 continue;
             }
             Err(_) => {
+                mark_dead(dead, pid);
                 last_err = Some(anyhow!("connect {pid}: timed out"));
                 continue;
             }
@@ -1633,6 +1669,24 @@ impl ReconcileOutcome {
     }
 }
 
+/// Marker error returned by [`ReconcileJob::run`] when the pass was cancelled
+/// mid-flight because its share was removed or paused (known-issues #34).
+///
+/// It is distinct from a genuine failure so the daemon can log it quietly, and
+/// so the caller commits *nothing*: a cancelled pass must not write index rows
+/// for a share whose DB rows were just deleted, which would resurrect it in
+/// persistence.
+#[derive(Debug)]
+pub struct ReconcileCancelled;
+
+impl std::fmt::Display for ReconcileCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("reconcile pass cancelled (share removed or paused)")
+    }
+}
+
+impl std::error::Error for ReconcileCancelled {}
+
 /// A self-contained unit of reconcile work holding *cloned* iroh handles, so the
 /// heavy part (hashing the folder, streaming blobs in/out) runs with **no engine
 /// lock held**. Produced under a brief lock by [`Engine::make_reconcile_job`] or
@@ -1708,6 +1762,16 @@ pub struct ReconcileJob {
     /// shielded from a sweep that fires before the next live-set refresh sees it
     /// (known-issues #33). See [`GcProtect::note_added`].
     gc_protect: GcProtect,
+    /// Shared with the owning `ShareState`: set when the share is removed or
+    /// paused so this pass stops instead of running to completion against a
+    /// share that no longer exists (known-issues #34). A job is a *snapshot* —
+    /// it clones the doc, folder and store handles and runs off the engine lock —
+    /// so without this flag nothing the engine does can reach a running pass.
+    cancel: Arc<AtomicBool>,
+    /// Providers that failed to connect during THIS pass; see [`self_heal_file`].
+    /// Per-job, which is per-pass, so an unreachable peer is dialed once and then
+    /// skipped for the remaining paths instead of once per file.
+    dead_providers: Arc<StdMutex<HashSet<String>>>,
 }
 
 impl ReconcileJob {
@@ -1733,6 +1797,21 @@ impl ReconcileJob {
     /// `&self`.
     pub fn phase_handle(&self) -> Arc<StdMutex<String>> {
         self.phase.clone()
+    }
+
+    /// Whether this pass has been cancelled (share removed or paused).
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Bail out of the pass if it has been cancelled. Called at the top of each
+    /// per-file loop iteration: every branch below can await network I/O, so a
+    /// per-file granularity bounds how long a cancelled pass keeps running.
+    fn bail_if_cancelled(&self) -> anyhow::Result<()> {
+        if self.cancelled() {
+            return Err(ReconcileCancelled.into());
+        }
+        Ok(())
     }
 
     fn set_phase(&self, p: impl Into<String>) {
@@ -2152,9 +2231,15 @@ impl ReconcileJob {
         } else {
             // Store export didn't yield matching bytes (rare): pull a verified copy
             // from a peer as a last resort.
-            self_heal_file(&self.endpoint, &self.providers, hash, &target)
-                .await
-                .with_context(|| format!("self-heal {path}"))?;
+            self_heal_file(
+                &self.endpoint,
+                &self.providers,
+                hash,
+                &target,
+                &self.dead_providers,
+            )
+            .await
+            .with_context(|| format!("self-heal {path}"))?;
             Ok(true)
         }
     }
@@ -2304,6 +2389,7 @@ impl ReconcileJob {
         self.set_phase("retry previously-skipped files");
         let mut still_skipped: Vec<String> = Vec::new();
         for rel in skip_candidates {
+            self.bail_if_cancelled()?;
             if local.contains_key(&rel) {
                 continue;
             }
@@ -2367,6 +2453,7 @@ impl ReconcileJob {
         let mut removed: HashSet<String> = HashSet::new();
 
         for path in keys {
+            self.bail_if_cancelled()?;
             // Per-file breadcrumb: every branch below can await store/doc/network
             // ops (import, materialize, tombstone), and #7-style wedges are
             // per-call, so name the exact file being merged.
@@ -2943,6 +3030,10 @@ struct ShareState {
     /// Set while a [`ReconcileJob`] for this share is running off-lock, so the
     /// reconcile loop doesn't start a second concurrent publish of it.
     publishing: bool,
+    /// Raised to stop an in-flight [`ReconcileJob`] for this share. Cloned into
+    /// every job built from this state, so removing or pausing the share reaches
+    /// the pass that is already running off-lock (known-issues #34).
+    cancel: Arc<AtomicBool>,
     /// Live peer membership, updated by the doc event task + presence gossip.
     roster: Arc<StdMutex<PeerRoster>>,
     /// Unix seconds of the last successful publish (master) or applied update
@@ -3552,6 +3643,7 @@ impl Engine {
         }
         if paused {
             self.cancel_all_downloads();
+            self.cancel_all_reconciles();
         }
         Ok(())
     }
@@ -3572,6 +3664,7 @@ impl Engine {
         }
         if suspended {
             self.cancel_all_downloads();
+            self.cancel_all_reconciles();
         }
     }
 
@@ -3829,6 +3922,7 @@ impl Engine {
                 last_quick_sig: 0,
                 paused,
                 publishing: false,
+                cancel: Arc::new(AtomicBool::new(false)),
                 roster,
                 last_updated: 0,
                 // Provisional until the first reconcile computes real completeness. Start
@@ -5108,6 +5202,12 @@ impl Engine {
             .endpoint_id()
             .and_then(|eid| EndpointId::from_bytes(&eid).ok());
         state.publishing = true;
+        // A fresh pass always starts uncancelled. Clearing here (rather than on
+        // every resume path) keeps one invariant: the flag only ever stops the
+        // pass that is running *right now*. Both this and every setter run under
+        // the engine lock, so a cancel can never be lost to a rebuild race.
+        state.cancel.store(false, Ordering::Relaxed);
+        let cancel = state.cancel.clone();
         Ok(Some(ReconcileJob {
             share_id: share_id.to_string(),
             folder: state.folder.clone(),
@@ -5133,6 +5233,8 @@ impl Engine {
             phase: Arc::new(StdMutex::new("queued".to_string())),
             debug_before_settle: None,
             gc_protect: self.gc_protect.clone(),
+            cancel,
+            dead_providers: Arc::new(StdMutex::new(HashSet::new())),
         }))
     }
 
@@ -5471,6 +5573,24 @@ impl Engine {
         }
     }
 
+    /// Stop the reconcile pass running for one share, if any. The pass checks the
+    /// flag between files, so it stops within one file's work rather than running
+    /// the folder to completion.
+    fn cancel_reconcile_for_share(&self, share_id: &str) {
+        if let Some(state) = self.shares.get(share_id) {
+            state.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Stop every in-flight reconcile pass (global pause / sync-suspend). Without
+    /// this, "pause everything" only stopped downloads while the passes kept
+    /// merging, materializing and publishing.
+    fn cancel_all_reconciles(&self) {
+        for state in self.shares.values() {
+            state.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// Abort ALL in-flight content downloads (global pause / sync-suspend).
     fn cancel_all_downloads(&self) {
         if let Ok(mut inflight) = self.downloads_inflight.lock() {
@@ -5491,6 +5611,10 @@ impl Engine {
         // (make_reconcile_job) prevents new ones while paused.
         if paused {
             self.cancel_downloads_for_share(share_id);
+            // ...and the pass itself. The gate only blocks the *next* job; a pass
+            // already running off-lock owns cloned handles and would otherwise
+            // keep writing to the folder for the rest of its walk.
+            self.cancel_reconcile_for_share(share_id);
         }
         Ok(())
     }
@@ -5517,6 +5641,15 @@ impl Engine {
     }
 
     pub async fn remove_share(&mut self, share_id: &str, delete_files: bool) -> anyhow::Result<()> {
+        // Order matters: stop the work BEFORE dropping the state, because a running
+        // [`ReconcileJob`] is a snapshot holding its own clones of the doc, folder,
+        // blob store and downloader. Dropping `ShareState` — or `doc.leave()`ing —
+        // does not reach it, so a removed share kept merging, self-healing and
+        // writing files into a folder the user had just detached, invisibly: the
+        // engine map, the DB, the CLI and the GUI all correctly reported no shares
+        // while the pass ran on (known-issues #34).
+        self.cancel_downloads_for_share(share_id);
+        self.cancel_reconcile_for_share(share_id);
         if let Some(state) = self.shares.remove(share_id) {
             let _ = state.doc.leave().await;
             if delete_files {

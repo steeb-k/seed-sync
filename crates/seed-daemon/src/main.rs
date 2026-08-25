@@ -368,6 +368,15 @@ async fn run_sleep_monitor(daemon: &Daemon) -> anyhow::Result<()> {
     anyhow::bail!("logind PrepareForSleep stream ended")
 }
 
+/// How long a single reconcile pass may run before the daemon abandons it.
+///
+/// Generous, because a legitimate pass can be slow: materializing a multi-GB
+/// blob to disk is one file's work. It exists only to bound a *wedge* — a pass
+/// stuck on an unreachable peer or a share that no longer exists. Abandoning is
+/// safe: nothing is committed, and the next tick rebuilds the job and redoes the
+/// work idempotently.
+const RECONCILE_PASS_HARD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
 /// Periodically reconcile every share against the merged replica.
 ///
 /// Each share's reconcile runs *off* the engine lock: we build a job under a
@@ -400,24 +409,48 @@ async fn reconcile_loop(daemon: Daemon) {
             // is ever built and the share just stops, with nothing in the log
             // (fleet soak: nodes stuck at 0% for the whole run, 2 log lines).
             // WARN once a minute with the job's phase breadcrumb so a wedge is
-            // visible and localized. Diagnostic only — the pass is not aborted.
+            // visible and localized, and give up entirely at
+            // RECONCILE_PASS_HARD_TIMEOUT.
+            //
+            // The watchdog used to be diagnostic only, which made an unbounded
+            // pass unbounded in practice too: this loop is sequential, so one
+            // wedged share stalled the reconcile of every *other* share for as
+            // long as it ran — observed in the field at 14 minutes and climbing,
+            // with the share already deleted (known-issues #34).
             let phase = job.phase_handle();
             let run = job.run();
             let mut run = std::pin::pin!(run);
             let outcome = loop {
                 match tokio::time::timeout(Duration::from_secs(60), &mut run).await {
-                    Ok(res) => break res,
+                    Ok(res) => break Some(res),
                     Err(_) => {
                         let at = phase
                             .lock()
                             .map(|g| g.clone())
                             .unwrap_or_else(|_| "?".into());
+                        let elapsed = job_started.elapsed();
+                        if elapsed >= RECONCILE_PASS_HARD_TIMEOUT {
+                            tracing::error!(
+                                "reconcile {id} pass exceeded {}s — abandoning it; phase: {at}",
+                                RECONCILE_PASS_HARD_TIMEOUT.as_secs(),
+                            );
+                            break None;
+                        }
                         tracing::warn!(
                             "reconcile {id} pass still running after {}s — phase: {at}",
-                            job_started.elapsed().as_secs(),
+                            elapsed.as_secs(),
                         );
                     }
                 }
+            };
+            let Some(outcome) = outcome else {
+                // Hard timeout: abandon the pass. We simply stop polling it —
+                // the future is a loop-body local, so it is dropped (cancelling
+                // the pass at its last await point) when this iteration ends.
+                // Until then it is inert, so clearing the busy guard first is
+                // safe: nothing can advance the abandoned work.
+                daemon.engine.lock().await.finish_reconcile(&id, None);
+                continue;
             };
             match outcome {
                 Ok(outcome) => {
@@ -432,7 +465,15 @@ async fn reconcile_loop(daemon: Daemon) {
                     }
                 }
                 Err(e) => {
-                    tracing::warn!("reconcile {id} failed: {e:#}");
+                    // A cancelled pass is an expected outcome of removing or
+                    // pausing a share mid-flight, not a failure — don't cry wolf.
+                    if e.downcast_ref::<seed_core::engine::ReconcileCancelled>()
+                        .is_some()
+                    {
+                        tracing::debug!("reconcile {id} cancelled: {e}");
+                    } else {
+                        tracing::warn!("reconcile {id} failed: {e:#}");
+                    }
                     daemon.engine.lock().await.finish_reconcile(&id, None);
                 }
             }
