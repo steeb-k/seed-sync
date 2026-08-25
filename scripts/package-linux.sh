@@ -31,6 +31,16 @@ elif command -v convert >/dev/null 2>&1; then IM="convert"
 else echo "package-linux: ImageMagick (magick/convert) is required for icon generation" >&2; exit 1
 fi
 
+# Copy a text file with LF line endings. `.gitattributes` pins LF in the working
+# tree, but a tree cloned before that landed (or unpacked from a zip) can still
+# hold CRLF — and a CRLF wrapper ships a `#!/usr/bin/env bash\r` shebang that
+# fails on the target with `env: 'bash\r': No such file or directory`. Normalize
+# at package time so the artifact is right regardless of how the tree got here.
+install_text() {  # install_text <mode> <src> <dst>
+  tr -d '\r' < "$2" > "$3"
+  chmod "$1" "$3"
+}
+
 STAGE="$ROOT/dist/$NAME"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/bin" \
@@ -44,18 +54,18 @@ for b in seed-daemon seed-gui seed-cli; do
 done
 
 # Installer/updater wrapper + docs (tarball root)
-install -m 0755 "$PKG_SRC/seed-sync"   "$STAGE/seed-sync"
-install -m 0644 "$PKG_SRC/INSTALL.txt" "$STAGE/INSTALL.txt"
-install -m 0644 "$ROOT/LICENSE"        "$STAGE/LICENSE"
+install_text 0755 "$PKG_SRC/seed-sync"   "$STAGE/seed-sync"
+install_text 0644 "$PKG_SRC/INSTALL.txt" "$STAGE/INSTALL.txt"
+install_text 0644 "$ROOT/LICENSE"        "$STAGE/LICENSE"
 
 # Desktop entry + AppStream metadata
-install -m 0644 "$PKG_SRC/$APP_ID.desktop"       "$STAGE/share/applications/$APP_ID.desktop"
-install -m 0644 "$PKG_SRC/$APP_ID.metainfo.xml"  "$STAGE/share/metainfo/$APP_ID.metainfo.xml"
+install_text 0644 "$PKG_SRC/$APP_ID.desktop"       "$STAGE/share/applications/$APP_ID.desktop"
+install_text 0644 "$PKG_SRC/$APP_ID.metainfo.xml"  "$STAGE/share/metainfo/$APP_ID.metainfo.xml"
 
 # systemd --user units
-install -m 0644 "$PKG_SRC/seed-daemon.service"        "$STAGE/lib/systemd/user/seed-daemon.service"
-install -m 0644 "$PKG_SRC/seed-sync-update.service"   "$STAGE/lib/systemd/user/seed-sync-update.service"
-install -m 0644 "$PKG_SRC/seed-sync-update.timer"     "$STAGE/lib/systemd/user/seed-sync-update.timer"
+install_text 0644 "$PKG_SRC/seed-daemon.service"        "$STAGE/lib/systemd/user/seed-daemon.service"
+install_text 0644 "$PKG_SRC/seed-sync-update.service"   "$STAGE/lib/systemd/user/seed-sync-update.service"
+install_text 0644 "$PKG_SRC/seed-sync-update.timer"     "$STAGE/lib/systemd/user/seed-sync-update.timer"
 
 # hicolor icons, generated from the master PNG (pre-rendered so targets need no tools)
 for sz in $ICON_SIZES; do

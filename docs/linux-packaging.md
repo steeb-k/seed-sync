@@ -115,6 +115,17 @@ Self-replacement of `seed-sync` is safe: `apply_tree` writes the new file to a t
 `mv`'s it into place, so the running shell keeps its open fd to the old inode for that run.
 
 ## Caveats / gotchas for maintainers
+- **The tarball must ship LF line endings, and nothing on Linux tells you otherwise.**
+  Packaging from a CRLF working tree (a Windows clone with `core.autocrlf=true`, or WSL
+  packaging a `/mnt/c` checkout) copies `packaging/linux/*` verbatim, so the wrapper's
+  shebang becomes `#!/usr/bin/env bash\r` and the web installer dies on the user's machine
+  with `env: 'bash\r': No such file or directory` — after a successful download, which makes
+  it read like a broken release rather than a broken checkout. This bit **v0.7.1**: every
+  text file in that tarball (wrapper, `INSTALL.txt`, the three systemd units, the desktop
+  entry, the metainfo XML) shipped CRLF. Two guards now: `.gitattributes` pins `eol=lf` in
+  the working tree on every platform, and `package-linux.sh` copies text files through
+  `install_text`, which strips CR at package time. To check a built tarball:
+  `tar -xzf dist/*.tar.gz -O */seed-sync | head -1 | od -c | head -1`.
 - **An update must cycle the tray GUI, not just the daemon.** `seed-sync --update`
   restarts `seed-daemon.service`, but the GUI is a plain user process — left alone it
   keeps running the **old binary** against the new daemon indefinitely. `apply_tree`

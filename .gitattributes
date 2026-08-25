@@ -1,0 +1,15 @@
+# Line endings are part of the product here.
+#
+# The Linux/macOS release tarballs ship shell scripts, systemd units, desktop
+# entries and plists straight out of `packaging/`. A checkout that converted
+# them to CRLF (a Windows clone with core.autocrlf=true, or WSL packaging from
+# a /mnt/c tree) makes `scripts/package-*.sh` bundle `#!/usr/bin/env bash\r`,
+# and the installer dies on the target machine with the memorable
+# `env: 'bash\r': No such file or directory`. Pin LF in the working tree on
+# every platform so packaging cannot pick up CRLF in the first place.
+#
+# `text=auto` still auto-detects binaries, so icons/vendored blobs are untouched.
+* text=auto eol=lf
+
+# The one file that genuinely needs CRLF: cmd.exe mis-parses an LF batch file.
+*.bat text eol=crlf

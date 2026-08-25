@@ -148,12 +148,20 @@ codesign --force --sign - --timestamp=none "$APP" >/dev/null 2>&1 \
 # Verify the arch(es) actually landed.
 echo "package-macos: seed-gui arches -> $(lipo -archs "$CONTENTS/MacOS/seed-gui" 2>/dev/null)"
 
+# Copy a text file with LF line endings — see the same helper in
+# package-linux.sh: a CRLF checkout otherwise ships a `#!/usr/bin/env bash\r`
+# wrapper that dies with `env: 'bash\r': No such file or directory`.
+install_text() {  # install_text <mode> <src> <dst>
+  tr -d '\r' < "$2" > "$3"
+  chmod "$1" "$3"
+}
+
 # Tarball-root extras: bootstrap wrapper, docs, launchd templates.
-install -m 0755 "$PKG_SRC/seed-sync"   "$STAGE/seed-sync"
-install -m 0644 "$PKG_SRC/INSTALL.txt" "$STAGE/INSTALL.txt"
-install -m 0644 "$ROOT/LICENSE"        "$STAGE/LICENSE"
+install_text 0755 "$PKG_SRC/seed-sync"   "$STAGE/seed-sync"
+install_text 0644 "$PKG_SRC/INSTALL.txt" "$STAGE/INSTALL.txt"
+install_text 0644 "$ROOT/LICENSE"        "$STAGE/LICENSE"
 for p in daemon update gui; do
-  install -m 0644 "$PKG_SRC/$APP_ID.$p.plist" "$STAGE/LaunchAgents/$APP_ID.$p.plist"
+  install_text 0644 "$PKG_SRC/$APP_ID.$p.plist" "$STAGE/LaunchAgents/$APP_ID.$p.plist"
 done
 
 # Tarball (preserve the .app's signature/symlinks).
