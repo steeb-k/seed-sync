@@ -51,6 +51,7 @@ tier 0.
 | `gc` | blob-store GC against a replica-derived live set |
 | `tombstone_race` | a master that joins holding a copy of a deleted file must not resurrect the delete, even when it reconciles before its replica syncs (known-issues #10) |
 | `health_quiesce` | a quiet fleet whose folders are correct must *say* 100% — health may not dock a file whose bytes are right on disk just because the index lagged (known-issues #33) |
+| `share_removal` | a removed or paused share must stop the reconcile pass already running for it, and a cancelled pass must commit nothing (known-issues #34) |
 | `persistence` / `keystore` | state survives restart; locked-keystore behaviour |
 | `seed-daemon/loopback_ipc`, `health_ipc` | the same through the real IPC surface the GUI uses |
 

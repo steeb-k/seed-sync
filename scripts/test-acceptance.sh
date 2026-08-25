@@ -22,6 +22,7 @@ ALL_SUITES=(
   "seed-core:persistence"
   "seed-core:keystore"
   "seed-core:loopback"
+  "seed-core:share_removal"
   "seed-core:live_folder"
   "seed-core:health"
   "seed-core:presence"
