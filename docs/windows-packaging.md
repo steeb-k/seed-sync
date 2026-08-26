@@ -171,7 +171,10 @@ release.
   uninstall/upgrade before removing files.
 - Adds an **inbound Windows Firewall allow** for `seed-daemon.exe`
   (`<fw:FirewallException>`, domain + private profiles, per-program because the
-  endpoint binds an ephemeral UDP port). A service never gets the interactive
+  endpoint binds an ephemeral UDP port). Each profile's exception needs its own
+  distinct `Name`: the firewall custom action *replaces* same-named rules as it
+  applies each one, so sharing a name silently installs only the last profile's
+  rule (v0.7.3 shipped with just the private rule for exactly this reason). A service never gets the interactive
   firewall prompt, so without this rule inbound QUIC dials are silently dropped
   and the node can only connect outward — peers' direct dials to it fail and the
   share leans entirely on relay-coordinated holepunching, which is exactly how

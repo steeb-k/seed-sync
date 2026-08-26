@@ -120,9 +120,13 @@
              daemon binds an ephemeral UDP port, so the rule is per-program, not
              per-port. Public profile is deliberately excluded: on untrusted
              networks outbound + holepunching still works. -->
-        <fw:FirewallException Id="DaemonFwDomain" Name="SEED Sync daemon"
+        <!-- Distinct Names: the firewall custom action replaces same-named
+             rules as it applies each exception, so two exceptions sharing one
+             name leave only the last profile's rule installed (observed on the
+             0.7.3 rollout: the domain rule was clobbered by the private one). -->
+        <fw:FirewallException Id="DaemonFwDomain" Name="SEED Sync daemon (domain)"
                               Profile="domain" Scope="any" />
-        <fw:FirewallException Id="DaemonFwPrivate" Name="SEED Sync daemon"
+        <fw:FirewallException Id="DaemonFwPrivate" Name="SEED Sync daemon (private)"
                               Profile="private" Scope="any" />
       </File>
       <ServiceInstall Id="SeedSyncSvc"
