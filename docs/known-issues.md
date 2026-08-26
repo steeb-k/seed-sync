@@ -37,6 +37,7 @@ why, and the fix or current disposition.
 | 32 | a full OS credential store silently downgrades a master seed to plaintext DB | design note |
 | 33 | the hourly GC sweep drops every node to `Syncing 98%` permanently | **open** (pre-existing; no data impact) |
 | 34 | a removed or paused share keeps reconciling: the in-flight pass writes files, dials peers and stalls every other share | fixed (cancellable passes + hard pass timeout) |
+| 35 | a flapping share disarms the #23 self-heal ladders (episode clocks reset on every blip) | fixed (hysteretic `EpisodeClock`) |
 
 Three vendored crates carry upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
 `vendor/iroh-docs` — see `vendor/README.md` for the per-hunk detail and the
@@ -1030,3 +1031,53 @@ The folder in the field report was being *resurrected* because this node's
 replica still held those entries and it could not reach the origin to learn about
 the delete — it self-heals what it believes exists. That is #10/#12 territory and
 is unchanged. This entry is only about the removed share continuing to act at all.
+
+## 35. A flapping share disarms the #23 self-heal ladders
+
+**Where:** `crates/seed-core/src/engine.rs` (`EpisodeClock`, `ConnHeal`,
+`connectivity_recoveries`).
+
+**Field incident (2026-08-26).** A two-member share (Windows box + Linux laptop)
+where **neither host accepted inbound QUIC** — the Windows service had no
+firewall rule (services never get the interactive prompt; the MSI now installs
+one, see `windows-packaging.md` §3) and the laptop ran default-deny ufw — so
+every direct dial failed and connectivity lived entirely on relay-coordinated
+holepunching. When that path wobbled, the share settled into a stable ~25 s
+**flap**: a stray presence beat got through every ~30–60 s (often via the
+rendezvous bootstrap dial itself), marked the peer online for one 20 s TTL, then
+silence again. `seed-cli peers` oscillated `online=true path=direct` ↔
+`online=false` for over an hour; both GUIs truthfully showed the other member
+offline most of the time.
+
+**Why the ladders never fired.** Both #23 ladders act only on a *sustained*
+fault — `isolated()` for `ISOLATION_HEAL_SECS` (120 s), presence-silent for
+`PRESENCE_GAP_HEAL_SECS` (90 s) — and both tracked their episodes with a clock
+that reset to `None` the instant the raw predicate read healthy. One delivered
+beat reads healthy for a whole TTL, so a flap faster than the thresholds reset
+the clocks on every blip: the share sat degraded indefinitely with every ladder
+disarmed, while the rendezvous lookup (correctly) burned a dial every ~2 min —
+the observable signature is `"no reachable member; bootstrapping from master"`
+every ~2 min in a steady stream (healthy baseline: zero such lines). A second
+distortion: `force_relay_fallback` was recomputed per tick from the raw
+predicate, so each blip released it and the relay watchdog logged **"custom
+relay reachable again"** — those lines track share reachability, *not* relay
+health, which sent the 2026-08 diagnosis chasing an innocent relay.
+
+**Fix.** Episode tracking moved into `EpisodeClock`, with asymmetric hysteresis:
+an episode starts on the first faulty observation, but only ends after the
+condition reads healthy *continuously* for `HEAL_CLEAR_SECS` (60 s = 3× the
+presence TTL, so no single beat can clear it), and elapsed accrues from the
+episode's original start straight through blips. Both ladders and
+`any_partitioned` (→ `force_relay_fallback`) now key off episode state, so under
+a flap the WARN fires once, the presence rebuild + doc re-kick retry every
+`PRESENCE_REBUILD_MIN_SECS`, and the public-relay fallback stays latched instead
+of thrashing. Episode end is now logged (`"members reachable again — partition
+episode over"`) so an outage reads as a bracketed episode. `on_resume` still
+resets the clocks outright — resume is a known teardown, not a flap. Unit tests:
+`heal_episode_survives_flap` (a 25 s-period flap accrues past both ladder
+thresholds without ever clearing), `heal_episode_clears_only_after_sustained_health`,
+`heal_episode_noop_while_healthy`.
+
+**Cost.** On a genuine recovery the episode lingers ≤ 60 s, worth at most one
+redundant presence rebuild (idempotent) and one extra minute of public-relay
+fallback. Both harmless by design ("adding relays never strands a node").

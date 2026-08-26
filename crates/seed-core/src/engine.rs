@@ -136,6 +136,51 @@ struct RememberedPeer {
 /// still flushes immediately.
 const REMEMBERED_LAST_SEEN_FLUSH_SECS: i64 = 300;
 
+/// Fault-episode tracker with asymmetric hysteresis for the self-heal ladders
+/// (known-issues #35). An episode *starts* on the first faulty observation, but
+/// only *ends* once the condition has read healthy continuously for
+/// [`HEAL_CLEAR_SECS`] — a single healthy blip does not clear it, and elapsed
+/// keeps accruing from the episode's original start.
+///
+/// Why: both ladders act only on a *sustained* fault (120s isolated / 90s
+/// presence-silent), and the raw predicates flicker under a flap — one stray
+/// presence beat getting through marks the peer online for a whole 20s TTL. The
+/// old episode clocks reset on every such blip, so a share flapping on a ~25s
+/// period sat degraded for over an hour with every ladder disarmed (the 2026-08
+/// two-member outage). The ladders exist to be restart-equivalent; a flap must
+/// not be their blind spot.
+#[derive(Default)]
+struct EpisodeClock {
+    /// Unix seconds the current fault episode began; `None` while healthy.
+    since: Option<i64>,
+    /// Unix seconds the condition first read healthy within the active episode;
+    /// `None` while it reads faulty (or no episode is active).
+    healthy_since: Option<i64>,
+}
+
+impl EpisodeClock {
+    /// Fold in one observation of the fault condition. Returns the episode's
+    /// elapsed seconds while an episode is active (including mid-blip), `None`
+    /// once it has genuinely cleared.
+    fn observe(&mut self, faulty: bool, now: i64) -> Option<i64> {
+        if faulty {
+            self.healthy_since = None;
+            Some(now - *self.since.get_or_insert(now))
+        } else if let Some(since) = self.since {
+            let healthy = *self.healthy_since.get_or_insert(now);
+            if now - healthy >= HEAL_CLEAR_SECS {
+                self.since = None;
+                self.healthy_since = None;
+                None
+            } else {
+                Some(now - since)
+            }
+        } else {
+            None
+        }
+    }
+}
+
 /// Per-share bookkeeping for the connectivity self-heal ladders
 /// (known-issues #23). Default = healthy. The two episodes are
 /// tracked independently because they are mutually exclusive but each needs its own
@@ -143,16 +188,14 @@ const REMEMBERED_LAST_SEEN_FLUSH_SECS: i64 = 300;
 /// a dead *presence* overlay, and vice versa.
 #[derive(Default)]
 struct ConnHeal {
-    /// Total-isolation episode (transport dead): unix seconds since the share became
-    /// continuously unable to reach any member while it *has* members; `None` while
-    /// transport is healthy.
-    isolated_since: Option<i64>,
+    /// Total-isolation episode (transport dead): active while the share cannot
+    /// reach any member (flap-hysteretic; see [`EpisodeClock`]).
+    isolated: EpisodeClock,
     /// Whether the loud partition WARN has already been logged this isolation episode
     /// (so it isn't repeated every ~6s tick).
     isolated_warned: bool,
-    /// Presence-gap episode (transport alive, gossip presence silent): unix seconds
-    /// since it began; `None` while presence is flowing.
-    presence_gap_since: Option<i64>,
+    /// Presence-gap episode (transport alive, gossip presence silent).
+    presence_gap: EpisodeClock,
     /// Unix seconds of the last presence-subscription rebuild — a shared throttle
     /// across both ladders (see [`PRESENCE_REBUILD_MIN_SECS`]).
     last_presence_rebuild: i64,
@@ -663,6 +706,14 @@ const PRESENCE_GAP_HEAL_SECS: i64 = 90;
 /// throttle across both the isolation and presence-gap ladders, so a stubborn
 /// overlay retries periodically without thrashing the gossip actor.
 const PRESENCE_REBUILD_MIN_SECS: i64 = 90;
+
+/// A self-heal fault episode ends only after its condition has read healthy for
+/// this long *continuously* ([`EpisodeClock`]; known-issues #35). Must comfortably
+/// exceed [`PEER_ONLINE_TTL_SECS`]: a single delivered presence beat reads healthy
+/// for one full TTL, so anything shorter lets a ~25s flap clear the episode on
+/// every blip and permanently disarm the ladders. 3× the TTL; the cost of the
+/// hysteresis on a genuine recovery is at most one redundant (idempotent) rebuild.
+const HEAL_CLEAR_SECS: i64 = 60;
 
 /// Stall watchdog: an in-flight download older than this is presumed wedged and is
 /// aborted so the next reconcile re-queues it (verified chunks persist on disk, so
@@ -4777,6 +4828,12 @@ impl Engine {
     /// presence heartbeat for a sustained window — and rebuilds the subscription,
     /// which is the only thing a restart really does for this case.
     ///
+    /// Both ladders run on flap-hysteretic [`EpisodeClock`]s (known-issues #35):
+    /// a healthy blip shorter than [`HEAL_CLEAR_SECS`] neither ends an episode nor
+    /// resets its elapsed time, so a share oscillating faster than the ladder
+    /// thresholds still gets healed — and the forced-relay fallback stays latched
+    /// through the flap instead of thrashing per blip.
+    ///
     /// Returns [`DocResync`] jobs to run off-lock (ladder 1's doc re-kick), mirroring
     /// [`Engine::retry_locked_keys`]. Subscribing to gossip is a local actor hand-off
     /// (not a network dial), so rebuilding the handle inline under the lock is
@@ -4810,10 +4867,12 @@ impl Engine {
             let isolated = s.isolated();
 
             // --- Ladder 1: total isolation ---
-            if isolated {
-                let since = *s.heal.isolated_since.get_or_insert(now);
-                let elapsed = now - since;
-                if elapsed >= ISOLATION_HEAL_SECS {
+            // The episode clock is flap-hysteretic (known-issues #35): a healthy
+            // blip shorter than HEAL_CLEAR_SECS keeps the episode — and with it
+            // the forced-relay fallback and the periodic rebuilds — engaged, and
+            // elapsed accrues from the episode's true start.
+            match s.heal.isolated.observe(isolated, now) {
+                Some(elapsed) if elapsed >= ISOLATION_HEAL_SECS => {
                     any_partitioned = true;
                     if !s.heal.isolated_warned {
                         s.heal.isolated_warned = true;
@@ -4853,15 +4912,24 @@ impl Engine {
                         }
                     }
                 }
-            } else {
-                s.heal.isolated_since = None;
-                s.heal.isolated_warned = false;
+                Some(_) => {} // episode active but under the ladder threshold
+                None => {
+                    // Episode over: the share has been reachable continuously for
+                    // HEAL_CLEAR_SECS. Log the recovery once, so an outage reads
+                    // as a bracketed episode in the log instead of trailing off.
+                    if std::mem::take(&mut s.heal.isolated_warned) {
+                        tracing::info!(
+                            "share {id}: members reachable again — partition episode over \
+                             (stable for {HEAL_CLEAR_SECS}s)"
+                        );
+                    }
+                }
             }
 
             // --- Ladder 2: presence overlay silent while transport is alive ---
-            if presence_overlay_dead(known, isolated, last_contact, last_presence, now) {
-                let since = *s.heal.presence_gap_since.get_or_insert(now);
-                let gap = now - since;
+            let overlay_dead =
+                presence_overlay_dead(known, isolated, last_contact, last_presence, now);
+            if let Some(gap) = s.heal.presence_gap.observe(overlay_dead, now) {
                 if gap >= PRESENCE_GAP_HEAL_SECS
                     && now - s.heal.last_presence_rebuild >= PRESENCE_REBUILD_MIN_SECS
                 {
@@ -4874,8 +4942,6 @@ impl Engine {
                         );
                     }
                 }
-            } else {
-                s.heal.presence_gap_since = None;
             }
         }
 
@@ -4929,9 +4995,9 @@ impl Engine {
             // isolation / presence-gap ladders to detect it. Reset their episode
             // timers (this rebuild counts as the throttled one) so they don't fire a
             // redundant second rebuild moments later.
-            s.heal.isolated_since = None;
+            s.heal.isolated = EpisodeClock::default();
             s.heal.isolated_warned = false;
-            s.heal.presence_gap_since = None;
+            s.heal.presence_gap = EpisodeClock::default();
             s.heal.last_presence_rebuild = now;
             if rebuild_presence(&gossip, self_id, id, s).await {
                 tracing::info!("resume: rebuilt presence subscription for share {id}");
@@ -5780,6 +5846,55 @@ mod tests {
             .verifying_key()
             .to_bytes();
         EndpointId::from_bytes(&bytes).unwrap()
+    }
+
+    /// A share that *flaps* — one stray presence beat marking the peer online
+    /// for a TTL every ~30s — must not reset the self-heal episode clocks: that
+    /// blind spot left the 2026-08 two-member outage flapping for over an hour
+    /// with every ladder disarmed (known-issues #35). A healthy blip shorter
+    /// than [`HEAL_CLEAR_SECS`] keeps the episode alive, and elapsed accrues
+    /// from the episode's original start.
+    #[test]
+    fn heal_episode_survives_flap() {
+        let mut c = EpisodeClock::default();
+        let t0 = 1_000_000;
+        assert_eq!(c.observe(true, t0), Some(0));
+        // 25s-period flap: 20s faulty, then a 5s healthy blip, repeated.
+        let mut now = t0;
+        for _ in 0..20 {
+            now += 20;
+            assert!(c.observe(true, now).is_some());
+            now += 5;
+            assert_eq!(
+                c.observe(false, now),
+                Some(now - t0),
+                "a sub-hysteresis blip must not clear the episode"
+            );
+        }
+        // The flap ran long enough that every ladder threshold has been crossed.
+        assert!(now - t0 > ISOLATION_HEAL_SECS + ISOLATION_PRESENCE_REBUILD_SECS);
+    }
+
+    /// The flip side of the hysteresis: sustained health ends the episode, stays
+    /// clear, and a later fault starts a *fresh* episode from its own start.
+    #[test]
+    fn heal_episode_clears_only_after_sustained_health() {
+        let mut c = EpisodeClock::default();
+        let t0 = 1_000_000;
+        c.observe(true, t0);
+        assert!(c.observe(false, t0 + 10).is_some());
+        assert!(c.observe(false, t0 + 10 + HEAL_CLEAR_SECS - 1).is_some());
+        assert_eq!(c.observe(false, t0 + 10 + HEAL_CLEAR_SECS), None);
+        assert_eq!(c.observe(false, t0 + 500), None);
+        assert_eq!(c.observe(true, t0 + 600), Some(0));
+    }
+
+    /// A share that never faults never has an episode.
+    #[test]
+    fn heal_episode_noop_while_healthy() {
+        let mut c = EpisodeClock::default();
+        assert_eq!(c.observe(false, 5), None);
+        assert_eq!(c.observe(false, 500), None);
     }
 
     /// Mesh-repair target selection (known-issues #9): dial only peers we can't
