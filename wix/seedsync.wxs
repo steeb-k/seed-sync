@@ -12,7 +12,7 @@
   so it installs to Program Files (without it WiX builds a 32-bit MSI that lands in
   Program Files (x86)):
     wix build -arch x64 wix\seedsync.wxs ^
-      -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext ^
+      -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -ext WixToolset.Firewall.wixext ^
       -d DistDir=dist\SeedSync -d Version=<ver> -d LicenseRtf=<path> ^
       -o target\wix\seed-sync-<ver>-windows-x86_64.msi
 
@@ -26,7 +26,8 @@
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
-     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
   <Package Name="SEED Sync"
            Manufacturer="kznjk LLC"
            Version="$(Version)"
@@ -109,7 +110,21 @@
 
     <!-- The daemon + the Windows service (LocalSystem, auto-start). -->
     <Component Id="DaemonExe" Directory="BinDir" Guid="*">
-      <File Id="seed_daemon.exe" Source="$(DistDir)\bin\seed-daemon.exe" KeyPath="yes" />
+      <File Id="seed_daemon.exe" Source="$(DistDir)\bin\seed-daemon.exe" KeyPath="yes">
+        <!-- Inbound allow for the daemon on domain/private networks. A service
+             never gets the interactive firewall prompt, so without this rule
+             Windows silently drops every inbound QUIC dial and the node can only
+             ever connect outward — peer dials to this machine fail with "Failed
+             to establish connection" and the share ends up wholly dependent on
+             relay-coordinated holepunching (2026-08 two-member outage). The
+             daemon binds an ephemeral UDP port, so the rule is per-program, not
+             per-port. Public profile is deliberately excluded: on untrusted
+             networks outbound + holepunching still works. -->
+        <fw:FirewallException Id="DaemonFwDomain" Name="SEED Sync daemon"
+                              Profile="domain" Scope="any" />
+        <fw:FirewallException Id="DaemonFwPrivate" Name="SEED Sync daemon"
+                              Profile="private" Scope="any" />
+      </File>
       <ServiceInstall Id="SeedSyncSvc"
                       Name="SeedSyncDaemon"
                       DisplayName="SEED Sync"

@@ -154,8 +154,8 @@ pwsh -File scripts\build-msi.ps1                    # build + bundle + sign + wi
 #   -> target\wix\seed-sync-<version>-windows-x86_64.msi
 ```
 
-`build-msi.ps1` needs the **UI + Util** WiX extensions; it adds them automatically
-(`wix extension add -g WixToolset.UI.wixext WixToolset.Util.wixext`) on first run.
+`build-msi.ps1` needs the **UI + Util + Firewall** WiX extensions; it adds them
+automatically (`wix extension add -g …`) on first run.
 The **version is single-sourced** from `Cargo.toml`'s `[workspace.package].version`
 (override with `-Version`), and the artifact name matches the Linux convention
 (`seed-sync-<version>-windows-x86_64.msi`) so both OSes' assets sit on the same
@@ -169,6 +169,14 @@ release.
   `<ServiceInstall>` + `<ServiceControl>` (`Arguments="service"`, matching
   `service.rs`); MSI starts it on install and waits for it to stop on
   uninstall/upgrade before removing files.
+- Adds an **inbound Windows Firewall allow** for `seed-daemon.exe`
+  (`<fw:FirewallException>`, domain + private profiles, per-program because the
+  endpoint binds an ephemeral UDP port). A service never gets the interactive
+  firewall prompt, so without this rule inbound QUIC dials are silently dropped
+  and the node can only connect outward — peers' direct dials to it fail and the
+  share leans entirely on relay-coordinated holepunching, which is exactly how
+  the 2026-08 two-member flapping outage happened. Public profile is excluded on
+  purpose: outbound + holepunching still work on untrusted networks.
 - **WixUI_Minimal** UI: a single Welcome+License page (shows the GPL-3.0 license,
   generated to `wix\license.rtf` from the repo `LICENSE` at build time), then
   progress + finish. No folder chooser.

@@ -166,10 +166,26 @@ Self-replacement of `seed-sync` is safe: `apply_tree` writes the new file to a t
   system unit; not built (noted in `install.sh`).
 - **Icons are pre-rendered at package time** (build host has ImageMagick) so target machines
   need no tools. If you change `icon/appIcon.png`, the next release regenerates all sizes.
+- **A host firewall silently degrades the node to outbound-only.** With ufw/firewalld
+  in default-deny (ufw's default when enabled), inbound QUIC dials are dropped and
+  peers can only ever reach this node via relay-coordinated holepunching — which
+  *looks* fine until the relay path degrades, and then two firewalled members flap
+  in ~25 s online/offline cycles instead of connecting directly (the 2026-08
+  two-member outage: Windows box with no service firewall rule + a ufw'd laptop).
+  The daemon binds an **ephemeral UDP port**, so there is nothing stable to allow;
+  ufw also cannot allow by program. Until a fixed-port setting exists (Future
+  work), the options are a subnet-scoped allow (e.g.
+  `sudo ufw allow from 192.168.50.0/24 comment 'SEED Sync LAN peers'`) or living
+  with holepunch-only reachability. The installer deliberately does not touch the
+  firewall — it's per-user and must not sudo. The Windows MSI *does* install a
+  per-program inbound rule (see `windows-packaging.md` §3).
 
 ## Future work (not built)
 - Native per-distro packages (`.deb` via `cargo-deb`, Arch `PKGBUILD`, `.rpm` via
   `cargo-generate-rpm`) + self-hosted apt/pacman repos, if a fleet standardizes.
+- A **fixed-listen-port setting** for the daemon (iroh supports binding a chosen
+  port), so firewalled hosts can open exactly one UDP port instead of a subnet
+  allow. Would also make the ufw guidance above a one-liner.
 - A GUI "Check for updates" affordance (the daemon/GUI could surface the timer's result).
 - Code signing / minisign-style artifact signatures for tamper-evidence.
 - macOS mirrors this model (script/tarball + launchd, bundled GTK, ad-hoc signed).

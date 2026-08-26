@@ -4,7 +4,7 @@
 # Prereqs:
 #   * GTK built/installed via gvsbuild (default C:\gtk) — see docs/windows-packaging.md
 #   * WiX 5 dotnet tool:  dotnet tool install --global wix --version "5.*"
-#     plus the UI + Util extensions (this script adds them if missing).
+#     plus the UI + Util + Firewall extensions (this script adds them if missing).
 #   * Signing: RELEASES ARE SIGNED BY DEFAULT. Keep artifact-signing-metadata.json
 #     at the repo root (git-ignored; or point $env:ARTIFACT_SIGNING_METADATA at it)
 #     plus the Trusted Signing client tools + Windows SDK and an authenticated Azure
@@ -118,7 +118,7 @@ Write-Host "[5/6] wix build" -ForegroundColor Cyan
 # it can't find the engine-matched version. `wix extension add` takes the version
 # as id/version, not a --version flag.
 $wixVer = ((& wix --version) -split '\+')[0].Trim()
-foreach ($ext in "WixToolset.UI.wixext", "WixToolset.Util.wixext") {
+foreach ($ext in "WixToolset.UI.wixext", "WixToolset.Util.wixext", "WixToolset.Firewall.wixext") {
     Write-Host "  ensuring extension $ext/$wixVer" -ForegroundColor DarkGray
     & wix extension add -g "$ext/$wixVer"
     if ($LASTEXITCODE -ne 0) { throw "wix extension add failed for $ext/$wixVer" }
@@ -127,7 +127,7 @@ foreach ($ext in "WixToolset.UI.wixext", "WixToolset.Util.wixext") {
 $out = Join-Path $root "target\wix\seed-sync-$Version-windows-$Arch.msi"
 New-Item -ItemType Directory -Force -Path (Split-Path $out) | Out-Null
 & wix build -arch $wixArch "$root\wix\seedsync.wxs" `
-    -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext `
+    -ext WixToolset.UI.wixext -ext WixToolset.Util.wixext -ext WixToolset.Firewall.wixext `
     -d DistDir="$dist" -d Version="$Version" -d LicenseRtf="$licenseRtf" `
     -d UtilCA="$utilCA" `
     -o $out
