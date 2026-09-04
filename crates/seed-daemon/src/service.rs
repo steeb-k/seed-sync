@@ -20,7 +20,8 @@ use tokio::sync::Notify;
 use windows_service::{
     define_windows_service,
     service::{
-        ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl, ServiceExitCode,
+        ServiceAccess, ServiceAction, ServiceActionType, ServiceControl, ServiceControlAccept,
+        ServiceErrorControl, ServiceExitCode, ServiceFailureActions, ServiceFailureResetPeriod,
         ServiceInfo, ServiceStartType, ServiceState, ServiceStatus, ServiceType,
     },
     service_control_handler::{self, ServiceControlHandlerResult},
@@ -77,6 +78,10 @@ fn run_service() -> WsResult<()> {
         ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
     ))?;
 
+    // We are LocalSystem here: make sure the host lets this binary be reached
+    // and restarts us if we give up (both idempotent, both best-effort).
+    provision_host();
+
     // Run the daemon until the SCM asks us to stop.
     let data_dir = crate::default_data_dir();
     let socket = crate::default_socket(&data_dir);
@@ -96,6 +101,129 @@ fn run_service() -> WsResult<()> {
         ServiceControlAccept::empty(),
     ))?;
     Ok(())
+}
+
+/// Name of the inbound firewall rule the service maintains for itself.
+const SELF_FIREWALL_RULE: &str = "SEED Sync daemon (self)";
+
+/// Host provisioning the service does for itself every start, as LocalSystem:
+///
+/// 1. An inbound Windows Firewall allow rule for **this exact binary** on
+///    **every** profile. The MSI installs rules too, but they proved fragile in
+///    the field: the 0.7.3 rollout's two same-named exceptions collapsed into
+///    one (private only), and any adapter Windows classifies as *Public* — a VPN
+///    or overlay adapter, a hotel network — was left with no rule at all, so
+///    unsolicited inbound QUIC from a member over that path was silently
+///    dropped (2026-09 two-member outage, known-issues #36). A service never
+///    gets the interactive firewall prompt, and a per-program rule only admits
+///    traffic to this daemon's own authenticated QUIC socket, so allowing it on
+///    every profile is the right default. Re-checked on every start, so an
+///    updated install path or a deleted rule heals itself without an MSI.
+/// 2. Service failure actions: restart after 5 s / 30 s / 60 s, reset daily,
+///    and treat a non-zero exit as a failure. This is what makes rung 3 of the
+///    transport-repair ladder (`std::process::exit(3)`) a restart rather than
+///    a dead service.
+///
+/// Every step logs and continues on error — provisioning must never stop the
+/// daemon from starting.
+pub fn provision_host() {
+    provision_firewall();
+    provision_failure_actions();
+}
+
+fn provision_firewall() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let exe = exe.to_string_lossy().to_string();
+    let name_arg = format!("name={SELF_FIREWALL_RULE}");
+
+    // Already present for this exact path? (`verbose` prints the Program line.)
+    if let Ok(out) = std::process::Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "show",
+            "rule",
+            &name_arg,
+            "verbose",
+        ])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+        if out.status.success()
+            && text.contains(&exe.to_lowercase())
+            && text.contains("profiles:")
+            && text.contains("any")
+        {
+            return;
+        }
+    }
+    // Replace whatever is there under our name (stale path, wrong profile).
+    let _ = std::process::Command::new("netsh")
+        .args(["advfirewall", "firewall", "delete", "rule", &name_arg])
+        .output();
+    let program_arg = format!("program={exe}");
+    match std::process::Command::new("netsh")
+        .args([
+            "advfirewall",
+            "firewall",
+            "add",
+            "rule",
+            &name_arg,
+            "dir=in",
+            "action=allow",
+            &program_arg,
+            "enable=yes",
+            "profile=any",
+            "description=Inbound QUIC for the SEED Sync daemon (maintained by the service itself).",
+        ])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            tracing::info!("firewall: installed inbound rule '{SELF_FIREWALL_RULE}' for {exe}")
+        }
+        Ok(out) => tracing::warn!(
+            "firewall: could not install inbound rule '{SELF_FIREWALL_RULE}': {}{}",
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => tracing::warn!("firewall: netsh unavailable: {e}"),
+    }
+}
+
+fn provision_failure_actions() {
+    let result = (|| -> WsResult<()> {
+        let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        let service = manager.open_service(
+            SERVICE_NAME,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG,
+        )?;
+        service.update_failure_actions(ServiceFailureActions {
+            reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 3600)),
+            reboot_msg: None,
+            command: None,
+            actions: Some(vec![
+                ServiceAction {
+                    action_type: ServiceActionType::Restart,
+                    delay: Duration::from_secs(5),
+                },
+                ServiceAction {
+                    action_type: ServiceActionType::Restart,
+                    delay: Duration::from_secs(30),
+                },
+                ServiceAction {
+                    action_type: ServiceActionType::Restart,
+                    delay: Duration::from_secs(60),
+                },
+            ]),
+        })?;
+        service.set_failure_actions_on_non_crash_failures(true)?;
+        Ok(())
+    })();
+    if let Err(e) = result {
+        tracing::warn!("service recovery: could not set failure actions: {e}");
+    }
 }
 
 /// install / uninstall / start / stop via the service control manager.

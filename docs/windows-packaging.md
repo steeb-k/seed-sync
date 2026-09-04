@@ -170,16 +170,29 @@ release.
   `service.rs`); MSI starts it on install and waits for it to stop on
   uninstall/upgrade before removing files.
 - Adds an **inbound Windows Firewall allow** for `seed-daemon.exe`
-  (`<fw:FirewallException>`, domain + private profiles, per-program because the
-  endpoint binds an ephemeral UDP port). Each profile's exception needs its own
-  distinct `Name`: the firewall custom action *replaces* same-named rules as it
-  applies each one, so sharing a name silently installs only the last profile's
-  rule (v0.7.3 shipped with just the private rule for exactly this reason). A service never gets the interactive
+  (`<fw:FirewallException>`, domain + private + public profiles, per-program
+  because the endpoint binds an ephemeral UDP port). Each profile's exception
+  needs its own distinct `Name`: the firewall custom action *replaces* same-named
+  rules as it applies each one, so sharing a name silently installs only the last
+  profile's rule (v0.7.3 shipped with just the private rule for exactly this
+  reason — confirmed in the 0.7.3 auto-update's msiexec log, which shows both
+  exceptions installed under the one name). A service never gets the interactive
   firewall prompt, so without this rule inbound QUIC dials are silently dropped
   and the node can only connect outward — peers' direct dials to it fail and the
-  share leans entirely on relay-coordinated holepunching, which is exactly how
-  the 2026-08 two-member flapping outage happened. Public profile is excluded on
-  purpose: outbound + holepunching still work on untrusted networks.
+  share leans entirely on relay-coordinated holepunching (the 2026-08 two-member
+  flapping outage). Public is included since 0.7.4: VPN and overlay adapters
+  (the 2026-09 case: a Nullgate overlay) and hotel Wi-Fi are classified Public,
+  and excluding it dropped every unsolicited inbound dial over the one path a
+  member was actually reachable through; a per-program rule only admits traffic
+  to the daemon's own authenticated QUIC socket.
+- **The service also provisions itself on every start** (`service.rs`
+  `provision_host`, LocalSystem): it re-asserts an all-profile inbound rule named
+  `SEED Sync daemon (self)` for its *current* executable path, and sets the
+  service's failure actions (restart after 5 s / 30 s / 60 s, reset daily,
+  non-zero exit counts as failure). So an MSI whose firewall custom action
+  misfires, a deleted rule, or a moved install path heals on the next service
+  start without a reinstall — and the transport-repair ladder's last rung
+  (`exit(3)`, known-issues #36) is a restart rather than a dead service.
 - **WixUI_Minimal** UI: a single Welcome+License page (shows the GPL-3.0 license,
   generated to `wix\license.rtf` from the repo `LICENSE` at build time), then
   progress + finish. No folder chooser.

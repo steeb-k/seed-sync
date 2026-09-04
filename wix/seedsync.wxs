@@ -118,8 +118,14 @@
              to establish connection" and the share ends up wholly dependent on
              relay-coordinated holepunching (2026-08 two-member outage). The
              daemon binds an ephemeral UDP port, so the rule is per-program, not
-             per-port. Public profile is deliberately excluded: on untrusted
-             networks outbound + holepunching still works. -->
+             per-port. Public is included since 0.7.4: VPN/overlay adapters and
+             hotel Wi-Fi are classified Public, and leaving them out dropped
+             every unsolicited inbound dial over the overlay a member was
+             actually reachable through (known-issues #36). A per-program rule
+             only admits traffic to the daemon's own authenticated QUIC socket.
+             The service also re-asserts an all-profile rule for its own path on
+             every start (seed-daemon `service::provision_host`), so these are
+             the install-time baseline, not the only line of defence. -->
         <!-- Distinct Names: the firewall custom action replaces same-named
              rules as it applies each exception, so two exceptions sharing one
              name leave only the last profile's rule installed (observed on the
@@ -128,6 +134,8 @@
                               Profile="domain" Scope="any" />
         <fw:FirewallException Id="DaemonFwPrivate" Name="SEED Sync daemon (private)"
                               Profile="private" Scope="any" />
+        <fw:FirewallException Id="DaemonFwPublic" Name="SEED Sync daemon (public)"
+                              Profile="public" Scope="any" />
       </File>
       <ServiceInstall Id="SeedSyncSvc"
                       Name="SeedSyncDaemon"
