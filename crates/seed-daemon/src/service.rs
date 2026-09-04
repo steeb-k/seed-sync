@@ -195,9 +195,12 @@ fn provision_firewall() {
 fn provision_failure_actions() {
     let result = (|| -> WsResult<()> {
         let manager = ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CONNECT)?;
+        // ChangeServiceConfig2 rejects a RESTART action unless the handle also
+        // carries SERVICE_START (observed on the 0.7.4 rollout as "IO error in
+        // winapi call"; the firewall half of provisioning had already succeeded).
         let service = manager.open_service(
             SERVICE_NAME,
-            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG,
+            ServiceAccess::CHANGE_CONFIG | ServiceAccess::QUERY_CONFIG | ServiceAccess::START,
         )?;
         service.update_failure_actions(ServiceFailureActions {
             reset_period: ServiceFailureResetPeriod::After(Duration::from_secs(24 * 3600)),

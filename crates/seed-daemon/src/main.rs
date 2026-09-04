@@ -131,7 +131,10 @@ fn env_filter() -> tracing_subscriber::EnvFilter {
         // trouble) were invisible in production until 0.7.4 — the 2026-09
         // investigation had nothing below `seed_core` to look at.
         .unwrap_or_else(|_| {
-            "seed_daemon=info,seed_core=info,iroh=warn,iroh_gossip=warn,iroh_docs=warn,             iroh_blobs=warn"
+            // net_report's captive-portal probe WARNs every ~5 min against a
+            // custom relay that has no /generate_204 — harmless, so keep that
+            // module at error.
+            "seed_daemon=info,seed_core=info,iroh=warn,iroh::net_report=error,             iroh_gossip=warn,iroh_docs=warn,iroh_blobs=warn"
                 .into()
         })
 }
