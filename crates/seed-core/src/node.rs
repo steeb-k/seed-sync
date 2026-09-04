@@ -135,6 +135,58 @@ impl IrohNode {
         })
     }
 
+    /// Tear the whole iroh stack down and bring it back up **in place**: same
+    /// `node.key` (so the endpoint id is stable), same blob store and docs
+    /// directory, fresh endpoint / gossip / docs actors / router.
+    ///
+    /// This is the in-process equivalent of a daemon restart at the transport
+    /// layer, and exists because a restart is the only thing that has ever
+    /// cleared known-issues #36: after days of uptime an endpoint can lose the
+    /// ability to reach a member that a *fresh* endpoint on the same machine
+    /// reaches in under a second (stale per-remote path / relay-actor state
+    /// inside iroh). Every handle cloned out of the old node (docs, blob store,
+    /// downloader, endpoint) is dead after this; the caller re-opens its shares.
+    ///
+    /// The old stores must be fully closed before the new ones open — both
+    /// `blobs.db` and `docs.redb` are single-writer redb files — so the store
+    /// shutdown is awaited first and the respawn retries briefly while a
+    /// background actor is still releasing its file lock.
+    pub async fn rebuild(
+        &mut self,
+        data_dir: &Path,
+        blobs_dir: &Path,
+        relay_settings: &crate::relays::RelaySettings,
+        gc: Option<GcConfig>,
+    ) -> anyhow::Result<()> {
+        if let Err(e) = self.blobs.shutdown().await {
+            tracing::warn!("transport rebuild: blob store shutdown: {e}");
+        }
+        if let Err(e) = self.router.shutdown().await {
+            tracing::warn!("transport rebuild: router shutdown: {e}");
+        }
+        // Belt and braces: the router shuts the endpoint down, but make sure the
+        // socket is gone before binding the replacement.
+        self.endpoint.close().await;
+
+        let mut last_err = None;
+        for attempt in 1..=20u32 {
+            match Self::spawn_with_blobs(data_dir, blobs_dir, relay_settings, gc.clone()).await {
+                Ok(fresh) => {
+                    *self = fresh;
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!("transport rebuild: respawn attempt {attempt} failed: {e:#}");
+                    last_err = Some(e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("transport rebuild: respawn never attempted"))
+            .context("respawn iroh node after shutdown"))
+    }
+
     pub fn docs_api(&self) -> &DocsApi {
         self.docs.api()
     }

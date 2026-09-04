@@ -35,6 +35,7 @@ ALL_SUITES=(
   "seed-core:tombstone_race"
   "seed-core:health_quiesce"
   "seed-core:multi_master"
+  "seed-core:transport_rebuild"
   "seed-daemon:loopback_ipc"
   "seed-daemon:health_ipc"
 )

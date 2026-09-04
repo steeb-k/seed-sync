@@ -308,6 +308,18 @@ pub struct PeerInfo {
     /// (offline, this device itself, or no recent iroh connection).
     #[serde(default)]
     pub path: Option<PeerPath>,
+    /// Unix secs of the last doc-sync **this device initiated** to the member
+    /// that succeeded (0 = none this session). With `last_dial_err_at` this
+    /// tells "they reach us but we cannot reach them" apart from "offline" —
+    /// the signature the transport-repair ladder acts on (known-issues #36).
+    #[serde(default)]
+    pub last_dial_ok: i64,
+    /// Error text of the most recent failed outbound dial to the member.
+    #[serde(default)]
+    pub last_dial_err: Option<String>,
+    /// Unix secs of that failure (0 = none this session).
+    #[serde(default)]
+    pub last_dial_err_at: i64,
 }
 
 /// One user-configured custom relay server (a self-hosted iroh relay).

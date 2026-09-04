@@ -127,7 +127,13 @@ fn main() -> anyhow::Result<()> {
 
 fn env_filter() -> tracing_subscriber::EnvFilter {
     tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| "seed_daemon=info,seed_core=info".into())
+        // iroh's own WARNs (relay connection failures, path errors, gossip actor
+        // trouble) were invisible in production until 0.7.4 — the 2026-09
+        // investigation had nothing below `seed_core` to look at.
+        .unwrap_or_else(|_| {
+            "seed_daemon=info,seed_core=info,iroh=warn,iroh_gossip=warn,iroh_docs=warn,             iroh_blobs=warn"
+                .into()
+        })
 }
 
 /// Console commands (`run`, install/start/…) log to stderr. The SCM-launched
@@ -403,6 +409,7 @@ async fn reconcile_loop(daemon: Daemon) {
                     .flatten()
             };
             let Some(job) = job else { continue };
+            let generation = job.generation();
             let job_started = std::time::Instant::now();
             // Slow-pass watchdog (known-issues #7): a pass that never returns
             // wedges this share silently — `publishing` stays set, so no new job
@@ -449,7 +456,11 @@ async fn reconcile_loop(daemon: Daemon) {
                 // the pass at its last await point) when this iteration ends.
                 // Until then it is inert, so clearing the busy guard first is
                 // safe: nothing can advance the abandoned work.
-                daemon.engine.lock().await.finish_reconcile(&id, None);
+                daemon
+                    .engine
+                    .lock()
+                    .await
+                    .finish_reconcile(&id, generation, None);
                 continue;
             };
             match outcome {
@@ -459,7 +470,7 @@ async fn reconcile_loop(daemon: Daemon) {
                         .engine
                         .lock()
                         .await
-                        .finish_reconcile(&id, Some(outcome));
+                        .finish_reconcile(&id, generation, Some(outcome));
                     if did {
                         changed.push(id.clone());
                     }
@@ -474,7 +485,11 @@ async fn reconcile_loop(daemon: Daemon) {
                     } else {
                         tracing::warn!("reconcile {id} failed: {e:#}");
                     }
-                    daemon.engine.lock().await.finish_reconcile(&id, None);
+                    daemon
+                        .engine
+                        .lock()
+                        .await
+                        .finish_reconcile(&id, generation, None);
                 }
             }
             // A long pass (e.g. materializing a multi-GB blob to disk) is normal
@@ -587,6 +602,18 @@ async fn presence_loop(daemon: Daemon) {
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(Duration::from_secs(30), resync.run()).await;
                 });
+            }
+            // Rung 3 of the transport-repair ladder (known-issues #36): the
+            // in-process rebuild itself keeps failing, so hand the restart to the
+            // supervisor — Windows service recovery (configured at service start,
+            // see `service::provision_host`) or systemd `Restart=on-failure`. A
+            // console dev run simply exits and says why.
+            if let Some(why) = { daemon.engine.lock().await.transport_fatal() } {
+                tracing::error!(
+                    "transport repair exhausted: {why} — exiting with code 3 so the service \
+                     supervisor restarts the daemon"
+                );
+                std::process::exit(3);
             }
 
             // Master shares whose write key was locked in the OS keystore at startup
@@ -797,13 +824,14 @@ async fn handle_request(daemon: &Daemon, req: IpcRequest) -> anyhow::Result<IpcR
                 engine.create_open(&PathBuf::from(folder), ignore).await?
             };
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
+            let generation = job.generation();
             let outcome = job.run().await;
             if let Err(e) = &outcome {
                 tracing::warn!("initial import for {} failed: {e:#}", created.share_id);
             }
             {
                 let mut engine = daemon.engine.lock().await;
-                engine.finish_reconcile(&created.share_id, outcome.ok());
+                engine.finish_reconcile(&created.share_id, generation, outcome.ok());
             }
             let _ = daemon.events.send(IpcEvent::ShareListChanged);
             IpcResponse::ShareCreated {

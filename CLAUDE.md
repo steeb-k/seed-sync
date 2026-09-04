@@ -119,6 +119,7 @@ Architecture / engine internals:
 - `divergence-detection.md` — cross-member divergence detection, self-heal, deep-verify.
 - `relay-outage-field-note.md` — why a relay outage looked like an app bug, and the follow-ups to make it self-evident next time.
 - `member-registry.md` — replicated last-known member names (`\x00m/` doc records + `peer_names` cache) so the member list survives disconnects/restarts.
+- `connectivity-plan.md` — 2026-09 two-member unreachability: why the #23/#35 ladders can't heal a wedged endpoint, the control experiment (`examples/dial_probe.rs`), and the transport-level fix plan.
 
 Packaging / distribution (maintainer guides):
 - `releasing.md` — how to cut a release across platforms + the shared distribution model.

@@ -119,12 +119,13 @@ async fn a_later_pass_is_not_poisoned_by_an_earlier_cancel() -> anyhow::Result<(
     let cancelled = engine
         .make_reconcile_job(&share_id)?
         .expect("a live share yields a job");
+    let generation = cancelled.generation();
     engine.set_paused(&share_id, true)?;
     assert!(cancelled.run().await.is_err(), "first pass must abort");
     // What the daemon's reconcile loop does with a failed pass: commit nothing,
     // clear the busy guard. Without it `publishing` stays set and no further job
     // is ever built for this share.
-    engine.finish_reconcile(&share_id, None);
+    engine.finish_reconcile(&share_id, generation, None);
 
     engine.set_paused(&share_id, false)?;
     let job = engine

@@ -313,8 +313,9 @@ async fn deep_verify_survives_inflight_reconcile() -> anyhow::Result<()> {
         viewer.debug_deep_verify_pending(&share_id),
         "request must mark the verify pending"
     );
+    let generation = job.generation();
     let outcome = job.run().await?;
-    viewer.finish_reconcile(&share_id, Some(outcome));
+    viewer.finish_reconcile(&share_id, generation, Some(outcome));
     assert!(
         viewer.debug_deep_verify_pending(&share_id),
         "an in-flight (unforced) job's commit must NOT swallow the pending verify \

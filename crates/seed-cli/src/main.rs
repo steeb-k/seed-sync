@@ -240,15 +240,33 @@ fn print_response(resp: &IpcResponse) {
                     Some(seed_ipc::PeerPath::Relay(host)) => format!("  path=relay({host})"),
                     None => String::new(),
                 };
+                // Our own dials to this member: "they reach us, we can't reach
+                // them" is the wedged-endpoint signature (known-issues #36).
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let dial = if p.last_dial_err_at != 0 && p.last_dial_err_at > p.last_dial_ok {
+                    format!(
+                        "  dial=FAIL {}s ago ({})",
+                        now - p.last_dial_err_at,
+                        p.last_dial_err.as_deref().unwrap_or("?")
+                    )
+                } else if p.last_dial_ok != 0 {
+                    format!("  dial=ok {}s ago", now - p.last_dial_ok)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "{}  name={}  {:?}  online={}  seqno={}  {}%{}",
+                    "{}  name={}  {:?}  online={}  seqno={}  {}%{}{}",
                     p.node_id,
                     p.name.as_deref().unwrap_or("-"),
                     p.role,
                     p.online,
                     p.have_seqno,
                     p.percent,
-                    path
+                    path,
+                    dial
                 );
             }
         }

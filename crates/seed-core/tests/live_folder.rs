@@ -47,8 +47,11 @@ where
         .engine
         .make_reconcile_job(&id)?
         .expect("share should be reconcilable");
+    let generation = job.generation();
     let outcome = job.debug_before_settle(mutate).run().await?;
-    c.nodes[node].engine.finish_reconcile(&id, Some(outcome));
+    c.nodes[node]
+        .engine
+        .finish_reconcile(&id, generation, Some(outcome));
     Ok(())
 }
 

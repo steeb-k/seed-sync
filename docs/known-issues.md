@@ -1081,3 +1081,51 @@ thresholds without ever clearing), `heal_episode_clears_only_after_sustained_hea
 **Cost.** On a genuine recovery the episode lingers ≤ 60 s, worth at most one
 redundant presence rebuild (idempotent) and one extra minute of public-relay
 fallback. Both harmless by design ("adding relays never strands a node").
+
+## 36. A long-running endpoint stops reaching a live member; the #23/#35 ladders cannot heal it
+
+**Status: FIXED in 0.7.4 (2026-09-04) — pending field confirmation.** Full evidence and
+the plan: `docs/connectivity-plan.md`.
+
+**Where:** iroh endpoint state inside the daemon process (not the engine roster,
+not the network). `crates/seed-core/examples/dial_probe.rs` is the control
+experiment.
+
+Two-member share (bigDev ↔ xpsTop, the latter remote over the Nullgate overlay).
+Nine days after the last restart, every dial from bigDev's daemon to xpsTop times
+out, presence from xpsTop never arrives, and the #23/#35 ladders cycle every ~6 min
+(rebuild presence → re-kick doc sync → force relay fallback → "reachable again" on
+a stray inbound contact → repeat), ~2000 log lines a day. A **fresh** endpoint on
+the same box, with the daemon's exact relay config and token, connects to xpsTop
+in 0.3 s over every ALPN. The fault is per-process transport state; a daemon
+restart is the only thing that has ever cleared it, which is also why each earlier
+round (#23, #35) looked fixed when verified right after a restart and degraded
+again within 1–3 days.
+
+**Fix (0.7.4).** A third, transport-level ladder in `connectivity_recoveries`,
+keyed on the signature itself rather than on isolation: the roster now records
+doc-sync outcomes by *direction* (`Origin::Connect` = our dial, `Origin::Accept` =
+theirs) plus a rendezvous-freshness signal, and `outbound_dead` fires when members
+are provably alive (any contact, an inbound sync, or a rendezvous record published
+within 10 min) while ≥ 3 consecutive outbound dials have failed. Rung 1 after
+300 s: `Endpoint::network_change` (the `on_resume` rebind) + presence rebuild +
+doc re-kick. Rung 2 after 600 s: `Engine::rebuild_transport` — tear down and
+respawn the whole iroh node in-process (same `node.key`, same stores, every share
+reopened from the DB), spaced ≥ 15 min and doubling to 2 h while the fault
+persists; in-flight passes from before the rebuild are fenced off by an engine
+generation counter. Rung 3: two consecutive failed rebuilds set
+`transport_fatal`, and the daemon exits with code 3 for its supervisor (Windows
+service recovery is now provisioned by the service itself at start; systemd unit
+already has `Restart=on-failure`). `seed-cli peers` shows `dial=ok Ns ago` /
+`dial=FAIL Ns ago (…)` per member so the signature is visible without the log.
+Relay handling is deliberately untouched: the probe proved the relay config was
+not the fault, and members must work regardless of how each is configured.
+Suite: `transport_rebuild` (same endpoint id, shares reopened, sync both ways,
+second rebuild, stale-generation fence). Unit:
+`outbound_dead_needs_alive_members_and_repeated_dial_failures`.
+
+**Not fixed here:** the underlying iroh wedge (which candidate/relay state goes
+stale) is still uncaptured — step 0 of `docs/connectivity-plan.md` (run the
+service with `iroh=debug` until the next episode) stands, and the roaming-peer
+soak from that plan is still to write. The rung-2 rebuild is the remedy, not the
+diagnosis.

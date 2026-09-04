@@ -35,6 +35,7 @@ $AllSuites = @(
     @{ Crate = "seed-core";   Test = "tombstone_race" },
     @{ Crate = "seed-core";   Test = "health_quiesce" },
     @{ Crate = "seed-core";   Test = "multi_master" },
+    @{ Crate = "seed-core";   Test = "transport_rebuild" },
     @{ Crate = "seed-daemon"; Test = "loopback_ipc" },
     @{ Crate = "seed-daemon"; Test = "health_ipc" }
 )

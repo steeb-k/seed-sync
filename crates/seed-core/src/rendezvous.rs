@@ -85,6 +85,13 @@ pub const LOOKUP_SECS: i64 = 60;
 /// Network timeout for a single publish or resolve.
 pub const TIMEOUT: Duration = Duration::from_secs(15);
 
+/// A resolved record published within this window proves the publishing master
+/// is alive *right now* — evidence the transport-repair ladder needs
+/// (known-issues #36): a master that publishes but that we cannot dial is a
+/// fault on our side. Comfortably above [`REPUBLISH_SECS`] so one missed
+/// republish does not read as death.
+pub const FRESH_SECS: i64 = 600;
+
 /// A pkarr client that borrows the endpoint's TLS trust anchors and DNS resolver,
 /// so rendezvous traffic uses exactly the same trust configuration as the rest of
 /// the stack rather than a second, independently-configured one.
@@ -143,6 +150,17 @@ pub async fn publish(endpoint: &Endpoint, seed: [u8; 32]) -> Result<()> {
 /// Public so the round-trip against the real pkarr server can be tested directly;
 /// the engine drives it through [`RendezvousDial`].
 pub async fn resolve(endpoint: &Endpoint, master_pub: [u8; 32]) -> Result<EndpointAddr> {
+    resolve_with_published(endpoint, master_pub)
+        .await
+        .map(|(addr, _)| addr)
+}
+
+/// [`resolve`], plus the unix seconds the record was published (0 if the packet
+/// carried no usable timestamp).
+pub async fn resolve_with_published(
+    endpoint: &Endpoint,
+    master_pub: [u8; 32],
+) -> Result<(EndpointAddr, i64)> {
     let name = EndpointId::from_bytes(&master_pub).context("share pubkey is not a valid key")?;
 
     // `resolve` verifies the packet's signature against `name` — the share key — so
@@ -151,6 +169,7 @@ pub async fn resolve(endpoint: &Endpoint, master_pub: [u8; 32]) -> Result<Endpoi
         .resolve(name)
         .await
         .map_err(|e| anyhow!("resolve rendezvous record: {e}"))?;
+    let published = (packet.timestamp().as_micros() / 1_000_000) as i64;
     let info = EndpointInfo::from_pkarr_signed_packet(&packet)
         .map_err(|e| anyhow!("parse rendezvous record: {e}"))?;
 
@@ -162,10 +181,13 @@ pub async fn resolve(endpoint: &Endpoint, master_pub: [u8; 32]) -> Result<Endpoi
         .parse()
         .context("rendezvous record's endpoint id is malformed")?;
 
-    Ok(EndpointAddr {
-        id,
-        addrs: info.data.addrs().cloned().collect(),
-    })
+    Ok((
+        EndpointAddr {
+            id,
+            addrs: info.data.addrs().cloned().collect(),
+        },
+        published,
+    ))
 }
 
 /// A master's periodic rendezvous publish, built under the engine lock and awaited
@@ -200,29 +222,36 @@ pub struct RendezvousDial {
     pub(crate) master_pub: [u8; 32],
     pub(crate) doc: Doc,
     pub(crate) presence: Option<iroh_gossip::api::GossipSender>,
+    /// The share's roster, to record "another master is provably alive" when a
+    /// fresh record resolves (see [`FRESH_SECS`]).
+    pub(crate) roster: std::sync::Arc<std::sync::Mutex<crate::engine::PeerRoster>>,
 }
 
 impl RendezvousDial {
     /// Resolve a live master and bootstrap from it. Best-effort and idempotent: a
     /// share with no live master simply finds nothing and is retried next tick.
     pub async fn run(self) {
-        let addr =
-            match tokio::time::timeout(TIMEOUT, resolve(&self.endpoint, self.master_pub)).await {
-                Ok(Ok(addr)) => addr,
-                Ok(Err(e)) => {
-                    // Expected while no master has published yet (e.g. every master in
-                    // the pool predates this feature) — debug, not warn.
-                    tracing::debug!(
-                        "rendezvous lookup for {} found nothing: {e:#}",
-                        self.share_id
-                    );
-                    return;
-                }
-                Err(_) => {
-                    tracing::warn!("rendezvous lookup for {} timed out", self.share_id);
-                    return;
-                }
-            };
+        let (addr, published) = match tokio::time::timeout(
+            TIMEOUT,
+            resolve_with_published(&self.endpoint, self.master_pub),
+        )
+        .await
+        {
+            Ok(Ok(found)) => found,
+            Ok(Err(e)) => {
+                // Expected while no master has published yet (e.g. every master in
+                // the pool predates this feature) — debug, not warn.
+                tracing::debug!(
+                    "rendezvous lookup for {} found nothing: {e:#}",
+                    self.share_id
+                );
+                return;
+            }
+            Err(_) => {
+                tracing::warn!("rendezvous lookup for {} timed out", self.share_id);
+                return;
+            }
+        };
 
         // The record is last-writer-wins across ALL masters, and we are a master too if
         // we hold the seed — so the address we just resolved is quite often our own.
@@ -238,10 +267,21 @@ impl RendezvousDial {
             return;
         }
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let fresh = published != 0 && now - published <= FRESH_SECS;
+        if fresh {
+            if let Ok(mut r) = self.roster.lock() {
+                r.note_rendezvous_alive();
+            }
+        }
         tracing::info!(
-            "rendezvous: share {} has no reachable member; bootstrapping from master {}",
+            "rendezvous: share {} has no reachable member; bootstrapping from master {}              (record published {}s ago)",
             self.share_id,
             addr.id.fmt_short(),
+            if published == 0 { -1 } else { now - published },
         );
 
         // Doc sync first: it carries the *full* resolved address, which seeds the

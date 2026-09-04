@@ -33,8 +33,11 @@ use iroh_blobs::protocol::GetRequest;
 use iroh_blobs::store::{GcConfig, ProtectOutcome};
 use iroh_blobs::{store::fs::FsStore, BlobFormat, Hash};
 use iroh_docs::{
-    api::Doc, engine::LiveEvent, store::Query, sync::Capability, AuthorId, NamespaceId,
-    NamespaceSecret,
+    api::Doc,
+    engine::{LiveEvent, Origin},
+    store::Query,
+    sync::Capability,
+    AuthorId, NamespaceId, NamespaceSecret,
 };
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -102,6 +105,32 @@ pub(crate) struct PeerRoster {
     /// fresh subscription heals it (known-issues #23).
     /// `0` = no presence heard yet this session.
     last_presence: i64,
+    /// Outbound-dial bookkeeping for the transport-repair ladder (known-issues
+    /// #36). A doc-sync we *initiated* (`Origin::Connect`) that succeeded /
+    /// failed, and the last sync a member initiated *toward us*
+    /// (`Origin::Accept`) that succeeded. The wedge signature is "members keep
+    /// reaching us, or are otherwise provably alive, while every dial we make
+    /// times out" — which no roster-level repair can fix and only a fresh
+    /// endpoint clears.
+    last_outbound_ok: i64,
+    last_outbound_err: Option<(String, i64)>,
+    /// Consecutive failed outbound dials since the last successful one.
+    outbound_failures: u32,
+    last_inbound_ok: i64,
+    /// Unix secs the rendezvous last resolved to a *different* master whose
+    /// record was published recently — proof that master is up, independent of
+    /// whether we can reach it.
+    rendezvous_alive: i64,
+}
+
+/// Snapshot of a share's outbound/inbound dial history (see [`PeerRoster`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DialStats {
+    pub(crate) last_outbound_ok: i64,
+    pub(crate) last_outbound_err: Option<(String, i64)>,
+    pub(crate) outbound_failures: u32,
+    pub(crate) last_inbound_ok: i64,
+    pub(crate) rendezvous_alive: i64,
 }
 
 #[derive(Default)]
@@ -114,6 +143,10 @@ struct PeerEntry {
     percent: u8,
     /// Peer's manifest fingerprint from its last presence (0 = unknown/not reported).
     manifest_fp: u64,
+    /// Last doc-sync *we* initiated to this peer that succeeded / failed
+    /// (unix secs; the error text is kept for the CLI and the partition WARN).
+    last_dial_ok: i64,
+    last_dial_err: Option<(String, i64)>,
 }
 
 /// A member's last-known identity (see [`PeerRoster::remembered`]).
@@ -199,6 +232,30 @@ struct ConnHeal {
     /// Unix seconds of the last presence-subscription rebuild — a shared throttle
     /// across both ladders (see [`PRESENCE_REBUILD_MIN_SECS`]).
     last_presence_rebuild: i64,
+    /// Ladder-3 episode (known-issues #36): members alive, our outbound dials
+    /// failing. Flap-hysteretic like the others.
+    outbound: EpisodeClock,
+    /// Whether the ladder-3 WARN was logged this episode.
+    outbound_warned: bool,
+    /// Unix seconds rung 1 (network re-probe) ran for this episode; 0 = not yet.
+    rung1_at: i64,
+}
+
+/// Engine-wide state of the transport-repair ladder (rung 2/3 act on the one
+/// shared endpoint, so they are throttled here, not per share).
+#[derive(Default)]
+struct TransportHeal {
+    /// Unix seconds of the last in-process endpoint rebuild (0 = never).
+    last_rebuild: i64,
+    /// Current minimum spacing to the next rebuild (0 = the base
+    /// [`TRANSPORT_REBUILD_MIN_SECS`]); doubles while the fault persists.
+    backoff: i64,
+    /// Consecutive rebuilds that *failed* (could not respawn the node).
+    failures: u32,
+    /// Total rebuilds this process (diagnostics / tests).
+    rebuilds: u32,
+    /// Set once rebuilds keep failing: the daemon should exit for its supervisor.
+    fatal: Option<String>,
 }
 
 impl PeerRoster {
@@ -224,15 +281,62 @@ impl PeerRoster {
     /// `last_seen`, so an unreachable peer ages out and stays out instead of being
     /// marked "online" on every failed retry (the phantom-liveness flap;
     /// known-issues #23).
-    pub(crate) fn note_sync_finished(&mut self, id: &str, ok: bool, err: Option<&str>) {
+    ///
+    /// `outbound` says who dialed: `true` for a sync we initiated
+    /// (`Origin::Connect`), `false` for one the peer initiated toward us
+    /// (`Origin::Accept`). The split feeds the transport-repair ladder
+    /// (known-issues #36): a peer that keeps reaching us while our dials to it
+    /// all fail is the wedged-endpoint signature.
+    pub(crate) fn note_sync_finished(
+        &mut self,
+        id: &str,
+        outbound: bool,
+        ok: bool,
+        err: Option<&str>,
+    ) {
+        let now = now_secs();
         if ok {
             self.note(id, None);
+            if outbound {
+                self.last_outbound_ok = now;
+                self.outbound_failures = 0;
+                if let Some(e) = self.peers.get_mut(id) {
+                    e.last_dial_ok = now;
+                }
+            } else {
+                self.last_inbound_ok = now;
+            }
         } else {
-            self.last_sync_err = Some((
-                id.to_string(),
-                err.unwrap_or_default().to_string(),
-                now_secs(),
-            ));
+            let msg = err.unwrap_or_default().to_string();
+            self.last_sync_err = Some((id.to_string(), msg.clone(), now));
+            if outbound {
+                self.last_outbound_err = Some((msg.clone(), now));
+                self.outbound_failures = self.outbound_failures.saturating_add(1);
+                // Only annotate a peer we already know; a failed dial must not
+                // conjure a roster row (that is what made failed syncs look
+                // like members, known-issues #23).
+                if let Some(e) = self.peers.get_mut(id) {
+                    e.last_dial_err = Some((msg, now));
+                }
+            }
+        }
+    }
+
+    /// Record that the rendezvous resolved to another master whose record was
+    /// published within the freshness window: that master is alive right now,
+    /// whatever our dials say.
+    pub(crate) fn note_rendezvous_alive(&mut self) {
+        self.rendezvous_alive = now_secs();
+    }
+
+    /// Outbound / inbound dial history for the transport-repair ladder.
+    pub(crate) fn dial_stats(&self) -> DialStats {
+        DialStats {
+            last_outbound_ok: self.last_outbound_ok,
+            last_outbound_err: self.last_outbound_err.clone(),
+            outbound_failures: self.outbound_failures,
+            last_inbound_ok: self.last_inbound_ok,
+            rendezvous_alive: self.rendezvous_alive,
         }
     }
 
@@ -481,6 +585,9 @@ impl PeerRoster {
                     manifest_fp: e.manifest_fp,
                     unhealthy_secs: 0, // filled by Engine::peers from the health tracks
                     path: None,        // filled by Engine::annotate_peer_paths
+                    last_dial_ok: e.last_dial_ok,
+                    last_dial_err: e.last_dial_err.as_ref().map(|(m, _)| m.clone()),
+                    last_dial_err_at: e.last_dial_err.as_ref().map(|(_, t)| *t).unwrap_or(0),
                 }
             })
             .collect();
@@ -501,6 +608,9 @@ impl PeerRoster {
                 manifest_fp: 0,
                 unhealthy_secs: 0,
                 path: None,
+                last_dial_ok: 0,
+                last_dial_err: None,
+                last_dial_err_at: 0,
             });
         }
         out
@@ -715,6 +825,40 @@ const PRESENCE_REBUILD_MIN_SECS: i64 = 90;
 /// hysteresis on a genuine recovery is at most one redundant (idempotent) rebuild.
 const HEAL_CLEAR_SECS: i64 = 60;
 
+/// Transport-repair ladder (known-issues #36). The two #23 ladders repair
+/// things *above* the transport (gossip subscription, doc-sync session, relay
+/// map); none of them can help when the iroh endpoint itself has stopped being
+/// able to reach a member — the field signature was a daemon that could not
+/// dial a peer for days while a fresh endpoint on the same host reached it in
+/// 0.3 s. The only remedy that ever worked was a restart, so this ladder does
+/// the restart's work in-process, in two rungs, and only when the peer is
+/// provably alive (so a genuinely offline fleet never churns the endpoint).
+///
+/// Rung 1 after this long of "alive but every outbound dial fails": re-probe
+/// the network (`Endpoint::network_change`, the same rebind `on_resume` does)
+/// and re-kick the share.
+const OUTBOUND_DEAD_SECS: i64 = 300;
+/// Rung 2: if rung 1 did not restore outbound dials within another
+/// [`OUTBOUND_DEAD_SECS`], rebuild the whole iroh node in-process
+/// ([`Engine::rebuild_transport`]).
+const OUTBOUND_REBUILD_SECS: i64 = 600;
+/// Consecutive failed outbound dials before the condition counts at all — a
+/// single timeout is weather.
+const OUTBOUND_MIN_FAILURES: u32 = 3;
+/// "Provably alive" = any genuine contact from a member, a doc-sync a member
+/// initiated toward us, or a fresh rendezvous record from another master,
+/// within this window.
+const PEER_ALIVE_WINDOW_SECS: i64 = 600;
+/// Rebuilds are spaced at least this far apart, doubling while the fault
+/// persists up to [`TRANSPORT_REBUILD_MAX_SECS`]; the spacing resets once no
+/// share is in an outbound-dead episode.
+const TRANSPORT_REBUILD_MIN_SECS: i64 = 900;
+const TRANSPORT_REBUILD_MAX_SECS: i64 = 7200;
+/// After this many consecutive *failed* rebuilds the engine reports a fatal
+/// transport ([`Engine::transport_fatal`]) and the daemon exits for its
+/// supervisor (service recovery / `systemd` `Restart=on-failure`) — rung 3.
+const TRANSPORT_REBUILD_MAX_FAILURES: u32 = 2;
+
 /// Stall watchdog: an in-flight download older than this is presumed wedged and is
 /// aborted so the next reconcile re-queues it (verified chunks persist on disk, so
 /// a healthy-but-slow fetch that gets recycled resumes where it left off — the cost
@@ -897,6 +1041,30 @@ fn presence_overlay_dead(
         && last_contact != 0
         && now - last_contact <= PRESENCE_TRANSPORT_FRESH_SECS
         && (last_presence == 0 || now - last_presence > PRESENCE_HEARD_TTL_SECS)
+}
+
+/// Whether a share's members are provably alive while every doc-sync dial *we*
+/// make fails (the ladder-3 condition of [`Engine::connectivity_recoveries`],
+/// known-issues #36). Pure so it is unit-testable.
+///
+/// "Alive" is any of: genuine contact from a member (`last_contact`: presence,
+/// a remote insert, a neighbor-up), a sync a member initiated toward us that
+/// succeeded, or the rendezvous resolving to another master with a fresh
+/// record — all within [`PEER_ALIVE_WINDOW_SECS`]. "Dials fail" is the most
+/// recent outbound sync error being newer than the last outbound success with
+/// at least [`OUTBOUND_MIN_FAILURES`] consecutive failures. The sustained-time
+/// guard lives in the caller's [`EpisodeClock`].
+fn outbound_dead(known: u32, last_contact: i64, dial: &DialStats, now: i64) -> bool {
+    let Some((_, err_at)) = dial.last_outbound_err.as_ref() else {
+        return false;
+    };
+    let alive = [last_contact, dial.last_inbound_ok, dial.rendezvous_alive]
+        .iter()
+        .any(|t| *t != 0 && now - *t <= PEER_ALIVE_WINDOW_SECS);
+    known > 0
+        && *err_at > dial.last_outbound_ok
+        && dial.outbound_failures >= OUTBOUND_MIN_FAILURES
+        && alive
 }
 
 /// Rebuild one share's gossip/presence subscription from its current known-member
@@ -1779,6 +1947,8 @@ pub struct ReconcileJob {
     /// load-balanced provider set (and to cancel them on pause).
     downloader: Downloader,
     downloads_inflight: Arc<StdMutex<HashMap<Hash, InflightDownload>>>,
+    /// The engine generation this job was built in (see [`Engine::generation`]).
+    generation: u64,
     /// Live peer roster, read at download time to pick current online providers
     /// (dynamic discovery), rather than relying on the job-creation snapshot in
     /// `providers`.
@@ -1846,6 +2016,13 @@ impl ReconcileJob {
     /// Cloneable handle to this job's current-phase breadcrumb, so a watchdog can
     /// report where an overrunning pass is stuck while [`run`](Self::run) holds
     /// `&self`.
+    /// The engine generation this job belongs to; pass it back to
+    /// [`Engine::finish_reconcile`] so a job that outlived a transport rebuild
+    /// cannot commit stale results into the reopened share.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub fn phase_handle(&self) -> Arc<StdMutex<String>> {
         self.phase.clone()
     }
@@ -3465,6 +3642,17 @@ pub struct Engine {
     /// The watchdog task, aborted on [`Engine::shutdown`] so tests that build
     /// many engines don't accumulate tickers.
     relay_watchdog: tokio::task::AbortHandle,
+    /// Where the node lives, kept so [`Engine::rebuild_transport`] can respawn
+    /// the iroh stack on the same key, blob store and docs directory.
+    data_dir: PathBuf,
+    blobs_dir: PathBuf,
+    /// Bumped by every [`Engine::rebuild_transport`]. A [`ReconcileJob`] built
+    /// before a rebuild holds handles into the *old* node; its result is fenced
+    /// off by [`Engine::finish_reconcile`] so it cannot commit into the fresh
+    /// share state.
+    generation: u64,
+    /// Rung 2/3 throttling for the transport-repair ladder (known-issues #36).
+    transport: TransportHeal,
     /// Live set for the blob store's GC loop (known-issues #22). Republished from
     /// the current replicas each periodic tick via [`Engine::gc_refresh_job`];
     /// the store's GC callback copies it in before each sweep.
@@ -3576,6 +3764,10 @@ impl Engine {
             relay_fallback,
             force_relay_fallback,
             relay_watchdog,
+            data_dir: data_dir.to_path_buf(),
+            blobs_dir: blobs_dir.to_path_buf(),
+            generation: 0,
+            transport: TransportHeal::default(),
             gc_protect,
         };
         engine.reload_shares().await?;
@@ -4169,6 +4361,9 @@ impl Engine {
                 .map(|r| crate::health::accrued(r, now))
                 .unwrap_or(0),
             path: None,
+            last_dial_ok: 0,
+            last_dial_err: None,
+            last_dial_err_at: 0,
         }];
         out.extend(state.roster.lock().map(|r| r.infos()).unwrap_or_default());
         // Health episodes are keyed by the FULL endpoint id; `infos()` shows the
@@ -4798,6 +4993,7 @@ impl Engine {
                 master_pub: s.key.master_pub_bytes(),
                 doc: s.doc.clone(),
                 presence: s.presence.as_ref().map(|h| h.sender.clone()),
+                roster: s.roster.clone(),
             });
         }
         out
@@ -4845,6 +5041,11 @@ impl Engine {
         let now = now_secs();
         let mut any_partitioned = false;
         let mut jobs = Vec::new();
+        // Ladder 3 (known-issues #36) bookkeeping, resolved after the loop
+        // because rung 1 and rung 2 act on the shared endpoint.
+        let mut rung1: Vec<String> = Vec::new();
+        let mut want_rebuild = false;
+        let mut any_outbound_episode = false;
 
         for (id, s) in self.shares.iter_mut() {
             if s.paused || paused_all {
@@ -4852,7 +5053,7 @@ impl Engine {
                 continue;
             }
             // One roster snapshot drives both ladders.
-            let (known, last_contact, last_presence, last_err) = s
+            let (known, last_contact, last_presence, last_err, dial) = s
                 .roster
                 .lock()
                 .map(|r| {
@@ -4861,9 +5062,10 @@ impl Engine {
                         r.last_contact(),
                         r.last_presence(),
                         r.last_sync_err().map(|(p, e, _)| format!("{p}: {e}")),
+                        r.dial_stats(),
                     )
                 })
-                .unwrap_or((0, 0, 0, None));
+                .unwrap_or((0, 0, 0, None, DialStats::default()));
             let isolated = s.isolated();
 
             // --- Ladder 1: total isolation ---
@@ -4943,6 +5145,143 @@ impl Engine {
                     }
                 }
             }
+
+            // --- Ladder 3: members alive, our outbound dials dead (known-issues #36) ---
+            let dead = outbound_dead(known, last_contact, &dial, now);
+            match s.heal.outbound.observe(dead, now) {
+                Some(elapsed) => {
+                    any_outbound_episode = true;
+                    if elapsed >= OUTBOUND_DEAD_SECS && !s.heal.outbound_warned {
+                        s.heal.outbound_warned = true;
+                        let (err, err_age) = dial
+                            .last_outbound_err
+                            .as_ref()
+                            .map(|(m, t)| (m.clone(), now - t))
+                            .unwrap_or_default();
+                        let age = |t: i64| {
+                            if t == 0 {
+                                "never".to_string()
+                            } else {
+                                format!("{}s ago", now - t)
+                            }
+                        };
+                        tracing::warn!(
+                            "share {id}: members are alive (contact {}, inbound sync {}, \
+                             rendezvous {}) but every outbound dial has failed for {elapsed}s \
+                             ({} consecutive; last {err_age}s ago: {err}) — transport repair \
+                             engaging (known-issues #36)",
+                            age(last_contact),
+                            age(dial.last_inbound_ok),
+                            age(dial.rendezvous_alive),
+                            dial.outbound_failures,
+                        );
+                    }
+                    if elapsed >= OUTBOUND_DEAD_SECS && s.heal.rung1_at == 0 {
+                        s.heal.rung1_at = now;
+                        rung1.push(id.clone());
+                    }
+                    if elapsed >= OUTBOUND_REBUILD_SECS
+                        && s.heal.rung1_at != 0
+                        && now - s.heal.rung1_at >= OUTBOUND_DEAD_SECS
+                    {
+                        want_rebuild = true;
+                    }
+                }
+                None => {
+                    if std::mem::take(&mut s.heal.outbound_warned) {
+                        tracing::info!(
+                            "share {id}: outbound dials succeeding again — transport episode over"
+                        );
+                    }
+                    s.heal.rung1_at = 0;
+                }
+            }
+        }
+
+        // Ladder 3, rung 1: the cheap restart-equivalent — rebind the socket,
+        // re-home the relay, and let iroh re-probe every remote (exactly what
+        // `on_resume` does for a known teardown), then re-kick the share.
+        if !rung1.is_empty() {
+            tracing::warn!(
+                "transport repair rung 1: re-probing the network for {} share(s)",
+                rung1.len()
+            );
+            let _ = tokio::time::timeout(
+                Duration::from_secs(RESUME_NETWORK_CHANGE_TIMEOUT_SECS),
+                self.node.endpoint.network_change(),
+            )
+            .await;
+            for id in &rung1 {
+                if let Some(s) = self.shares.get_mut(id) {
+                    s.heal.last_presence_rebuild = now;
+                    let _ = rebuild_presence(&gossip, self_id, id, s).await;
+                    let peers: Vec<iroh::EndpointAddr> = peer_providers(&s.key, &s.roster)
+                        .into_iter()
+                        .filter(|pid| *pid != self_id)
+                        .map(iroh::EndpointAddr::new)
+                        .collect();
+                    if !peers.is_empty() {
+                        jobs.push(DocResync {
+                            share_id: id.clone(),
+                            doc: s.doc.clone(),
+                            peers,
+                        });
+                    }
+                }
+            }
+        }
+        if !any_outbound_episode {
+            self.transport.backoff = 0;
+        }
+        // Ladder 3, rung 2: rung 1 did not bring outbound dials back — rebuild
+        // the iroh node in-process. Spaced with doubling backoff so a member
+        // that is alive-but-unreachable for a network reason we cannot fix
+        // costs at most one rebuild per backoff window.
+        if want_rebuild {
+            let min_gap = if self.transport.backoff == 0 {
+                TRANSPORT_REBUILD_MIN_SECS
+            } else {
+                self.transport.backoff
+            };
+            if self.transport.last_rebuild == 0 || now - self.transport.last_rebuild >= min_gap {
+                self.transport.last_rebuild = now;
+                self.transport.backoff = (min_gap * 2).min(TRANSPORT_REBUILD_MAX_SECS);
+                self.transport.rebuilds += 1;
+                let n = self.transport.rebuilds;
+                tracing::warn!(
+                    "transport repair rung 2: rebuilding the iroh endpoint in-process \
+                     (rebuild #{n}; the daemon-restart equivalent, known-issues #36)"
+                );
+                match self.rebuild_transport().await {
+                    Ok(took) => {
+                        self.transport.failures = 0;
+                        tracing::info!(
+                            "transport rebuilt in {:.1}s: {} share(s) reopened on the same \
+                             endpoint id; outbound dials will be re-evaluated",
+                            took.as_secs_f32(),
+                            self.shares.len()
+                        );
+                    }
+                    Err(e) => {
+                        self.transport.failures += 1;
+                        tracing::error!(
+                            "transport rebuild failed ({} consecutive): {e:#}",
+                            self.transport.failures
+                        );
+                        if self.transport.failures >= TRANSPORT_REBUILD_MAX_FAILURES {
+                            self.transport.fatal = Some(format!(
+                                "{} consecutive in-process transport rebuilds failed; last: {e:#}",
+                                self.transport.failures
+                            ));
+                        }
+                    }
+                }
+                // Every share was just recreated: the re-kick jobs collected above
+                // hold handles into the old node.
+                jobs.clear();
+                self.force_relay_fallback.store(false, Ordering::Relaxed);
+                return jobs;
+            }
         }
 
         // Endpoint-wide: fall back to the public relays while ANY share is provably
@@ -4952,6 +5291,80 @@ impl Engine {
         self.force_relay_fallback
             .store(any_partitioned, Ordering::Relaxed);
         jobs
+    }
+
+    /// Tear down and respawn the whole iroh stack **in-process** — rung 2 of the
+    /// transport-repair ladder (known-issues #36) and the exact work a daemon
+    /// restart does at the transport layer: same `node.key` (the endpoint id
+    /// does not change), same blob store and docs directory, fresh endpoint /
+    /// gossip / docs actors, every share reopened from the DB and re-kicked.
+    ///
+    /// Everything that held a handle into the old node is invalidated: in-flight
+    /// downloads and reconcile passes are cancelled first, and any pass that
+    /// still completes afterwards is fenced off by the generation bump (see
+    /// [`Engine::finish_reconcile`]). Runs under the engine lock; takes a few
+    /// seconds. Returns how long it took.
+    pub async fn rebuild_transport(&mut self) -> anyhow::Result<Duration> {
+        let started = std::time::Instant::now();
+        self.cancel_all_downloads();
+        self.cancel_all_reconciles();
+        self.relay_watchdog.abort();
+        // Dropping the share states aborts their presence receive tasks and
+        // releases their doc handles; the docs actor itself goes with the node.
+        self.shares.clear();
+        self.locked.clear();
+        self.reclaim_pending.clear();
+        if let Ok(mut m) = self.progress.lock() {
+            m.clear();
+        }
+        self.generation += 1;
+
+        let settings = self
+            .relay_settings
+            .lock()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        self.node
+            .rebuild(
+                &self.data_dir,
+                &self.blobs_dir,
+                &settings,
+                Some(self.gc_protect.gc_config()),
+            )
+            .await
+            .context("rebuild iroh node")?;
+        self.author = self.node.docs_api().author_default().await?;
+
+        // The watchdog and its flags belong to the endpoint that just died.
+        self.relay_fallback.store(false, Ordering::Relaxed);
+        self.force_relay_fallback.store(false, Ordering::Relaxed);
+        self.relay_watchdog = tokio::spawn(crate::relays::relay_watchdog(
+            self.node.endpoint.clone(),
+            self.relay_settings.clone(),
+            self.relay_fallback.clone(),
+            self.force_relay_fallback.clone(),
+        ))
+        .abort_handle();
+
+        // Give the fresh endpoint a moment to home on a relay so the reopened
+        // shares' first dials and the next rendezvous publish carry a full
+        // address. Bounded: an offline host must not stall the engine lock.
+        let _ = tokio::time::timeout(Duration::from_secs(10), self.node.endpoint.online()).await;
+        self.reload_shares().await.context("reopen shares")?;
+        self.gc_refresh_job().run().await;
+        Ok(started.elapsed())
+    }
+
+    /// Set once the transport-repair ladder has given up on in-process rebuilds
+    /// ([`TRANSPORT_REBUILD_MAX_FAILURES`] consecutive failures). The daemon
+    /// should log it and exit non-zero so its supervisor restarts the process.
+    pub fn transport_fatal(&self) -> Option<String> {
+        self.transport.fatal.clone()
+    }
+
+    /// How many in-process transport rebuilds this engine has performed.
+    pub fn transport_rebuilds(&self) -> u32 {
+        self.transport.rebuilds
     }
 
     /// Force a full connectivity re-establish after a system resume.
@@ -5199,8 +5612,9 @@ impl Engine {
         ignore: Vec<String>,
     ) -> anyhow::Result<CreatedShare> {
         let (created, job) = self.create_open(folder, ignore).await?;
+        let generation = job.generation();
         let outcome = job.run().await;
-        self.finish_reconcile(&created.share_id, outcome.ok());
+        self.finish_reconcile(&created.share_id, generation, outcome.ok());
         Ok(created)
     }
 
@@ -5290,6 +5704,7 @@ impl Engine {
             self_id,
             downloader,
             downloads_inflight,
+            generation: self.generation,
             roster: state.roster.clone(),
             prev_skipped: state.skipped.clone(),
             base,
@@ -5307,9 +5722,28 @@ impl Engine {
     /// Commit a [`ReconcileJob`] result and clear its busy guard. `outcome` is
     /// `Some` on success (persists the index mutations, health, and signature) and
     /// `None` on failure (just clears the guard).
-    pub fn finish_reconcile(&mut self, share_id: &str, outcome: Option<ReconcileOutcome>) {
+    ///
+    /// `generation` is the job's [`ReconcileJob::generation`]. A job built before
+    /// an in-process transport rebuild ran against handles that no longer exist
+    /// and against share state that has since been recreated; its outcome (or
+    /// its failure) is dropped here rather than committed or allowed to clear
+    /// the fresh state's busy guard.
+    pub fn finish_reconcile(
+        &mut self,
+        share_id: &str,
+        generation: u64,
+        outcome: Option<ReconcileOutcome>,
+    ) {
         if let Ok(mut m) = self.progress.lock() {
             m.remove(share_id);
+        }
+        if generation != self.generation {
+            tracing::debug!(
+                "reconcile {share_id}: dropping result from generation {generation} \
+                 (engine is at {})",
+                self.generation
+            );
+            return;
         }
         let Some(out) = outcome else {
             if let Some(state) = self.shares.get_mut(share_id) {
@@ -5485,14 +5919,15 @@ impl Engine {
         let Some(job) = self.make_reconcile_job(share_id)? else {
             return Ok(false);
         };
+        let generation = job.generation();
         match job.run().await {
             Ok(o) => {
                 let changed = o.changed;
-                self.finish_reconcile(share_id, Some(o));
+                self.finish_reconcile(share_id, generation, Some(o));
                 Ok(changed)
             }
             Err(e) => {
-                self.finish_reconcile(share_id, None);
+                self.finish_reconcile(share_id, generation, None);
                 Err(e)
             }
         }
@@ -5772,10 +6207,18 @@ async fn spawn_event_task(
                             // every peer online for the TTL on each retry and the fleet
                             // flaps "Syncing ↔ offline" while nothing actually connects
                             // (known-issues #23, #16).
-                            LiveEvent::SyncFinished(se) => match &se.result {
-                                Ok(_) => r.note(&peer, None),
-                                Err(err) => r.note_sync_finished(&peer, false, Some(err.as_str())),
-                            },
+                            LiveEvent::SyncFinished(se) => {
+                                let outbound = matches!(se.origin, Origin::Connect(_));
+                                match &se.result {
+                                    Ok(_) => r.note_sync_finished(&peer, outbound, true, None),
+                                    Err(err) => r.note_sync_finished(
+                                        &peer,
+                                        outbound,
+                                        false,
+                                        Some(err.as_str()),
+                                    ),
+                                }
+                            }
                             _ => r.note(&peer, None),
                         }
                     }
@@ -5784,7 +6227,11 @@ async fn spawn_event_task(
                     // is diagnosable. Debug-level: it fires on every retry.
                     if let LiveEvent::SyncFinished(se) = e {
                         if let Err(err) = &se.result {
-                            tracing::debug!("doc sync with {peer} failed: {err}");
+                            let dir = match se.origin {
+                                Origin::Connect(_) => "outbound",
+                                Origin::Accept => "inbound",
+                            };
+                            tracing::debug!("{dir} doc sync with {peer} failed: {err}");
                         }
                     }
                 }
@@ -5949,7 +6396,7 @@ mod tests {
 
         // A failed dial: not contact. No online peer, no advanced last-contact, but
         // the error is recorded for diagnostics.
-        r.note_sync_finished(&peer, false, Some("connection timed out"));
+        r.note_sync_finished(&peer, true, false, Some("connection timed out"));
         assert_eq!(r.counts().0, 0, "a failed sync must not mark a peer online");
         assert_eq!(r.last_contact(), 0, "a failed sync is not genuine contact");
         assert!(
@@ -5959,7 +6406,7 @@ mod tests {
 
         // Repeated failures (the retry loop) never flip it online either.
         for _ in 0..5 {
-            r.note_sync_finished(&peer, false, Some("connection timed out"));
+            r.note_sync_finished(&peer, true, false, Some("connection timed out"));
         }
         assert_eq!(
             r.counts().0,
@@ -5968,9 +6415,80 @@ mod tests {
         );
 
         // A *successful* sync IS contact and marks the peer online.
-        r.note_sync_finished(&peer, true, None);
+        r.note_sync_finished(&peer, true, true, None);
         assert_eq!(r.counts().0, 1, "a successful sync marks the peer online");
         assert!(r.last_contact() > 0, "success advances last-contact");
+    }
+
+    /// Ladder-3 trigger (known-issues #36): only "members provably alive AND our
+    /// outbound dials failing repeatedly" counts; a dead fleet, a single timeout,
+    /// or a recent outbound success never does.
+    #[test]
+    fn outbound_dead_needs_alive_members_and_repeated_dial_failures() {
+        let now = 10_000;
+        let failing = DialStats {
+            last_outbound_ok: now - 900,
+            last_outbound_err: Some(("timed out".into(), now - 5)),
+            outbound_failures: 6,
+            last_inbound_ok: now - 30,
+            rendezvous_alive: 0,
+        };
+        assert!(
+            outbound_dead(1, 0, &failing, now),
+            "inbound syncs land while every outbound dial fails: the wedge signature"
+        );
+        assert!(
+            !outbound_dead(0, 0, &failing, now),
+            "no known members: nothing to repair"
+        );
+
+        // Nobody alive: a fleet that is simply off must not churn the endpoint.
+        let nobody = DialStats {
+            last_inbound_ok: 0,
+            ..failing.clone()
+        };
+        assert!(!outbound_dead(1, 0, &nobody, now));
+        assert!(
+            !outbound_dead(1, now - PEER_ALIVE_WINDOW_SECS - 1, &nobody, now),
+            "contact older than the alive window does not count"
+        );
+        assert!(
+            outbound_dead(1, now - 10, &nobody, now),
+            "any genuine contact within the window counts as alive"
+        );
+        assert!(
+            outbound_dead(
+                1,
+                0,
+                &DialStats {
+                    rendezvous_alive: now - 60,
+                    ..nobody.clone()
+                },
+                now
+            ),
+            "a fresh rendezvous record from another master counts as alive"
+        );
+
+        // One timeout is weather; a recent outbound success clears it.
+        assert!(!outbound_dead(
+            1,
+            0,
+            &DialStats {
+                outbound_failures: 1,
+                ..failing.clone()
+            },
+            now
+        ));
+        assert!(!outbound_dead(
+            1,
+            0,
+            &DialStats {
+                last_outbound_ok: now - 2,
+                ..failing.clone()
+            },
+            now
+        ));
+        assert!(!outbound_dead(1, now - 10, &DialStats::default(), now));
     }
 
     /// Ladder-2 trigger (known-issues #23): the presence

@@ -290,13 +290,14 @@ impl MobileEngine {
                 engine.create_open(&PathBuf::from(folder), ignore).await?
             };
             inner.listener.on_share_list_changed();
+            let generation = job.generation();
             let outcome = job.run().await;
             if let Err(e) = &outcome {
                 tracing::warn!("initial import for {} failed: {e:#}", created.share_id);
             }
             {
                 let mut engine = inner.engine.lock().await;
-                engine.finish_reconcile(&created.share_id, outcome.ok());
+                engine.finish_reconcile(&created.share_id, generation, outcome.ok());
             }
             inner.listener.on_share_list_changed();
             Ok(CreatedShare {
@@ -492,6 +493,7 @@ async fn reconcile_loop(inner: Arc<Inner>) {
                     .flatten()
             };
             let Some(job) = job else { continue };
+            let generation = job.generation();
             match job.run().await {
                 Ok(outcome) => {
                     let did = outcome.changed();
@@ -499,14 +501,18 @@ async fn reconcile_loop(inner: Arc<Inner>) {
                         .engine
                         .lock()
                         .await
-                        .finish_reconcile(&id, Some(outcome));
+                        .finish_reconcile(&id, generation, Some(outcome));
                     if did {
                         changed.push(id);
                     }
                 }
                 Err(e) => {
                     tracing::warn!("reconcile {id} failed: {e:#}");
-                    inner.engine.lock().await.finish_reconcile(&id, None);
+                    inner
+                        .engine
+                        .lock()
+                        .await
+                        .finish_reconcile(&id, generation, None);
                 }
             }
         }
