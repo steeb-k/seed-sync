@@ -175,7 +175,12 @@ val cargoHostBuild by tasks.registering(Exec::class) {
     group = "rust"
     description = "Build the host seed-mobile cdylib for UniFFI binding generation"
     workingDir = workspaceRoot
-    commandLine(cargo("build", "-p", "seed-mobile", "--lib"))
+    // Release profile on purpose: the binding generator only reads UniFFI
+    // metadata, which is identical in either profile, and a debug build of the
+    // whole seed-core stack costs ~8 GB of target/ next to the release build the
+    // MSI/tarball steps already produced (the 0.7.4 release ran out of disk on
+    // exactly this step).
+    commandLine(cargo("build", "-p", "seed-mobile", "--lib", "--release"))
 }
 
 val hostLibName = when {
@@ -189,12 +194,12 @@ val uniffiBindgen by tasks.registering(Exec::class) {
     description = "Generate Kotlin UniFFI bindings from the host seed-mobile library"
     dependsOn(cargoHostBuild)
     workingDir = workspaceRoot
-    val hostLib = File(workspaceRoot, "target/debug/$hostLibName")
+    val hostLib = File(workspaceRoot, "target/release/$hostLibName")
     val outDir = uniffiOutDir.asFile
     doFirst { outDir.mkdirs() }
     commandLine(
         cargo(
-            "run", "-p", "seed-mobile", "--features", "bindgen", "--bin", "uniffi-bindgen", "--",
+            "run", "--release", "-p", "seed-mobile", "--features", "bindgen", "--bin", "uniffi-bindgen", "--",
             "generate", "--library", hostLib.absolutePath,
             "--language", "kotlin", "--out-dir", outDir.absolutePath
         )
