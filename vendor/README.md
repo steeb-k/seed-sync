@@ -16,7 +16,7 @@ Current state (verified 2026-07-24):
 | Crate | Version | Hunks | Issue | Upstream status |
 |-------|---------|-------|-------|-----------------|
 | `iroh` | 1.0.3 | 1 | known-issues #9 | tracked as [iroh#4390](https://github.com/n0-computer/iroh/issues/4390) — open |
-| `iroh-blobs` | 0.103.0 | 2 | known-issues #25, #9 | unfixed on `main` |
+| `iroh-blobs` | 0.103.0 | 3 | known-issues #25, #9, #38 | unfixed on `main` |
 | `iroh-docs` | 0.101.0 | 2 | known-issues #5 | unfixed on `main` |
 
 Issue numbers are the **current** `docs/known-issues.md` numbering. That doc was
@@ -59,7 +59,7 @@ Note the issue's closing observation, which we have *not* addressed: persistent
 `MaxPathIdReached` suggests unreachable candidate paths are not being abandoned
 to free path-id budget. Dedup+cap fixes the memory, not that root cause.
 
-## iroh-blobs 0.103.0 — Windows cross-volume reference export (hunk 1 of 2)
+## iroh-blobs 0.103.0 — Windows cross-volume reference export (hunk 1 of 3)
 
 **Why:** `ExportMode::TryReference` (used so a viewer references its mirror file
 instead of keeping a second copy) moves the owned blob with `std::fs::rename` and
@@ -77,7 +77,7 @@ Inert on Linux/macOS (they hit 18, already handled).
 
 **Status:** still unfixed on upstream `main` (re-check before re-vendoring).
 
-## iroh-blobs 0.103.0 — bounded provider accept loop (hunk 2 of 2)
+## iroh-blobs 0.103.0 — bounded provider accept loop (hunk 2 of 3)
 
 **Why:** `handle_connection` (`src/provider.rs`) spawns one detached task per
 inbound request stream with no cap, so a fleet's swarm retry storm piles
@@ -90,6 +90,41 @@ instead of the node buffering without limit. 16 matches one full swarm's part
 fan-out on the requesting side.
 
 **Status:** still unfixed on upstream `main` (re-check before re-vendoring).
+
+## iroh-blobs 0.103.0 — a poisoned in-memory handle recovers (hunk 3 of 3)
+
+**Why:** each hash's in-memory `BaoFileHandle` (`src/store/fs/bao_file.rs`) goes
+`Poisoned` in two ways, and upstream never leaves that state for the life of the
+handle. (1) Loading the entry failed — typically an owned `data/<hash>.data` that
+is gone while the DB still says `Complete`. (2) The entity's idle `persist`
+(`ActiveEntityState::persist`, `fs.rs`) does `guard.take()`, which leaves **every**
+state Poisoned, on the assumption that the entity manager recycles and resets the
+handle immediately afterwards — but `recycle` is skipped whenever anything else
+still holds a reference (a peer's `observe` stream, an in-flight export), so a
+handle that is being *used* is exactly the one that stays poisoned. From then on
+every `export_bao` fails with "poisoned storage" and the provider resets each
+peer's stream with `ERR_INTERNAL`, while `Blobs::has` (a DB read) keeps saying
+yes. Observed in the field as one member refusing 44 files it held on disk, for
+hours, to two members retrying every pass. See known-issues #38.
+
+**The patch** (four sites, all marked `SEED-SYNC PATCH`):
+- `fs.rs` `load()`: `Poisoned` reloads from the DB on the next use, like `Initial`.
+- `fs.rs` `finish_import_impl`: an import over a *poisoned* handle **replaces**
+  the DB entry (`db.set`) instead of merging into it (`update`). The merge rule
+  (`DataLocation::union`) keeps `Owned` over `External` — "owned needs to win,
+  since it has an associated file" — so re-importing the file by reference left
+  the DB pointing at the owned data file that no longer existed, and every reload
+  failed again. Only taken when the existing entry was unreadable.
+- `bao_file.rs` `BaoFileHandle::complete`: a completed import supersedes a
+  poisoned handle (a reload of a truly broken entry poisons it again right before
+  `finish_import` runs, and the import's data + outboard are valid by construction).
+- `bao_file.rs` `BaoFileStorage::bitfield`: an empty bitfield for `Poisoned`
+  instead of a panic — `observe` on a still-broken entry otherwise panicked the
+  store's actor thread and took every later store operation down with it.
+Tier-1 test: `crates/seed-core/tests/serve_repair.rs` (both tests fail without it,
+with "poisoned storage" on the post-repair export).
+
+**Status:** unfixed on upstream `main` (re-check before re-vendoring).
 
 ## iroh-docs 0.101.0 — sync-actor / LiveActor deadlock (2 hunks)
 

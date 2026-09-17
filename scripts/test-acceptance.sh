@@ -22,6 +22,7 @@ ALL_SUITES=(
   "seed-core:persistence"
   "seed-core:keystore"
   "seed-core:missing_folder"
+  "seed-core:serve_repair"
   "seed-core:loopback"
   "seed-core:share_removal"
   "seed-core:live_folder"

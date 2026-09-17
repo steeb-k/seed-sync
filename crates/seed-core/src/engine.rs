@@ -938,6 +938,10 @@ async fn load_seed_bounded(share_id: &str) -> anyhow::Result<[u8; 32]> {
     }
 }
 
+/// Blobs a share has proved it can serve (see `ShareState::servable`), shared
+/// between the engine and the reconcile jobs.
+type ServableSet = Arc<StdMutex<HashSet<Hash>>>;
+
 /// Why a share is held inert (see [`Engine::inert`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InertCause {
@@ -2008,6 +2012,9 @@ pub struct ReconcileJob {
     /// Per-job, which is per-pass, so an unreachable peer is dialed once and then
     /// skipped for the remaining paths instead of once per file.
     dead_providers: Arc<StdMutex<HashSet<String>>>,
+    /// Shared with the owning `ShareState`: blobs proved servable by a read probe.
+    /// See `ShareState::servable`.
+    servable: ServableSet,
 }
 
 impl ReconcileJob {
@@ -2102,6 +2109,44 @@ impl ReconcileJob {
         let hash = tag.hash();
         self.gc_protect.note_added(hash);
         Ok(hash)
+    }
+
+    /// Can this node actually hand `hash` to a peer? `Blobs::has` is a metadata
+    /// lookup: an entry whose owned data file was deleted (a GC sweep, a cleanup)
+    /// or whose by-reference file has moved still counts as present, but every
+    /// export of it fails and the provider resets the peer's stream — and health
+    /// credited it anyway, so the member read 100% over content it could not
+    /// serve (known-issues #38). Reading the first chunk through the store is the
+    /// same operation a peer's fetch performs, so it fails exactly when they do.
+    /// Proved hashes are cached per share; a deep verify clears the cache.
+    async fn blob_servable(&self, hash: Hash, path: &str) -> bool {
+        if self
+            .servable
+            .lock()
+            .map(|s| s.contains(&hash))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        match self.blobs.blobs().export_chunk(hash, 0).await {
+            Ok(_) => {
+                self.mark_servable(hash);
+                true
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "{path}: the store lists {hash} but cannot read it ({e:#}); peers fetching \
+                     this file from us are being refused — re-importing it from disk"
+                );
+                false
+            }
+        }
+    }
+
+    fn mark_servable(&self, hash: Hash) {
+        if let Ok(mut s) = self.servable.lock() {
+            s.insert(hash);
+        }
     }
 
     async fn import_one(&self, path: &str, abs: &Path) -> anyhow::Result<Vec<u8>> {
@@ -3029,6 +3074,14 @@ impl ReconcileJob {
         // Index rows this pass proved stale by hashing the file itself. Collected
         // rather than pushed straight onto `index_sets`, which `on_disk` borrows.
         let mut index_repairs: Vec<(String, Vec<u8>)> = Vec::new();
+        // A deep verify re-proves servability from scratch, so a blob that broke
+        // since it was last probed is caught within one verify interval even if no
+        // peer ever asks for it.
+        if self.force_scan {
+            if let Ok(mut s) = self.servable.lock() {
+                s.clear();
+            }
+        }
         for (path, re) in &remote {
             // `remote` was read at the top of the pass, so it is stale for paths we
             // published or tombstoned since — for those, our disk *is* the new
@@ -3043,7 +3096,9 @@ impl ReconcileJob {
             let hash = to_hash(&re.hash)?;
             let indexed = on_disk.get(path.as_str()) == Some(&re.hash.as_slice());
             let in_store = self.blobs.blobs().has(hash).await?;
-            if indexed && in_store {
+            // Listed is not servable: prove it with a read (known-issues #38).
+            let servable_now = in_store && self.blob_servable(hash, path).await;
+            if indexed && servable_now {
                 present_bytes += re.size;
                 continue;
             }
@@ -3077,9 +3132,32 @@ impl ReconcileJob {
                 // content the share can no longer hand out — known-issues #17's rule
                 // ("if the app claims X, then X is true") from the other side. So
                 // credit it only once it is genuinely servable again.
-                let servable = in_store
+                let servable = servable_now
                     || match self.reimport_local(&target).await {
-                        Ok(h) => h == hash,
+                        Ok(h) if h == hash => {
+                            // Prove it: an import rewrites the DB entry, but only the
+                            // vendored hunk 3 makes it supersede a poisoned in-memory
+                            // handle. If that ever regresses, say so instead of
+                            // crediting a blob peers still cannot get.
+                            match self.blobs.blobs().export_chunk(hash, 0).await {
+                                Ok(_) => {
+                                    tracing::info!(
+                                        "{path}: re-imported from disk; the blob is servable again"
+                                    );
+                                    self.mark_servable(hash);
+                                    true
+                                }
+                                Err(e) => {
+                                    tracing::error!(
+                                        "{path}: re-imported from disk but the store STILL cannot \
+                                         read {hash} ({e:#}); peers cannot fetch this file from us \
+                                         — a daemon restart reloads the store's handle"
+                                    );
+                                    false
+                                }
+                            }
+                        }
+                        Ok(_) => false,
                         Err(e) => {
                             tracing::warn!(
                                 "{path}: bytes on disk are correct but the blob is gone from the \
@@ -3107,7 +3185,8 @@ impl ReconcileJob {
                 // Both predicates are reported because "the index disagrees" and
                 // "the blob is gone" are very different faults with one symptom.
                 short.push(format!(
-                    "{path} (size={} indexed={indexed} in_store={in_store} local={local})",
+                    "{path} (size={} indexed={indexed} in_store={in_store} \
+                     servable={servable_now} local={local})",
                     re.size
                 ));
             }
@@ -3287,6 +3366,14 @@ struct ShareState {
     /// What the reconcile gate last found the root to be. Doubles as the
     /// once-per-episode log marker: transitions are logged, steady states are not.
     folder_gate: FolderGate,
+    /// Blobs this node has *proved* it can serve: the health pass read a chunk of
+    /// each through the store. `Blobs::has` only says the store lists a hash; a
+    /// listed blob whose data file is gone (or whose referenced file moved) still
+    /// answers "present" while every peer's fetch of it is refused, and that is
+    /// how a member reads `Healthy 100%` over content nobody can get from it
+    /// (known-issues #38). Shared with each [`ReconcileJob`]; cleared by a deep
+    /// verify so the proof is periodically re-established.
+    servable: ServableSet,
     /// Set while a [`ReconcileJob`] for this share is running off-lock, so the
     /// reconcile loop doesn't start a second concurrent publish of it.
     publishing: bool,
@@ -3697,7 +3784,13 @@ pub struct Engine {
     /// the current replicas each periodic tick via [`Engine::gc_refresh_job`];
     /// the store's GC callback copies it in before each sweep.
     gc_protect: GcProtect,
+    /// When each refused hash was last probed by [`Engine::repair_refused_blobs`],
+    /// so a peer retrying every pass costs one probe per [`REFUSED_PROBE_SECS`].
+    refused_probe_at: HashMap<Hash, i64>,
 }
+
+/// Minimum spacing between repair probes of the same refused hash.
+const REFUSED_PROBE_SECS: i64 = 60;
 
 /// A deferred kick of one share's doc live-sync, built under the engine lock (cheap:
 /// clones the `Doc` handle + snapshots the peer set) and run **off** the lock.
@@ -3795,6 +3888,7 @@ impl Engine {
             progress: Arc::new(StdMutex::new(HashMap::new())),
             downloads_inflight: Arc::new(StdMutex::new(HashMap::new())),
             reclaim_pending: std::collections::HashSet::new(),
+            refused_probe_at: HashMap::new(),
             device_name: StdMutex::new(device_name),
             paused_all: StdMutex::new(paused_all),
             sync_suspended: StdMutex::new(false),
@@ -4240,6 +4334,7 @@ impl Engine {
                 last_quick_sig: 0,
                 paused,
                 folder_gate: FolderGate::Open,
+                servable: Arc::new(StdMutex::new(HashSet::new())),
                 publishing: false,
                 cancel: Arc::new(AtomicBool::new(false)),
                 roster,
@@ -5728,6 +5823,158 @@ impl Engine {
         self.inert.get(share_id).map(|l| l.reason.as_str())
     }
 
+    /// Repair every blob a peer asked this node for and could not be served.
+    ///
+    /// The blob provider aborts a transfer when the store lists a hash but cannot
+    /// export it — its owned data file is gone, or the file it references has
+    /// moved — and the peer sees `stream reset by peer: error 3`, forever, while
+    /// this node's own health keeps reading 100% because `Blobs::has` still says
+    /// yes. Observed 2026-09-17: the one complete member of a share refused 44
+    /// files to two newly-added members for hours (known-issues #38).
+    ///
+    /// The refused request is the signal (recorded by the node's provider-event
+    /// watcher, see [`crate::node::RefusedBlobs`]); this drains it each daemon tick.
+    /// For each hash: probe it with a real read (a peer hanging up aborts a
+    /// transfer too, and a healthy blob needs nothing), find the file that carries
+    /// it — the share's index first, the replica second — and re-import that file
+    /// from disk by reference, which rewrites the store entry to point at the bytes
+    /// that are actually there. The peer's next retry then succeeds. Returns how
+    /// many blobs were repaired.
+    pub async fn repair_refused_blobs(&mut self) -> usize {
+        let hashes: Vec<Hash> = match self.node.refused.lock() {
+            Ok(mut r) => r.drain().collect(),
+            Err(_) => return 0,
+        };
+        if hashes.is_empty() {
+            return 0;
+        }
+        let now = now_secs();
+        let mut repaired = 0;
+        for hash in hashes {
+            if self
+                .refused_probe_at
+                .get(&hash)
+                .is_some_and(|t| now - *t < REFUSED_PROBE_SECS)
+            {
+                continue;
+            }
+            self.refused_probe_at.insert(hash, now);
+            if self.node.blobs.blobs().export_chunk(hash, 0).await.is_ok() {
+                // Readable: the abort was the peer's (disconnect, cancel), not ours.
+                continue;
+            }
+            // Which file carries this hash? The index maps path → the hash we last
+            // reconciled to disk; the replica is the fallback for a path the index
+            // has not recorded yet.
+            let mut candidates: Vec<(String, PathBuf, ServableSet)> = Vec::new();
+            for (id, s) in &self.shares {
+                let mut paths: Vec<String> = self
+                    .db
+                    .get_index(id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(_, h)| h.as_slice() == hash.as_bytes())
+                    .map(|(p, _)| p)
+                    .collect();
+                if paths.is_empty() {
+                    if let Ok(view) = read_remote_files(&s.doc).await {
+                        paths.extend(
+                            view.files
+                                .into_iter()
+                                .filter(|(_, e)| e.hash.as_slice() == hash.as_bytes())
+                                .map(|(p, _)| p),
+                        );
+                    }
+                }
+                for p in paths {
+                    candidates.push((
+                        id.clone(),
+                        s.folder.join(rel_to_native(&p)),
+                        s.servable.clone(),
+                    ));
+                }
+            }
+            if candidates.is_empty() {
+                tracing::warn!(
+                    "a peer asked for {hash}, which this node lists but cannot serve, and no \
+                     share of ours carries that content — nothing on disk to restore it from"
+                );
+                continue;
+            }
+            let mut fixed = false;
+            for (share_id, abs, servable) in candidates {
+                if !abs.is_file() {
+                    continue;
+                }
+                let imported = self
+                    .node
+                    .blobs
+                    .blobs()
+                    .add_path_with_opts(AddPathOptions {
+                        path: abs.clone(),
+                        format: BlobFormat::Raw,
+                        mode: ImportMode::TryReference,
+                    })
+                    .temp_tag()
+                    .await;
+                match imported {
+                    Ok(tag) => {
+                        let got = tag.hash();
+                        self.gc_protect.note_added(got);
+                        if got == hash {
+                            // Prove it with the same read a peer's fetch performs.
+                            if let Err(e) = self.node.blobs.blobs().export_chunk(hash, 0).await {
+                                tracing::error!(
+                                    "share {share_id}: re-imported {} but the store STILL cannot \
+                                     read {hash} ({e:#}); a daemon restart reloads the handle",
+                                    abs.display()
+                                );
+                                break;
+                            }
+                            tracing::info!(
+                                "share {share_id}: a peer could not fetch {} from us (the store \
+                                 listed {hash} but could not read it); re-imported it from disk \
+                                 — servable again",
+                                abs.display()
+                            );
+                            if let Ok(mut s) = servable.lock() {
+                                s.insert(hash);
+                            }
+                            repaired += 1;
+                            fixed = true;
+                            break;
+                        }
+                        tracing::warn!(
+                            "share {share_id}: {} on disk no longer hashes to the requested \
+                             {hash} (it is {got} now); the next scan publishes the new content",
+                            abs.display()
+                        );
+                    }
+                    Err(e) => tracing::warn!(
+                        "share {share_id}: re-importing {} to repair {hash} failed: {e:#}",
+                        abs.display()
+                    ),
+                }
+            }
+            if !fixed {
+                tracing::warn!(
+                    "a peer asked for {hash}, which this node lists but cannot serve, and the \
+                     file that should carry it is not on disk — peers cannot get it from us"
+                );
+            }
+        }
+        self.refused_probe_at
+            .retain(|_, t| now - *t < REFUSED_PROBE_SECS * 10);
+        repaired
+    }
+
+    /// Test seam: the node's blob store, so a suite can put the store into the
+    /// "listed but unreadable" state that GC or a lost data file leaves behind.
+    #[doc(hidden)]
+    pub fn debug_blob_store(&self) -> &FsStore {
+        &self.node.blobs
+    }
+
     /// Reveal the keys for a share. Returns the master key only when this node
     /// holds master role for the share.
     pub fn reveal_keys(&self, share_id: &str) -> anyhow::Result<(Option<String>, String)> {
@@ -5964,6 +6211,7 @@ impl Engine {
             gc_protect: self.gc_protect.clone(),
             cancel,
             dead_providers: Arc::new(StdMutex::new(HashSet::new())),
+            servable: state.servable.clone(),
         }))
     }
 

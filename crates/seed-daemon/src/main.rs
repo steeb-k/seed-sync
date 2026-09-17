@@ -630,6 +630,13 @@ async fn presence_loop(daemon: Daemon) {
                     let _ = tokio::time::timeout(Duration::from_secs(30), resync.run()).await;
                 });
             }
+            // A peer asked us for a blob we list but could not serve (the provider
+            // aborted the export): re-import it from the share folder so the peer's
+            // retry succeeds instead of failing forever (known-issues #38).
+            let repaired = { daemon.engine.lock().await.repair_refused_blobs().await };
+            if repaired > 0 {
+                tracing::info!("repaired {repaired} blob(s) a peer could not fetch from us");
+            }
             let verified = { daemon.engine.lock().await.periodic_deep_verify() };
             if !verified.is_empty() {
                 tracing::info!(

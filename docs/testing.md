@@ -55,6 +55,7 @@ tier 0.
 | `transport_rebuild` | the in-process iroh endpoint rebuild the transport-repair ladder fires: same endpoint id, shares reopened, sync resumes both ways, a pre-rebuild pass is fenced off (known-issues #36) |
 | `persistence` / `keystore` | state survives restart; locked-keystore behaviour |
 | `missing_folder` | a share whose folder is gone (drive removed) holds inert as `FolderMissing`, never recreates the folder, keeps the other shares running, resumes when the folder is back — and stays inert if it is back *empty* (known-issues #37) |
+| `serve_repair` | a member whose store lists a blob it cannot read must repair it from disk — on a peer's refused fetch, and on its own health pass — instead of reading 100% while refusing every fetch (known-issues #38) |
 | `seed-daemon/loopback_ipc`, `health_ipc` | the same through the real IPC surface the GUI uses |
 
 ## How to write a test that would have caught a real bug

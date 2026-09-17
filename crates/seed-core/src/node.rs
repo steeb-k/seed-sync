@@ -5,14 +5,26 @@
 //! data dir so the endpoint id is stable across restarts. Blob and document
 //! stores are filesystem-backed so synced content survives restarts.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::Context;
 use iroh::{protocol::Router, Endpoint, SecretKey};
+use iroh_blobs::provider::events::{
+    EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
+};
 use iroh_blobs::store::fs::options::Options as BlobStoreOptions;
 use iroh_blobs::store::GcConfig;
-use iroh_blobs::{api::downloader::Downloader, store::fs::FsStore, BlobsProtocol};
+use iroh_blobs::{api::downloader::Downloader, store::fs::FsStore, BlobsProtocol, Hash};
+
+/// Hashes a peer asked this node for that the blob provider could not serve: the
+/// store lists the hash, but exporting it failed (its data file is gone, or the
+/// file it references has moved), so the provider reset the peer's stream with
+/// `ERR_INTERNAL`. Filled by [`watch_provider_events`], drained by
+/// `Engine::repair_refused_blobs`, which re-imports the file from the share folder
+/// so the peer's next retry succeeds (known-issues #38).
+pub type RefusedBlobs = Arc<StdMutex<HashSet<Hash>>>;
 use iroh_docs::{api::DocsApi, protocol::Docs};
 use iroh_gossip::net::Gossip;
 
@@ -36,7 +48,76 @@ pub struct IrohNode {
     /// relays). Updated by [`Engine::set_relay_settings`](crate::Engine::set_relay_settings)
     /// — the selector itself can't be swapped after bind.
     pub preferred_relays: crate::relays::PreferredRelays,
+    /// Blobs this node was asked for and could not serve; see [`RefusedBlobs`].
+    pub refused: RefusedBlobs,
     router: Router,
+}
+
+/// Consume the blob provider's event stream and record every transfer it had to
+/// abort. This is how a member learns that a peer's fetch of a hash it *claims* to
+/// hold was refused — the request itself is the signal, no protocol of our own.
+///
+/// Only the notify variants are enabled (nothing here can reject a request), and
+/// each request's update stream is drained on its own task so a slow consumer can
+/// never stall the provider. A transfer also aborts when the *peer* hangs up, so an
+/// entry here means "probe this hash", not "this hash is broken"; the engine reads
+/// the blob before it does anything.
+async fn watch_provider_events(
+    mut rx: tokio::sync::mpsc::Receiver<ProviderMessage>,
+    refused: RefusedBlobs,
+) {
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            ProviderMessage::GetRequestReceivedNotify(msg) => {
+                let requested = msg.inner.request.hash;
+                let mut updates = msg.rx;
+                let refused = refused.clone();
+                tokio::spawn(async move {
+                    // A get for a hash sequence names each child as its transfer
+                    // starts; a plain get only ever transfers the requested hash.
+                    let mut current = requested;
+                    while let Ok(Some(update)) = updates.recv().await {
+                        match update {
+                            RequestUpdate::Started(s) => current = s.hash,
+                            RequestUpdate::Aborted(_) => {
+                                tracing::debug!(
+                                    "provider aborted serving {current}; queued for a repair probe"
+                                );
+                                if let Ok(mut r) = refused.lock() {
+                                    r.insert(current);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+            ProviderMessage::GetManyRequestReceivedNotify(msg) => {
+                let mut updates = msg.rx;
+                let refused = refused.clone();
+                tokio::spawn(async move {
+                    let mut current: Option<Hash> = None;
+                    while let Ok(Some(update)) = updates.recv().await {
+                        match update {
+                            RequestUpdate::Started(s) => current = Some(s.hash),
+                            RequestUpdate::Aborted(_) => {
+                                if let Some(h) = current {
+                                    tracing::debug!(
+                                        "provider aborted serving {h}; queued for a repair probe"
+                                    );
+                                    if let Ok(mut r) = refused.lock() {
+                                        r.insert(h);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
 impl IrohNode {
@@ -117,8 +198,22 @@ impl IrohNode {
             .await
             .context("spawn docs")?;
 
+        // Watch our own blob provider so a fetch we had to refuse becomes a repair
+        // instead of a peer retrying forever against a store that lists a hash it
+        // cannot read (known-issues #38). See `watch_provider_events`.
+        let refused: RefusedBlobs = Arc::new(StdMutex::new(HashSet::new()));
+        let (events, events_rx) = EventSender::channel(
+            64,
+            EventMask {
+                get: RequestMode::NotifyLog,
+                get_many: RequestMode::NotifyLog,
+                ..EventMask::DEFAULT
+            },
+        );
+        tokio::spawn(watch_provider_events(events_rx, refused.clone()));
+
         let router = Router::builder(endpoint.clone())
-            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, None))
+            .accept(iroh_blobs::ALPN, BlobsProtocol::new(&blobs, Some(events)))
             .accept(iroh_gossip::ALPN, gossip.clone())
             .accept(iroh_docs::ALPN, docs.clone())
             .spawn();
@@ -131,6 +226,7 @@ impl IrohNode {
             gossip,
             docs,
             preferred_relays,
+            refused,
             router,
         })
     }

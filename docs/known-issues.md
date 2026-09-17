@@ -40,11 +40,12 @@ why, and the fix or current disposition.
 | 35 | a flapping share disarms the #23 self-heal ladders (episode clocks reset on every blip) | fixed (hysteretic `EpisodeClock`) |
 | 36 | a long-running endpoint stops reaching a live member; the #23/#35 ladders cannot heal it | fixed (in-process transport rebuild ladder) — pending field confirmation |
 | 37 | a share whose folder is on a removed drive kills the daemon on every start, silently (exit 0) | fixed (held inert as `FolderMissing`, never recreated, auto-resume; real exit code to the SCM) |
+| 38 | a member lists a blob it cannot serve, reads 100%, and refuses every peer's fetch of it forever | fixed (health proves servability with a read; a refused fetch triggers a re-import from disk) |
 
 Three vendored crates carry upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
 `vendor/iroh-docs` — see `vendor/README.md` for the per-hunk detail and the
 re-vendor checklist, and `[patch.crates-io]` in the workspace `Cargo.toml`). All
-five hunks are still needed: four are unfixed on upstream `main`, and the fifth
+six hunks are still needed: five are unfixed on upstream `main`, and the sixth
 (#9's) is tracked as [iroh#4390](https://github.com/n0-computer/iroh/issues/4390),
 still open. **Before re-vendoring at a new version, re-check each patch site
 upstream** — a hunk that has been fixed there should be dropped, not carried
@@ -1197,3 +1198,80 @@ share to a new folder. The master seed in the keystore and the replica in
 **Not fixed here:** `sync_index` on that box held ~3.5 k rows for share ids no
 longer in `shares` — orphans from earlier removals that did not go through
 `Db::remove_share`. Harmless, but worth a startup sweep.
+
+## 38. A member lists a blob it cannot serve, reads 100%, and refuses every fetch of it forever
+
+**Status: FIXED (2026-09-17).** Suite: `serve_repair` (`--ignored`).
+
+**Where:** the health pass in `ReconcileJob::run` and `Engine::repair_refused_blobs`
+(`crates/seed-core/src/engine.rs`); the provider-event watcher in
+`crates/seed-core/src/node.rs`.
+
+Observed on the maintainer's own share the day after #37. One member (xpsTop) was the
+only complete copy left; two members were newly added and both parked at
+`Syncing 89%` for hours. Every fetch of the same 44 files — all small, all older than
+the rest — failed on the requesters with
+
+```text
+skip syncing phoenix-master.xcf (will retry): self-heal phoenix-master.xcf: fetch 476f91de…: io: stream reset by peer: error 3
+```
+
+3,095 times in 40 minutes. `error 3` is the vendored provider's `ERR_INTERNAL`: it is
+what `handle_write_result` sends when `export_bao` fails, which includes "the store
+lists this hash but cannot read its bytes" (an owned `data/<hash>.data` deleted by a
+pre-#33 GC sweep or a cleanup; a by-reference entry whose file moved). The requester
+only ever sees the reset. The files were on the serving member's disk the whole time.
+
+Two things kept it stuck:
+
+1. **Health trusted the listing.** The pass credited a file on
+   `indexed && Blobs::has(hash)`. `has` is a metadata lookup, so a broken entry still
+   answers yes, the member reads `Healthy 100%`, and the #33 re-import never runs —
+   it was gated on `has() == false`.
+2. **The serving member never learned it was refusing.** The provider resets the
+   peer's stream and moves on; nothing on the serving side recorded which hash it
+   could not export, so there was no trigger for a repair and no line in its log.
+
+**Fix.**
+
+- **Servability is proved, not assumed.** The health pass reads the first chunk of
+  every listed blob through the store (`export_chunk`, the same operation a peer's
+  fetch performs) before crediting it. Proved hashes are cached per share
+  (`ShareState::servable`) so steady state is still one metadata check per file; a
+  deep verify clears the cache. A listed-but-unreadable blob falls into the existing
+  disk check and is re-imported from the folder by reference — `finish_import_impl`
+  rewrites the entry's data location unconditionally, so the repair needs no delete.
+- **A refused fetch is the trigger.** The node now passes an `EventSender` to
+  `BlobsProtocol` with `get`/`get_many` in `NotifyLog` mode and drains the stream:
+  a `TransferAborted` records the hash in `IrohNode::refused`. Each daemon tick,
+  `Engine::repair_refused_blobs` probes each such hash with a read (a peer hanging
+  up aborts a transfer too), finds the file that carries it — the share's index
+  first, the replica second — re-imports it, and logs the repair. Debounced to one
+  probe per hash per 60 s.
+- **The store itself had to change for the repair to take** (vendored iroh-blobs
+  hunk 3, `vendor/README.md`). Making the engine re-import was not enough; the
+  red-then-green run exposed three store behaviours, each of which alone kept the
+  refusal permanent: (a) a hash's in-memory handle, once `Poisoned` — by a failed
+  open *or* by the entity's idle `persist`, whose `take()` leaves every state
+  poisoned expecting a recycle that is skipped while anything holds a reference —
+  was never reloaded, so even a fixed DB entry stayed unreadable until restart;
+  (b) an import over an existing entry is *merged*, and the merge keeps `Owned`
+  over `External`, so re-importing the file by reference left the DB pointing at
+  the missing owned data file; (c) `observe` on a poisoned handle panicked the
+  store's actor thread. The hunk reloads a poisoned handle on next use, replaces
+  (not merges) the entry when the import lands on a poisoned handle, lets a
+  completed import supersede the poison, and returns an empty bitfield instead of
+  panicking. (a) also explains how xpsTop refused files it held intact on disk:
+  no data loss is needed, only a handle poisoned while a peer's stream pinned it.
+- With all of it in place the field case resolves on its own: the complete member
+  repairs each of the 44 blobs on the first refused fetch (the test does it in
+  under four seconds), and the newcomers finish on their next pass. Nothing
+  happens on the 89% machines.
+
+The broken state is reproducible with public store APIs (import the same content in
+`Copy` mode, which rewrites the entry to an owned data file, then delete that file),
+so unlike #33's GC case this has a tier-1 red-then-green suite.
+
+**Not fixed here:** the requester still cannot say *which member* refused; the fetch
+error names the hash and the file but not the provider. The planned "what is
+syncing right now" tooltip should carry both.

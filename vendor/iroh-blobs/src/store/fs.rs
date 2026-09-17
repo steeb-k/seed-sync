@@ -272,7 +272,21 @@ impl SyncEntityApi for HashContext {
         }
         let mut action = Action::None;
         self.state.send_if_modified(|guard| match guard.deref() {
-            BaoFileStorage::Initial => {
+            // SEED-SYNC PATCH (vendor/README.md, iroh-blobs hunk 3): a `Poisoned`
+            // handle reloads from the DB on its next use, exactly like `Initial`.
+            // Upstream leaves it poisoned for the handle's whole life. Two things
+            // put a handle there: a failed open (an owned data file that is gone
+            // while the DB says Complete), and the idle `persist`, whose `take()`
+            // leaves *every* state Poisoned on the assumption that the entity is
+            // recycled and reset right after — which the manager skips whenever
+            // anything else still holds a reference (a peer's observe stream, an
+            // in-flight export). Either way every later export answered "poisoned
+            // storage" and the provider reset each peer's stream with ERR_INTERNAL,
+            // for hours, over content that was fine on disk (known-issues #38).
+            // Reloading costs one DB read + open; if the entry is truly broken it
+            // is poisoned again, and a re-import that fixes the DB is picked up on
+            // the very next access instead of never.
+            BaoFileStorage::Initial | BaoFileStorage::Poisoned => {
                 *guard = BaoFileStorage::Loading;
                 action = Action::Load;
                 true
@@ -1106,12 +1120,25 @@ async fn finish_import_impl(ctx: &HashContext, import_data: ImportEntry) -> io::
             MemOrFile::File(file)
         }
     };
+    // SEED-SYNC PATCH (vendor/README.md, iroh-blobs hunk 3): if the handle is
+    // poisoned, the existing entry cannot be read (its owned data file is gone,
+    // or the file it references has moved). `update` would *merge* the import
+    // into it, and the merge rule keeps `Owned` over `External` ("owned needs to
+    // win, since it has an associated file") — so a re-import of the same content
+    // from disk left the DB pointing at the missing file and repaired nothing.
+    // Replace the entry outright in that case; the import's locations are the
+    // ones that are known to be readable.
+    let was_poisoned = matches!(handle.borrow().deref(), BaoFileStorage::Poisoned);
     handle.complete(data, outboard);
     let state = EntryState::Complete {
         data_location,
         outboard_location,
     };
-    ctx.update_await(state).await?;
+    if was_poisoned {
+        ctx.global.db.set(hash, state).await?;
+    } else {
+        ctx.update_await(state).await?;
+    }
     Ok(())
 }
 

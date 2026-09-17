@@ -406,9 +406,13 @@ impl BaoFileStorage {
             BaoFileStorage::PartialMem(x) => x.bitfield.clone(),
             BaoFileStorage::Partial(x) => x.bitfield.clone(),
             BaoFileStorage::Complete(x) => Bitfield::complete(x.data.size()),
-            BaoFileStorage::Poisoned => {
-                panic!("poisoned storage should not be used")
-            }
+            // SEED-SYNC PATCH (vendor/README.md, iroh-blobs hunk 3): observing a
+            // poisoned handle used to panic the store's actor thread, taking every
+            // later store operation with it. A poisoned entry holds nothing readable,
+            // so "empty" is the truthful bitfield; once a re-import completes the
+            // handle (see `BaoFileHandle::complete`), the watch fires and observers
+            // see the real one.
+            BaoFileStorage::Poisoned => Bitfield::empty(),
         }
     }
 
@@ -651,6 +655,17 @@ impl BaoFileHandle {
                 BaoFileStorage::Complete(_) => false,
                 BaoFileStorage::PartialMem(_) => true,
                 BaoFileStorage::Partial(_) => true,
+                // SEED-SYNC PATCH (see the [patch.crates-io] note in the workspace
+                // Cargo.toml and vendor/README.md, hunk 3): a handle is poisoned when
+                // loading its entry failed — typically an owned data file that is gone
+                // while the DB still says Complete. Upstream leaves it poisoned for the
+                // life of the handle, so a fresh import of the same content (which
+                // rewrites the DB entry to point at readable bytes) changed nothing in
+                // memory, and every export kept failing with "poisoned storage" — and
+                // every retry kept the handle alive, so it was never evicted and
+                // reloaded. The import's data + outboard are valid by construction;
+                // let them supersede the poison.
+                BaoFileStorage::Poisoned => true,
                 _ => false,
             };
             if needs_complete {

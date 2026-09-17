@@ -556,6 +556,12 @@ async fn reconcile_loop(inner: Arc<Inner>) {
             for resync in recovered {
                 tokio::spawn(resync.run());
             }
+            // Blobs a peer asked for that our provider could not serve: re-import
+            // from disk (known-issues #38).
+            let repaired = { inner.engine.lock().await.repair_refused_blobs().await };
+            if repaired > 0 {
+                tracing::info!("repaired {repaired} blob(s) a peer could not fetch from us");
+            }
         }
 
         let membership = {
