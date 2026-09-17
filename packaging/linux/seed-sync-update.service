@@ -1,6 +1,6 @@
 [Unit]
 Description=S.E.E.D. auto-update check
-Documentation=https://github.com/steeb-k/seed-sync-gtk
+Documentation=https://github.com/steeb-k/seed-sync
 After=network-online.target
 Wants=network-online.target
 

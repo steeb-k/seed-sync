@@ -17,7 +17,7 @@ VERSION="${1:-}"; AUR="${2:-}"; PKGREL="${3:-1}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AUR="$(cd "$AUR" && pwd)"
 
-URL="https://github.com/steeb-k/seed-sync-gtk/archive/refs/tags/v$VERSION.tar.gz"
+URL="https://github.com/steeb-k/seed-sync/archive/refs/tags/v$VERSION.tar.gz"
 echo "aur-prepare: hashing $URL"
 SUM="$(curl -fsSL "$URL" | sha256sum | cut -d' ' -f1)" || { echo "aur-prepare: tag v$VERSION is not downloadable" >&2; exit 1; }
 [ "${#SUM}" = 64 ] || { echo "aur-prepare: bad checksum '$SUM'" >&2; exit 1; }

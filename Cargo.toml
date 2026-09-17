@@ -14,7 +14,7 @@ members = [
 version = "0.7.4"
 edition = "2021"
 license = "GPL-3.0-or-later"
-repository = "https://github.com/steeb-k/seed-sync-gtk"
+repository = "https://github.com/steeb-k/seed-sync"
 rust-version = "1.85"
 
 # Shared dependency versions. The iroh ecosystem crates must be bumped TOGETHER:

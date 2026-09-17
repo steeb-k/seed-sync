@@ -6,13 +6,11 @@
 #   docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist/arch:/out" archlinux:latest \
 #     bash /src/scripts/ci/arch-pkgbuild.sh <source-tarball>
 #
-# <source-tarball> is a path under /src to `seed-sync-gtk-<version>.tar.gz`
-# holding the tree under a `seed-sync-gtk-<version>/` prefix, which is what
+# <source-tarball> is a path under /src to `seed-sync-<version>.tar.gz`
+# holding the tree under a `seed-sync-<version>/` prefix, which is what
 # GitHub's tag archive looks like for this repo (CI makes it with
 # `git archive`). It stands in for the download, so the build never depends on
-# a tag that has not been published yet. Note the archive is named for the
-# source repo (`seed-sync-gtk`), not the package (`seed-sync`) — see the
-# PKGBUILD's `_srcname` comment.
+# a tag that has not been published yet.
 #
 # When /out is mounted, the built package is copied there: release.yml
 # attaches it, and apps.kznjk.com's pacman repo signs and serves it.
@@ -21,13 +19,13 @@ set -euo pipefail
 SRC=/src
 TARBALL="$1"
 VERSION="$(grep -m1 '^version = ' "$SRC/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
-[ "$(basename "$TARBALL")" = "seed-sync-gtk-$VERSION.tar.gz" ] || {
-  echo "arch-pkgbuild: expected seed-sync-gtk-$VERSION.tar.gz, got $TARBALL" >&2; exit 1; }
+[ "$(basename "$TARBALL")" = "seed-sync-$VERSION.tar.gz" ] || {
+  echo "arch-pkgbuild: expected seed-sync-$VERSION.tar.gz, got $TARBALL" >&2; exit 1; }
 
 # Every makedepend must be pre-installed: makepkg runs as `builder`, who has no
 # sudo, so a dependency it would have to install itself is a hard failure here.
-# base-devel does not include git, which the PKGBUILD declares.
-pacman -Syu --noconfirm --needed base-devel namcap rust git pkgconf gtk4 libadwaita dbus \
+# base-devel has neither rust nor pkgconf; the PKGBUILD's makedepends name them.
+pacman -Syu --noconfirm --needed base-devel namcap rust pkgconf gtk4 libadwaita dbus \
   hicolor-icon-theme imagemagick >/dev/null
 
 # makepkg refuses to run as root.
@@ -35,7 +33,7 @@ id builder >/dev/null 2>&1 || useradd -m builder
 WORK=/home/builder/pkg
 rm -rf "$WORK"; mkdir -p "$WORK"
 cp "$SRC/packaging/arch/PKGBUILD" "$SRC/packaging/arch/seed-sync.install" "$WORK/"
-# A file named like the source's `_srcname-$pkgver::` part is used instead of
+# A file named like the source's `$pkgname-$pkgver::` part is used instead of
 # downloading it.
 cp "$TARBALL" "$WORK/"
 sed -i "s/^pkgver=.*/pkgver=$VERSION/; s/^pkgrel=.*/pkgrel=1/" "$WORK/PKGBUILD"

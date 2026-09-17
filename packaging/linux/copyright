@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: SEED Sync
 Upstream-Contact: steeb-k <skaznak@protonmail.com>
-Source: https://github.com/steeb-k/seed-sync-gtk
+Source: https://github.com/steeb-k/seed-sync
 
 Files: *
 Copyright: 2026 steeb-k and contributors

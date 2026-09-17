@@ -22,7 +22,7 @@
     <category>FileTransfer</category>
     <category>Utility</category>
   </categories>
-  <url type="homepage">https://github.com/steeb-k/seed-sync-gtk</url>
+  <url type="homepage">https://github.com/steeb-k/seed-sync</url>
   <provides>
     <binary>seed-gui</binary>
   </provides>

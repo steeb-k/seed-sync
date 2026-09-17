@@ -176,20 +176,19 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
 
       - name: Source archive shaped like GitHub's tag archive
-        # GitHub's tag archive extracts to the SOURCE repo's name
-        # (seed-sync-gtk-<version>/), not the package name (seed-sync) — see
-        # the _srcname comment in packaging/arch/PKGBUILD.
+        # GitHub's tag archive extracts to <repo>-<version>/, which is what
+        # the PKGBUILD's source= expects (repo and package are both seed-sync).
         run: |
           version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           mkdir -p dist/arch
-          git archive --prefix="seed-sync-gtk-$version/" -o "dist/arch/seed-sync-gtk-$version.tar.gz" HEAD
+          git archive --prefix="seed-sync-$version/" -o "dist/arch/seed-sync-$version.tar.gz" HEAD
           echo "VERSION=$version" >> "$GITHUB_ENV"
 
       - name: makepkg, install and remove in archlinux
         run: |
           mkdir -p dist/arch-out
           docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist/arch-out:/out" archlinux:latest \
-            bash /src/scripts/ci/arch-pkgbuild.sh "/src/dist/arch/seed-sync-gtk-$VERSION.tar.gz"
+            bash /src/scripts/ci/arch-pkgbuild.sh "/src/dist/arch/seed-sync-$VERSION.tar.gz"
           test -f "dist/arch-out/seed-sync-$VERSION-1-x86_64.pkg.tar.zst"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -204,7 +203,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 120
     # Not a gate, a subject: the Azure federated credential trusts
-    # repo:steeb-k/seed-sync-gtk:environment:release, and a subject cannot
+    # repo:steeb-k/seed-sync:environment:release, and a subject cannot
     # carry a wildcard while tag names vary. Adding a required reviewer to
     # the environment is what would make a release wait for approval.
     environment: release

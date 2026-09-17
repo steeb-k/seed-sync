@@ -112,7 +112,7 @@
 
 id: io.github.steeb_k.SeedSync
 runtime: org.gnome.Platform
-runtime-version: '48'
+runtime-version: '50'
 sdk: org.gnome.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
@@ -151,16 +151,11 @@ modules:
       - install -Dm755 target/release/seed-daemon /app/bin/seed-daemon
       - install -Dm755 target/release/seed-gui /app/bin/seed-gui
       - install -Dm755 target/release/seed-cli /app/bin/seed-cli
-      # Desktop entry: the package-variant convention (no `__BIN__`
+      # Desktop entry: the package variant (`Exec=seed-gui`, no `__BIN__`
       # placeholder — `seed-gui` is already on `PATH` inside the sandbox at
-      # `/app/bin`), same as `packaging/linux/nfpm.yaml`'s installed layout.
-      - |
-        sed 's|Exec=__BIN__/seed-gui|Exec=seed-gui|' \
-          packaging/linux/io.github.steeb_k.SeedSync.desktop \
-          > /app/share/applications/io.github.steeb_k.SeedSync.desktop.tmp
-      - install -Dm644 /app/share/applications/io.github.steeb_k.SeedSync.desktop.tmp
+      # `/app/bin`), the same file the .deb/.rpm/Arch packages install.
+      - install -Dm644 packaging/linux/pkg/io.github.steeb_k.SeedSync.desktop
           /app/share/applications/io.github.steeb_k.SeedSync.desktop
-      - rm /app/share/applications/io.github.steeb_k.SeedSync.desktop.tmp
       - install -Dm644 packaging/linux/io.github.steeb_k.SeedSync.metainfo.xml
           /app/share/metainfo/io.github.steeb_k.SeedSync.metainfo.xml
       # Icons: pre-rendered PNGs from img/, not generated (no ImageMagick in

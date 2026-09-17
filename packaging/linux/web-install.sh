@@ -8,7 +8,7 @@
 #   ... | sh -s -- install     (or update / remove)
 #   SEED_ACTION=install ... | sh
 #
-# Source of truth: packaging/linux/web-install.sh in seed-sync-gtk. Mirrored to
+# Source of truth: packaging/linux/web-install.sh in seed-sync. Mirrored to
 # steeb-k.github.io/seed-install.sh (canonical) and seed-sync-binaries/install.sh
 # (raw fallback). After the first install, manage everything with `seed-sync`.
 set -eu

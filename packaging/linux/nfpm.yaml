@@ -21,7 +21,7 @@ section: net
 priority: optional
 maintainer: steeb-k <skaznak@protonmail.com>
 vendor: steeb-k
-homepage: https://github.com/steeb-k/seed-sync-gtk
+homepage: https://github.com/steeb-k/seed-sync
 license: GPL-3.0-or-later
 description: |-
   Peer-to-peer mirrored folder sync
@@ -152,4 +152,7 @@ scripts:
   preinstall: packaging/linux/scripts/preinstall.sh
   postinstall: packaging/linux/scripts/postinstall.sh
   preremove: packaging/linux/scripts/preremove.sh
-  postremove: packaging/linux/scripts/postremove.sh
+  # No postremove: seed-daemon.service lives under /usr/lib/systemd/user, which
+  # the *system* manager never loads, so there is no system-level daemon-reload
+  # to run (each user's own `systemctl --user daemon-reload`, or their next
+  # login, picks up the removal). lintian flags an empty postrm.

@@ -11,7 +11,7 @@
 #   ... | sh -s -- install     (or update / remove)
 #   SEED_ACTION=install ... | sh
 #
-# Source of truth: packaging/web-install.sh in seed-sync-gtk. Mirror to
+# Source of truth: packaging/web-install.sh in seed-sync. Mirror to
 # steeb-k.github.io/seed-install.sh (canonical) and seed-sync-binaries/install.sh.
 set -eu
 

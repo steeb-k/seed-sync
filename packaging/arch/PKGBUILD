@@ -10,18 +10,15 @@ pkgver=0.7.4
 pkgrel=1
 pkgdesc='Peer-to-peer mirrored folder sync, over iroh (S.E.E.D.)'
 arch=('x86_64')
-url='https://github.com/steeb-k/seed-sync-gtk'
+url='https://github.com/steeb-k/seed-sync'
 license=('GPL-3.0-or-later')
-depends=('gtk4' 'libadwaita' 'dbus')
-makedepends=('cargo' 'git' 'imagemagick')
+depends=('bash' 'dbus' 'gdk-pixbuf2' 'glib2' 'glibc' 'gtk4' 'hicolor-icon-theme' 'libadwaita' 'libgcc' 'pango')
+makedepends=('cargo' 'pkgconf' 'imagemagick')
 install=seed-sync.install
 # makepkg's LTO compiles C dependencies (ring) to GCC LTO bitcode, which
 # rustc's lld linker cannot read: the link fails on every ring_core_* symbol.
 options=('!lto')
-# The source repo is `seed-sync-gtk`; GitHub's tag archive extracts to
-# seed-sync-gtk-$pkgver, not $pkgname-$pkgver.
-_srcname=seed-sync-gtk
-source=("$_srcname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 # scripts/aur-prepare.sh replaces this with the tag archive's sum in the AUR copy.
 sha256sums=('SKIP')
 
@@ -29,20 +26,20 @@ _appid=io.github.steeb_k.SeedSync
 _iconsizes=(16 22 24 32 48 64 128 256 512)
 
 prepare() {
-  cd "$_srcname-$pkgver"
+  cd "$pkgname-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-  cd "$_srcname-$pkgver"
+  cd "$pkgname-$pkgver"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --release --locked -p seed-daemon -p seed-gui -p seed-cli
 }
 
 package() {
-  cd "$_srcname-$pkgver"
+  cd "$pkgname-$pkgver"
 
   local bin
   for bin in seed-daemon seed-gui seed-cli; do

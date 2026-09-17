@@ -67,6 +67,9 @@ grep -qx 'Exec=seed-gui' "$NATIVE/tree/share/applications/$APP_ID.desktop" || {
 # version. Every <release> carries a date: appstreamcli validate (which CI runs
 # on the installed package) flags one that does not, so an undated heading — or
 # no CHANGELOG.md at all — falls back to the build date rather than to nothing.
+# A section for a version NEWER than the one being built (the next release's
+# notes, written before the bump) is left out: the newest <release> must be the
+# package's own version.
 METAINFO_SRC="packaging/linux/$APP_ID.metainfo.xml"
 METAINFO_OUT="$NATIVE/metainfo/$APP_ID.metainfo.xml"
 RELEASES_FILE="$(mktemp)"
@@ -78,6 +81,8 @@ TODAY="$(date -u +%Y-%m-%d)"
   if [ -f CHANGELOG.md ] && grep -qE '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md; then
     grep -E '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | while IFS= read -r line; do
       ver="$(printf '%s' "$line" | sed -E 's/^## \[([0-9]+\.[0-9]+\.[0-9]+)\].*/\1/')"
+      # Skip a version newer than $VERSION: sort -V puts $VERSION last iff ver <= VERSION.
+      [ "$(printf '%s\n%s\n' "$ver" "$VERSION" | sort -V | tail -n1)" = "$VERSION" ] || continue
       date="$(printf '%s' "$line" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' || true)"
       echo "    <release version=\"$ver\" date=\"${date:-$TODAY}\"/>"
     done
