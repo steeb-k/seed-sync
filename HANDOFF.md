@@ -58,8 +58,15 @@ checked by reading and by `bash -n` / YAML parsing only:
 - Create the GitHub environment `release` on the source repo.
 - apps.kznjk.com: add `steeb-k/seed-sync-binaries` to the package poller's
   sources and its flatpak import (host side, outside this repo).
-- Decide whether the .deb/.rpm should ship `/etc/xdg/autostart/…SeedSync.desktop`
-  (tray autostart for every user) — currently they do not.
+- Decide whether the .deb/.rpm/Arch packages should ship
+  `/etc/xdg/autostart/io.github.steeb_k.SeedSync.desktop` (tray autostart for
+  every user). Currently they do not. The reviewer recommends **shipping it**: the
+  tarball install already creates the per-user equivalent, so package users
+  silently lose the tray at login, and the GUI's "Start Daemon" button makes the
+  tray the natural way to get syncing. Conditions: a separate desktop file
+  (`Exec=seed-gui --hidden`, `TryExec=seed-gui`, `NoDisplay=true`), shipped as
+  `config|noreplace` in nfpm and `backup=()` in the PKGBUILD, plus a doc line on
+  the XDG opt-out (`Hidden=true` copy in `~/.config/autostart`).
 
 ## Suggested order on Linux
 
