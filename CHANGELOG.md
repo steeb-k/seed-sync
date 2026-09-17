@@ -5,7 +5,7 @@ Pre-1.0; prereleases are tagged `v<version>-test<N>`.
 
 ## [Unreleased]
 
-## [0.8.0] - 2026-09-17 (not yet released)
+## [0.8.0] - 2026-09-17
 
 ### Added
 - **Release builds move to GitHub Actions.** `.github/workflows/release.yml` builds every
