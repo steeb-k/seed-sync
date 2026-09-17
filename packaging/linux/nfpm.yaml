@@ -104,6 +104,15 @@ contents:
     packager: rpm
     file_info: {mode: 0644}
 
+  # Tray at login for every account (the tarball install writes the per-user
+  # equivalent). A config file, so it survives `apt remove` and a user's edit;
+  # its TryExec makes a leftover entry inert. Per-user opt-out: a copy with
+  # Hidden=true in ~/.config/autostart (docs/linux-packaging.md).
+  - src: packaging/linux/pkg/io.github.steeb_k.SeedSync.Autostart.desktop
+    dst: /etc/xdg/autostart/io.github.steeb_k.SeedSync.desktop
+    type: config|noreplace
+    file_info: {mode: 0644}
+
   - src: dist/native/tree/share/applications/io.github.steeb_k.SeedSync.desktop
     dst: /usr/share/applications/io.github.steeb_k.SeedSync.desktop
     file_info: {mode: 0644}

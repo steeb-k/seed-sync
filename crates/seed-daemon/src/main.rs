@@ -134,7 +134,7 @@ fn env_filter() -> tracing_subscriber::EnvFilter {
             // net_report's captive-portal probe WARNs every ~5 min against a
             // custom relay that has no /generate_204 — harmless, so keep that
             // module at error.
-            "seed_daemon=info,seed_core=info,iroh=warn,iroh::net_report=error,             iroh_gossip=warn,iroh_docs=warn,iroh_blobs=warn"
+            "seed_daemon=info,seed_core=info,iroh=warn,iroh::net_report=error,iroh_gossip=warn,iroh_docs=warn,iroh_blobs=warn"
                 .into()
         })
 }

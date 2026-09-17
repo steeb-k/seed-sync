@@ -159,6 +159,7 @@ system-wide:
 | `/usr/bin/seed-daemon`, `/usr/bin/seed-gui`, `/usr/bin/seed-cli`, `/usr/bin/seed-sync` | binaries + the wrapper |
 | `/usr/lib/systemd/user/seed-daemon.service` | `ExecStart=/usr/bin/seed-daemon run` (a package variant of the unit: the tarball's uses `%h/.local/bin`) |
 | `/usr/share/applications/io.github.steeb_k.SeedSync.desktop` | `Exec=seed-gui` (no `__BIN__` placeholder in the package variant) |
+| `/etc/xdg/autostart/io.github.steeb_k.SeedSync.desktop` | tray at login for every account (`Exec=seed-gui --hidden`, `TryExec`, `NoDisplay=true`); a config file (`config\|noreplace` / `backup=()`), as Nullgate's packages ship |
 | `/usr/share/metainfo/io.github.steeb_k.SeedSync.metainfo.xml` | with a `<releases>` block generated from `CHANGELOG.md` |
 | `/usr/share/icons/hicolor/<sz>x<sz>/apps/io.github.steeb_k.SeedSync.png` | as the tarball |
 | `/usr/share/seed-sync/repo/…` + `/etc/apt/sources.list.d/kznjk.sources` + `/etc/apt/keyrings/kznjk-packages.asc` | self-configuring repo definitions (§7) |

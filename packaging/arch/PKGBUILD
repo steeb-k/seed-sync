@@ -14,6 +14,7 @@ url='https://github.com/steeb-k/seed-sync'
 license=('GPL-3.0-or-later')
 depends=('bash' 'dbus' 'gdk-pixbuf2' 'glib2' 'glibc' 'gtk4' 'hicolor-icon-theme' 'libadwaita' 'libgcc' 'pango')
 makedepends=('cargo' 'pkgconf' 'imagemagick')
+backup=('etc/xdg/autostart/io.github.steeb_k.SeedSync.desktop')
 install=seed-sync.install
 # makepkg's LTO compiles C dependencies (ring) to GCC LTO bitcode, which
 # rustc's lld linker cannot read: the link fails on every ring_core_* symbol.
@@ -54,6 +55,9 @@ package() {
   install -Dm0644 packaging/linux/pkg/seed-daemon.service \
     "$pkgdir/usr/lib/systemd/user/seed-daemon.service"
 
+  # Tray at login for every account (a config file: backup=(), above).
+  install -Dm0644 "packaging/linux/pkg/$_appid.Autostart.desktop" \
+    "$pkgdir/etc/xdg/autostart/$_appid.desktop"
   install -Dm0644 "packaging/linux/pkg/$_appid.desktop" \
     "$pkgdir/usr/share/applications/$_appid.desktop"
   install -Dm0644 "packaging/linux/$_appid.metainfo.xml" \

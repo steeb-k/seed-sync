@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=SEED Sync
+Comment=SEED Sync tray icon
+Exec=seed-gui --hidden
+# A native package's autostart entry is a config file, so it can outlive the
+# package (apt remove keeps it). TryExec makes a leftover entry inert.
+TryExec=seed-gui
+Icon=io.github.steeb_k.SeedSync
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

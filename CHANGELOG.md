@@ -26,7 +26,18 @@ Pre-1.0; prereleases are tagged `v<version>-test<N>`.
   versa (`seed-sync --update` now detects a package-managed install and declines to touch it).
   CI installs and removes the `.deb` under a real apt, installs and removes the `.rpm` on Fedora,
   builds the PKGBUILD in an Arch container, and installs/runs the Flatpak bundle, before any
-  release is published.
+  release is published. The packages also ship a system-wide tray autostart entry
+  (`/etc/xdg/autostart`, a config file with the usual `Hidden=true` per-user opt-out), and the
+  GUI's **Start Daemon** button now enables the per-user unit (`systemctl --user enable --now`)
+  rather than starting it for the current login only.
+- `seed-gui --version` prints the version, as `seed-daemon --version` does.
+
+### Changed
+- **The Android release keystore is new** (generated 2026-09-17; no shipped install was ever
+  signed with the old one). A device that still has an earlier release APK must uninstall it
+  before installing this one; from here on every release is signed with this key, forever.
+- The Flatpak targets the GNOME 50 runtime (48 is end-of-life on Flathub). A Flatpak install
+  never overwrites a tarball install's login autostart entry of the same name.
 
 ### Fixed
 - **A share whose folder is on a removed drive no longer kills the daemon on every start**

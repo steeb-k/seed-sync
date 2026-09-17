@@ -52,7 +52,11 @@ chain to validate). A self-signed key is the norm for sideload/F-Droid.
 
 ### The key
 
-A 4096-bit RSA key, alias `seedsync`, 10000-day validity, was generated with:
+The release key was regenerated on 2026-09-17 (the original was never used by a
+shipped install); it lives in the maintainer's `~/seed-sync-signing/android/`,
+alongside `set-seed-sync-secrets.sh`, which feeds it to CI as the
+`ANDROID_KEYSTORE_*` secrets. A 4096-bit RSA key, alias `seedsync`, 10000-day
+validity, generated with:
 
 ```pwsh
 keytool -genkeypair -v -keystore android\keystore\seedsync-release.jks `

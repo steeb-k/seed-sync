@@ -1334,8 +1334,14 @@ fn start_daemon(socket: &std::path::Path) {
     }
     #[cfg(target_os = "linux")]
     {
+        // `enable --now`, not `start`: the tarball install enables the unit
+        // at install time (a no-op here), but a .deb/.rpm/Arch package only
+        // stages it and its postinstall tells the user to enable it. The
+        // packages autostart the tray, so this button is how most package
+        // users will start the daemon — and it should stay started across
+        // logins, not just this one.
         if let Err(e) = std::process::Command::new("systemctl")
-            .args(["--user", "start", "seed-daemon.service"])
+            .args(["--user", "enable", "--now", "seed-daemon.service"])
             .spawn()
         {
             tracing::warn!("start daemon failed: {e}");

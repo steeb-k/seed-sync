@@ -197,6 +197,7 @@ tarball — a package only changes *where the files live*, never who runs the da
 | `/usr/bin/{seed-daemon,seed-gui,seed-cli,seed-sync}` | binaries + the wrapper (kept for `seed-sync --status`; see below) |
 | `/usr/lib/systemd/user/seed-daemon.service` | a package variant of the unit — `ExecStart=/usr/bin/seed-daemon run` instead of the tarball's `%h/.local/bin/seed-daemon run` |
 | `/usr/share/applications/io.github.steeb_k.SeedSync.desktop` | a package variant — `Exec=seed-gui`, no `__BIN__` placeholder to rewrite |
+| `/etc/xdg/autostart/io.github.steeb_k.SeedSync.desktop` | tray at login for every account (`Exec=seed-gui --hidden`, `TryExec=seed-gui`, `NoDisplay=true`) — a **config file** (dpkg conffile / rpm `%config(noreplace)` / pacman `backup`); see below |
 | `/usr/share/metainfo/io.github.steeb_k.SeedSync.metainfo.xml` | with a `<releases>` block generated from `CHANGELOG.md` |
 | `/usr/share/icons/hicolor/<size>x<size>/apps/io.github.steeb_k.SeedSync.png` | same sizes as the tarball |
 | `/usr/share/doc/seed-sync/copyright` (.deb) / `/usr/share/licenses/seed-sync/LICENSE` (.rpm) | license, each format's own convention |
@@ -255,7 +256,20 @@ distro installs them: deb `libgtk-4-1 (>= 4.10)`, `libadwaita-1-0 (>= 1.4)`,
 differently. deb compresses with xz (every dpkg reads it; `lintian` rejects a
 zstd `data.tar`), rpm with zstd.
 
-Maintainer scripts (`packaging/linux/scripts/{pre,post}{install,remove}.sh`, shared
+**Tray autostart.** The tarball install writes a per-user
+`~/.config/autostart` entry; the packages ship the system-wide equivalent,
+`/etc/xdg/autostart/io.github.steeb_k.SeedSync.desktop`
+(`packaging/linux/pkg/io.github.steeb_k.SeedSync.Autostart.desktop`), exactly
+as Nullgate's packages do, so every account gets the tray at login. It is a
+config file: `apt remove` leaves it behind (purge removes it) and its
+`TryExec=seed-gui` makes a leftover entry inert. The daemon itself is still
+not enabled by the package — the tray's **Start Daemon** button runs
+`systemctl --user enable --now seed-daemon`, so one click makes it persistent
+for that account. Per-user opt-out, the XDG way: copy the entry to
+`~/.config/autostart/` and add `Hidden=true` (the user directory shadows
+`/etc/xdg/autostart` by file name).
+
+Maintainer scripts (`packaging/linux/scripts/{preinstall,postinstall,preremove}.sh`, shared
 between the .deb and .rpm scriptlet forms) never touch a user session:
 - `preinstall` is a no-op scriptlet-arg dispatcher — there's no reliable system-wide
   way to detect a per-user tarball install from a root pre-install hook the way
