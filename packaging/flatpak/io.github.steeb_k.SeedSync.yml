@@ -1,0 +1,179 @@
+# S.E.E.D. (SEED Sync) Flatpak manifest.
+#
+# Build locally:  scripts/package-flatpak.sh
+# See docs/linux-packaging.md's "Flatpak" section for the full design and
+# docs/ci-release.md §6/§10 (W3) for how this fits the release pipeline.
+#
+# --- finish-args, one by one ------------------------------------------------
+#
+#   --share=ipc              Required by GTK/GDK for its own shared-memory IPC
+#                             (font/icon caches etc.) on the same host; unrelated
+#                             to SEED Sync's own IPC socket.
+#   --share=network           iroh (QUIC over UDP, relay fallback over HTTPS) —
+#                             the whole point of the app.
+#   --socket=wayland
+#   --socket=fallback-x11     GTK4 display access: Wayland natively, X11 when
+#                             the session is Xorg or Wayland isn't reachable.
+#   --device=dri              GPU acceleration for GTK's renderer (avoids the
+#                             software-rendering fallback, notably slow for the
+#                             window's blur/shadow effects under GSK's default
+#                             renderer).
+#   --socket=session-bus      The Linux tray (`crates/seed-gui/src/tray.rs`,
+#                             the `ksni` backend) registers a StatusNotifierItem
+#                             with the desktop shell's StatusNotifierWatcher.
+#                             `--talk-name=org.kde.StatusNotifierWatcher` alone
+#                             is NOT enough: ksni's `TrayMethods::spawn()`
+#                             defaults to *owning* a well-known bus name
+#                             (`org.kde.StatusNotifierItem-<pid>-<n>`, see
+#                             ksni's `service.rs` — `conn.request_name(...)`)
+#                             so the watcher can address it back. A per-PID,
+#                             per-instance name can't be pre-authorized with a
+#                             narrower `--own-name=` pattern (Flatpak's
+#                             wildcard only matches whole trailing dot
+#                             segments, e.g. `org.kde.StatusNotifierItem.*`,
+#                             which does not match the hyphen-suffixed name
+#                             ksni actually requests), so full session-bus
+#                             access is what's granted here. `ksni` does ship
+#                             a `.disable_dbus_name(true)` escape hatch
+#                             explicitly documented for "sandboxed environments
+#                             (e.g. flatpak)" that falls back to the
+#                             connection's unique name instead of owning one —
+#                             which would let this shrink to just
+#                             `--talk-name=org.kde.StatusNotifierWatcher` — but
+#                             that's a `tray.rs` behavior change gated on
+#                             `flatpak::in_flatpak()`, deliberately left out of
+#                             this pass (unverified without a real sandbox to
+#                             test the fallback in; tracked as a follow-up, not
+#                             a blocker for the bundle working).
+#   --talk-name=org.freedesktop.secrets
+#                             The OS keystore for share master seeds
+#                             (`crates/seed-core/src/secrets.rs`) goes through
+#                             the `keyring` crate's `sync-secret-service`
+#                             backend, i.e. the Secret Service D-Bus API. Best
+#                             effort already at the code level — a headless box
+#                             with no keystore falls back to storing the seed
+#                             in `state.db` — but a normal desktop session
+#                             should get the real keystore.
+#   --talk-name=org.freedesktop.portal.Background
+#                             Lets the sandboxed app ask the desktop for
+#                             "run in background" / "run at startup"
+#                             permission (the portal shows the user a one-time
+#                             prompt/toggle in Settings). We don't call the
+#                             portal's RequestBackground API in code yet (see
+#                             `crates/seed-gui/src/flatpak.rs` — autostart is
+#                             done via a plain XDG `.desktop` entry instead,
+#                             since `ashpd` is not a workspace dependency), but
+#                             the talk-name is requested up front so a later,
+#                             low-risk change to call it doesn't need a new
+#                             manifest permission (and a background-running
+#                             tray app SHOULD show up in the portal's
+#                             "Applications running in background" list either
+#                             way — some desktop shells populate that from the
+#                             app simply holding this permission).
+#   --filesystem=host        The daemon does continuous R/W on whatever
+#                             folders the user adds to a share — arbitrary
+#                             paths, chosen at runtime, for as long as the
+#                             share exists. That is fundamentally incompatible
+#                             with per-file portal grants (`xdg-desktop-portal`
+#                             file choosers hand back a one-shot, revocable
+#                             handle to a single picked path — fine for "open
+#                             a file", useless for "keep this folder mirrored
+#                             indefinitely"). `--filesystem=host` is the
+#                             practical alternative; this is also why Flatpak
+#                             was rejected outright until this workstream (see
+#                             docs/linux-packaging.md). It's also what makes
+#                             `~/.config/autostart` directly writable — see
+#                             `crates/seed-gui/src/flatpak.rs`'s module doc.
+#
+# No `--filesystem=xdg-run/seed-sync:create`: the IPC socket lives under
+# `$XDG_DATA_HOME/seedsync/seed.sock` (see `default_data_dir`/`default_socket`
+# in `crates/seed-daemon/src/main.rs`), not `$XDG_RUNTIME_DIR`, and
+# `$XDG_DATA_HOME` is already the sandbox's own per-app data directory
+# (`~/.var/app/io.github.steeb_k.SeedSync/data`) with no extra permission
+# needed. See docs/linux-packaging.md for the full path derivation.
+#
+# No `--env=GSK_RENDERER=`: nothing in this codebase or its GTK4/libadwaita
+# version requires forcing a specific GSK renderer inside the sandbox; the
+# default (Vulkan, falling back to GL, falling back to software) already
+# works through `--device=dri`.
+#
+# --- the cargo network exception ---
+#
+# `build-options.build-args: [--share=network]` lets `cargo build` fetch crates
+# from crates.io during our own local/CI builds — acceptable for a
+# self-published bundle (apps.kznjk.com, see docs/ci-release.md §7), but NOT
+# acceptable for a Flathub submission, whose build sandbox has no network
+# access at all. Flathub requires a `cargo-sources.json` generated by
+# `flatpak-cargo-generator` (https://github.com/flatpak/flatpak-builder-tools)
+# from this workspace's `Cargo.lock`, added as an extra `sources:` entry, with
+# `--share=network` removed from `build-args`. That conversion is a later,
+# separate step (see docs/linux-packaging.md); this manifest targets our own
+# repo/bundle distribution only.
+
+id: io.github.steeb_k.SeedSync
+runtime: org.gnome.Platform
+runtime-version: '48'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: seed-gui
+
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --socket=session-bus
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --talk-name=org.freedesktop.secrets
+  - --talk-name=org.freedesktop.portal.Background
+  - --filesystem=host
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/seed-sync/cargo
+  build-args:
+    - --share=network
+
+modules:
+  - name: seed-sync
+    buildsystem: simple
+    build-commands:
+      # `--locked` so the exact Cargo.lock versions build (no surprise bumps
+      # inside the sandbox); the three binaries the tarball/native packages
+      # also ship (see docs/linux-packaging.md) — seed-cli is included even
+      # though `command:` only launches seed-gui, since flatpak.rs's
+      # in-sandbox supervision spawns `seed-daemon` as a sibling of `seed-gui`
+      # in `/app/bin` and a user may reasonably `flatpak run --command=seed-cli`.
+      - cargo build --release --locked -p seed-daemon -p seed-gui -p seed-cli
+      - install -Dm755 target/release/seed-daemon /app/bin/seed-daemon
+      - install -Dm755 target/release/seed-gui /app/bin/seed-gui
+      - install -Dm755 target/release/seed-cli /app/bin/seed-cli
+      # Desktop entry: the package-variant convention (no `__BIN__`
+      # placeholder — `seed-gui` is already on `PATH` inside the sandbox at
+      # `/app/bin`), same as `packaging/linux/nfpm.yaml`'s installed layout.
+      - |
+        sed 's|Exec=__BIN__/seed-gui|Exec=seed-gui|' \
+          packaging/linux/io.github.steeb_k.SeedSync.desktop \
+          > /app/share/applications/io.github.steeb_k.SeedSync.desktop.tmp
+      - install -Dm644 /app/share/applications/io.github.steeb_k.SeedSync.desktop.tmp
+          /app/share/applications/io.github.steeb_k.SeedSync.desktop
+      - rm /app/share/applications/io.github.steeb_k.SeedSync.desktop.tmp
+      - install -Dm644 packaging/linux/io.github.steeb_k.SeedSync.metainfo.xml
+          /app/share/metainfo/io.github.steeb_k.SeedSync.metainfo.xml
+      # Icons: pre-rendered PNGs from img/, not generated (no ImageMagick in
+      # this SDK — ImageMagick is the tarball's tool, not the Flatpak SDK's;
+      # see scripts/package-linux.sh). Sizes are the subset of that script's
+      # `ICON_SIZES` (16 22 24 32 48 64 128 256 512) that exist pre-rendered
+      # under img/ as `seed-appicon-<sz>px.png` (16 32 48 64 128 256 512 —
+      # img/ has no 22px or 24px variant).
+      - |
+        for sz in 16 32 48 64 128 256 512; do
+          install -Dm644 "img/seed-appicon-${sz}px.png" \
+            "/app/share/icons/hicolor/${sz}x${sz}/apps/io.github.steeb_k.SeedSync.png"
+        done
+    sources:
+      - type: dir
+        path: ../..
