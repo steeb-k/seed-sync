@@ -32,6 +32,43 @@ die()  { printf '%s\n' "seed-sync: error: $*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 uctl() { systemctl --user "$@" 2>/dev/null; }
 
+# True when /usr/bin/seed-daemon exists and is owned by a package manager (the
+# .deb/.rpm/Arch package, not this tarball's ~/.local/bin install). Sets
+# PKG_MGR to the manager's name as a side effect.
+#
+# A per-user install in $BIN_DIR wins: that copy is this wrapper's to manage,
+# and it is ahead of /usr/bin on most desktop PATHs, so it is also the copy
+# that actually runs. Refusing there would strand the very user the package's
+# pre-install hint tells to clean up with `seed-sync --uninstall`.
+PKG_MGR=""
+pkg_managed() {
+  [ -e /usr/bin/seed-daemon ] || return 1
+  [ ! -e "$BIN_DIR/seed-daemon" ] || return 1
+  if have dpkg && dpkg -S /usr/bin/seed-daemon >/dev/null 2>&1; then PKG_MGR=dpkg; return 0; fi
+  if have rpm && rpm -qf /usr/bin/seed-daemon >/dev/null 2>&1; then PKG_MGR=rpm; return 0; fi
+  if have pacman && pacman -Qo /usr/bin/seed-daemon >/dev/null 2>&1; then PKG_MGR=pacman; return 0; fi
+  return 1
+}
+
+# A package-managed /usr/bin/seed-daemon is a *different* install from this
+# tarball's ~/.local/bin one (see docs/linux-packaging.md). Refuse to
+# install/update/uninstall it here — that's the package manager's job — so the
+# two never fight over which binary answers first on PATH.
+refuse_if_pkg_managed() {
+  pkg_managed || return 0
+  local hint
+  case "$PKG_MGR" in
+    dpkg)   hint="update with: sudo apt update && sudo apt upgrade; remove with: sudo apt remove seed-sync" ;;
+    rpm)    hint="update with: sudo dnf upgrade (or sudo zypper update); remove with: sudo dnf remove seed-sync (or sudo zypper remove seed-sync)" ;;
+    pacman) hint="update with: sudo pacman -Syu (the [kznjk] repository) or your AUR helper; remove with: sudo pacman -R seed-sync" ;;
+    *)      hint="update or remove it with your package manager" ;;
+  esac
+  log "SEED Sync was installed as a $PKG_MGR-managed package (/usr/bin/seed-daemon); this wrapper does not manage it."
+  log "$hint"
+  log "(seed-sync --status still reports whether a newer release exists.)"
+  exit 1
+}
+
 version_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1)" = "$2" ]; }
 installed_version() { have seed-daemon && seed-daemon --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1; }
 
@@ -174,6 +211,7 @@ apply_tree() {
 }
 
 cmd_install() {
+  refuse_if_pkg_managed
   local auto=1 gui=1 a
   for a in "$@"; do case "$a" in
     --no-auto-update) auto=0 ;;
@@ -216,6 +254,7 @@ cmd_install() {
 cmd_update() {
   local check=0 a
   for a in "$@"; do case "$a" in --check) check=1 ;; *) die "unknown flag for --update: $a" ;; esac; done
+  [ "$check" = 1 ] || refuse_if_pkg_managed
 
   local inst latest
   inst="$(installed_version || true)"
@@ -232,6 +271,7 @@ cmd_update() {
 }
 
 cmd_uninstall() {
+  refuse_if_pkg_managed
   local purge=0 a
   for a in "$@"; do case "$a" in --purge) purge=1 ;; *) die "unknown flag for --uninstall: $a" ;; esac; done
 

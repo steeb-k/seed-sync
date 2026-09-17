@@ -10,9 +10,15 @@ S.E.E.D. is **not a typical sandboxed GUI app** — it's a *per-user background 
 GUI + CLI. The daemon continuously reads/writes **arbitrary user-chosen folders** and needs
 the keyring, full network (iroh), the session bus (tray), and system GTK 4.10+/libadwaita 1.4+.
 
-- **Flatpak was rejected:** a daemon doing continuous R/W to arbitrary folders can't use
-  per-file portal grants; you'd need `--filesystem=host` + `--share=network` + secrets +
-  session bus, which guts the sandbox while paying its complexity. No real benefit.
+- **Flatpak needs a wide sandbox, not a narrow one.** A daemon doing continuous R/W to
+  arbitrary user-chosen folders can't use per-file portal grants — those hand back a
+  one-shot, revocable handle to a single picked path, useless for "keep this folder
+  mirrored indefinitely" — so the Flatpak build (added later, see
+  [Flatpak](#flatpak) below) asks for `--filesystem=host` outright instead of pretending
+  otherwise. It's still worth shipping: for users who prefer Flatpak's sandboxing and
+  auto-update over the per-user tarball, most of the sandbox still holds (no arbitrary
+  binary execution, network/bus access are the normal grants, GPU/display access is the
+  normal portals) even though the filesystem grant is broad.
 - **AppImage was rejected:** GTK4 bundling is fiddly and it does nothing for the daemon
   autostart problem.
 - **Chosen: a distro-agnostic tarball** installed per-user, with the daemon run as a
@@ -180,9 +186,302 @@ Self-replacement of `seed-sync` is safe: `apply_tree` writes the new file to a t
   firewall — it's per-user and must not sudo. The Windows MSI *does* install a
   per-program inbound rule (see `windows-packaging.md` §3).
 
+## Native packages (.deb / .rpm)
+The tarball above is the release baseline; `.deb` and `.rpm` packages are also built,
+for fleets that would rather use their distro's package manager than a per-user
+self-updating install. They keep the same **per-user, no-root** daemon model as the
+tarball — a package only changes *where the files live*, never who runs the daemon:
+
+| Path | Content |
+|------|---------|
+| `/usr/bin/{seed-daemon,seed-gui,seed-cli,seed-sync}` | binaries + the wrapper (kept for `seed-sync --status`; see below) |
+| `/usr/lib/systemd/user/seed-daemon.service` | a package variant of the unit — `ExecStart=/usr/bin/seed-daemon run` instead of the tarball's `%h/.local/bin/seed-daemon run` |
+| `/usr/share/applications/io.github.steeb_k.SeedSync.desktop` | a package variant — `Exec=seed-gui`, no `__BIN__` placeholder to rewrite |
+| `/usr/share/metainfo/io.github.steeb_k.SeedSync.metainfo.xml` | with a `<releases>` block generated from `CHANGELOG.md` |
+| `/usr/share/icons/hicolor/<size>x<size>/apps/io.github.steeb_k.SeedSync.png` | same sizes as the tarball |
+| `/usr/share/doc/seed-sync/copyright` (.deb) / `/usr/share/licenses/seed-sync/LICENSE` (.rpm) | license, each format's own convention |
+
+Because `seed-daemon.service` is still a **`systemd --user`** unit, there is no single
+system-level action a root postinstall scriptlet can take to start it — unlike a
+typical root-daemon package, nothing here calls `systemctl enable --now` for you.
+`postinstall`/`preremove` print the `systemctl --user …` command and otherwise leave
+every user session alone; enabling it is a one-line, per-account step:
+```sh
+systemctl --user enable --now seed-daemon
+```
+The packages **do not** ship the update timer/service — a package-managed install
+updates through the package manager, not `seed-sync --update`. `seed-sync` is still
+installed (for `--status`, and so anyone still holding a copy of the wrapper gets a
+clear answer), but it refuses `--install`/`--update`/`--uninstall` once it sees
+`/usr/bin/seed-daemon` owned by a package manager (`refuse_if_pkg_managed`, checked
+with `dpkg -S` / `rpm -qf` / `pacman -Qo`), naming the right command instead:
+```
+$ seed-sync --update
+seed-sync: SEED Sync was installed as a dpkg-managed package (/usr/bin/seed-daemon); this wrapper does not manage it.
+seed-sync: update with: sudo apt update && sudo apt upgrade; remove with: sudo apt remove seed-sync
+```
+Running the tarball installer over a package (or vice versa) is a real conflict — a
+per-user `~/.local/bin` is typically *ahead* of `/usr/bin` on desktop `$PATH`s, so the
+two would silently fight over which binary answers first. If you're switching from
+the tarball to a package, run `seed-sync --uninstall` (as that user) first; your share
+keys and data in `~/.local/share/seedsync` are untouched either way. If you find out
+the hard way — package installed, tarball still in `~/.local/bin` — that cleanup
+still works: the refusal only applies when `~/.local/bin/seed-daemon` is *absent*, so
+with both present the wrapper keeps managing your per-user copy, which is also the
+one your `$PATH` is running.
+
+**Builder:** [nfpm](https://github.com/goreleaser/nfpm), driven by
+`packaging/linux/nfpm.yaml`, fed from the tree `scripts/package-linux.sh` stages:
+```sh
+scripts/package-linux.sh              # stages dist/seed-sync-<v>-linux-x86_64/
+scripts/package-linux-native.sh       # -> dist/seed-sync_<v>-1_amd64.deb, dist/seed-sync-<v>-1.x86_64.rpm
+```
+`package-linux-native.sh` copies the staged tree to `dist/native/tree` (nfpm's
+content paths take no variables, so the path nfpm.yaml references is fixed), overlays
+the `/usr/bin` unit and desktop file from `packaging/linux/pkg/`, generates the
+metainfo `<releases>` block from `CHANGELOG.md`'s `## [X.Y.Z] - YYYY-MM-DD` headings
+(a single entry for the current version if the repo has no `CHANGELOG.md` yet; every
+`<release>` gets a `date`, falling back to the build date, because `appstreamcli
+validate` flags one without), pins the wrapper's shebang to `/bin/bash` (`env` is a
+`lintian`/`rpmlint` finding; the tarball keeps it), and calls `nfpm package` twice.
+It requires the staged tree to already exist and requires `nfpm` on `PATH`; it does
+not build or stage anything itself, and it works on a copy — the staged tarball tree
+is never modified.
+
+Dependencies are declared by soname/package so they resolve correctly on whichever
+distro installs them: deb `libgtk-4-1 (>= 4.10)`, `libadwaita-1-0 (>= 1.4)`,
+`libdbus-1-3`, `libc6 (>= 2.39)`, `libgcc-s1` (Rust's unwinder); rpm the equivalent sonames
+(`libgtk-4.so.1()(64bit)` etc.) since Fedora and openSUSE name the packages
+differently. deb compresses with xz (every dpkg reads it; `lintian` rejects a
+zstd `data.tar`), rpm with zstd.
+
+Maintainer scripts (`packaging/linux/scripts/{pre,post}{install,remove}.sh`, shared
+between the .deb and .rpm scriptlet forms) never touch a user session:
+- `preinstall` is a no-op scriptlet-arg dispatcher — there's no reliable system-wide
+  way to detect a per-user tarball install from a root pre-install hook the way
+  Nullgate's root-daemon packaging can check `/usr/local/bin`.
+- `postinstall` self-configures the rpm repository (below) on a **first install
+  only**, then prints the `systemctl --user enable --now seed-daemon` hint.
+- `preremove` warns that it isn't stopping anything running, and on an rpm erase
+  (not an upgrade) takes back the repository files it added, unless they were edited.
+- `postremove` is a no-op: `seed-daemon.service` lives under
+  `/usr/lib/systemd/user`, which the *system* manager never loads, so there is no
+  system-level `daemon-reload` to run.
+
+## Arch Linux / AUR
+`packaging/arch/PKGBUILD` builds `seed-sync` from the **source tarball of the
+tagged release** (`https://github.com/steeb-k/seed-sync-gtk/archive/refs/tags/v$pkgver.tar.gz`
+— note the repo is `seed-sync-gtk`, so the extracted directory is
+`seed-sync-gtk-$pkgver`, not `$pkgname-$pkgver`), not a binary package:
+`depends=(gtk4 libadwaita dbus)`, `makedepends=(cargo git imagemagick)` (icons are
+rendered from `icon/appIcon.png` at build time, the same `ICON_SIZES` as
+`package-linux.sh`), `options=('!lto')` (makepkg's LTO compiles `ring`'s C bits to
+GCC LTO bitcode, which rustc's lld linker can't read — this bit both Nullgate and
+would bite SEED Sync identically), and `cargo build --release --locked -p seed-daemon
+-p seed-gui -p seed-cli`. It installs the same `/usr`-rooted layout as the .deb/.rpm,
+including the per-user unit and the `packaging/linux/seed-sync` wrapper (kept for
+`--status`/`refuse_if_pkg_managed`, same reasoning as above).
+`packaging/arch/seed-sync.install` follows Arch convention — no service is
+enabled/started automatically — and prints the same `systemctl --user` hints as the
+.deb/.rpm scripts, plus a note to remove any per-user tarball install first.
+
+**CI proof:** `scripts/ci/arch-pkgbuild.sh`, run in an `archlinux:latest` container
+against a `git archive` of the tag (standing in for the not-yet-published tag
+download): `makepkg`, `namcap`, `pacman -U`, a check that `seed-daemon --version` and
+the unit's `ExecStart` are right, that `seed-sync --update` refuses
+(`refuse_if_pkg_managed`), then `pacman -R`. The built `.pkg.tar.zst` is copied out
+for the release to attach.
+
+**AUR workflow** (manual, after a release is published — this package does not
+build itself into the AUR):
+```sh
+git clone ssh://aur@aur.archlinux.org/seed-sync.git ../seed-sync-aur   # once
+scripts/aur-prepare.sh 0.8.0 ../seed-sync-aur
+cd ../seed-sync-aur && git diff && git commit -am "seed-sync 0.8.0" && git push
+```
+`aur-prepare.sh` copies `PKGBUILD`/`seed-sync.install` into the clone, sets `pkgver`
+(and `pkgrel`), replaces the in-repo `sha256sums=('SKIP')` with the real sha256 of
+the now-published tag archive, and regenerates `.SRCINFO` (via `makepkg
+--printsrcinfo`, or an `archlinux` container if `makepkg` isn't available locally).
+It never commits or pushes — review the diff first.
+
+## Flatpak
+`packaging/flatpak/io.github.steeb_k.SeedSync.yml` builds a single-file `.flatpak`
+bundle — a third distribution channel alongside the tarball and the native
+packages above, for users who'd rather install and auto-update through Flatpak.
+It targets `org.gnome.Platform`/`org.gnome.Sdk` branch `48` (GTK4 + libadwaita
+come from the runtime) plus the `org.freedesktop.Sdk.Extension.rust-stable` SDK
+extension to build. Build it with:
+```sh
+scripts/package-flatpak.sh
+```
+which installs the runtime/SDK/extension from Flathub into the user installation
+on first run, then writes `dist/io.github.steeb_k.SeedSync-<version>-x86_64.flatpak`
+(the exact name the release pipeline's asset table expects — see
+`docs/ci-release.md` §3). Install a downloaded bundle with:
+```sh
+flatpak install --user ./io.github.steeb_k.SeedSync-<v>-x86_64.flatpak
+```
+
+### Permissions, and why
+The manifest's `finish-args` comment block has the full reasoning per
+permission; in short:
+- `--share=network` — iroh (QUIC + relay fallback), the whole point of the app.
+- `--socket=wayland` / `--socket=fallback-x11`, `--device=dri` — normal GTK4
+  display + GPU access.
+- `--socket=session-bus` — the Linux tray (`crates/seed-gui/src/tray.rs`'s
+  `ksni` backend) registers a StatusNotifierItem with the desktop shell, which
+  by default means *owning* a per-instance well-known bus name
+  (`org.kde.StatusNotifierItem-<pid>-<n>`) that can't be pre-authorized with a
+  narrower `--own-name=` pattern — see the manifest comment for the exact
+  `ksni` internals this is based on, and the `disable_dbus_name(true)` escape
+  hatch that could narrow this to a plain `--talk-name` in a later pass.
+- `--talk-name=org.freedesktop.secrets` — the OS keystore for share master
+  seeds (`crates/seed-core/src/secrets.rs`) goes through the `keyring` crate's
+  Secret Service backend on Linux.
+- `--talk-name=org.freedesktop.portal.Background` — reserved for a future
+  `RequestBackground` portal call; not used yet (see next section).
+- `--filesystem=host` — the daemon mirrors arbitrary, runtime-chosen folders
+  continuously; no portal file-grant model supports that. This is also what
+  makes `~/.config/autostart` directly writable from inside the sandbox (see
+  below) without a separate `xdg-config` filesystem permission.
+
+No `--filesystem=xdg-run/seed-sync:create`: the IPC socket lives under
+`$XDG_DATA_HOME/seedsync/seed.sock` (`default_data_dir`/`default_socket` in
+`crates/seed-daemon/src/main.rs`), not `$XDG_RUNTIME_DIR`, and `$XDG_DATA_HOME`
+is already the sandbox's own per-app data directory with no extra permission
+needed — see the data directory paragraph below.
+
+### In-sandbox daemon supervision
+There is no `systemd --user` reachable inside the sandbox, so nothing brings
+`seed-daemon` up the way the tarball's unit or the Windows service does.
+`crates/seed-gui/src/flatpak.rs` covers this:
+- `in_flatpak()` detects the sandbox via `/.flatpak-info`, which Flatpak
+  bind-mounts into every sandboxed process.
+- `ensure_daemon(socket)` — a no-op outside Flatpak — checks whether anything
+  is listening on the daemon's socket and, if not, spawns
+  `seed-daemon run` as a child of the GUI (resolved next to the running
+  `seed-gui` binary, both installed to `/app/bin`), with its stdout/stderr
+  appended to `$XDG_DATA_HOME/seedsync/daemon.log` (on Linux, `seed-daemon run`
+  only ever logs to stdout — see `init_logging` in
+  `crates/seed-daemon/src/main.rs` — so without this redirect a
+  GUI-spawned child's output would just go nowhere).
+- It's called once at GUI startup, before the first IPC connection, and again
+  from the "Daemon Not Started" page's retry button.
+- For the daemon to survive a reboot without the user opening the GUI by hand,
+  `ensure_daemon` also writes an XDG autostart entry to
+  `~/.config/autostart/io.github.steeb_k.SeedSync.desktop` running
+  `flatpak run io.github.steeb_k.SeedSync --hidden` — the same mechanism and
+  directory the non-Flatpak install already uses for the tray
+  (`packaging/linux/seed-sync`'s `AUTOSTART_DIR`), rather than the Background
+  portal's `ashpd` binding, which is not a dependency of this workspace
+  (`Cargo.lock` has no `ashpd` entry) and wasn't worth adding for one call.
+  That file is read/written via the literal `$HOME` env var rather than
+  `directories::BaseDirs::config_dir()` (`$XDG_CONFIG_HOME`), because Flatpak
+  always redirects `$XDG_CONFIG_HOME` to the sandboxed
+  `~/.var/app/<id>/config` — invisible to the host session manager that reads
+  autostart entries — while `$HOME` itself is not redirected, and
+  `--filesystem=host` makes the real `~/.config/autostart` directly writable.
+
+### Data directory and socket path
+Unchanged from the tarball/native install: the data dir + socket are chosen by
+the `directories` crate the same way everywhere (`ProjectDirs::from("io.github",
+"steeb_k","SeedSync")`), which resolves via `$XDG_DATA_HOME`. Flatpak sets
+`$XDG_DATA_HOME` to `~/.var/app/io.github.steeb_k.SeedSync/data` inside the
+sandbox (its standard per-app data isolation, independent of the
+`--filesystem=host` grant), so the data dir lands at
+**`~/.var/app/io.github.steeb_k.SeedSync/data/seedsync`** — holding `state.db`,
+`blobs/`, `docs/`, `node.key` and `seed.sock`, exactly like
+`~/.local/share/seedsync` does outside Flatpak. `seed-gui` and `seed-daemon`
+compute this independently (each has its own `ProjectDirs::from(...)` call —
+see `default_socket()` in `crates/seed-gui/src/main.rs` and
+`default_data_dir()`/`default_socket()` in `crates/seed-daemon/src/main.rs`)
+but always agree, in the sandbox or out of it, because both read the same
+inputs. No code changes were needed for the sandbox case, and no
+`$XDG_RUNTIME_DIR` involvement — the socket is a regular file under the data
+directory, not under the runtime directory.
+
+### Updates
+Updating is Flatpak's own job (`flatpak update`, or automatic updates if the
+user's Flatpak setup does that) — `seed-sync --update` is **not** shipped
+inside the Flatpak build, and the bundle carries no update timer/service.
+
+### Flathub prerequisites (not done here)
+This manifest is built for our own distribution (a self-published bundle,
+apps.kznjk.com's future flatpak repo — see `docs/ci-release.md` §7) and is
+**not** Flathub-submission-ready:
+- **`cargo-sources.json`.** The manifest's `build-options.build-args:
+  [--share=network]` lets `cargo build` fetch crates from crates.io during the
+  build — fine for a build we run ourselves, but Flathub's build sandbox has no
+  network access at all. A Flathub submission needs a `cargo-sources.json`
+  generated from this workspace's `Cargo.lock` by
+  [`flatpak-cargo-generator`](https://github.com/flatpak/flatpak-builder-tools),
+  added as an extra `sources:` entry, with `--share=network` removed.
+- **Screenshots + a `<releases>` block** in
+  `packaging/linux/io.github.steeb_k.SeedSync.metainfo.xml` — Flathub requires
+  both; neither exists yet (the `.deb`/`.rpm` packages already generate a
+  `<releases>` block from `CHANGELOG.md` at package time — see "Native
+  packages" above — the same generation would need wiring into the Flatpak
+  build too).
+- A Flathub review of the permission set above, which tends to push back hard
+  on `--filesystem=host` and `--socket=session-bus` — expect that
+  conversation, not a rubber stamp.
+
+## Package repositories (apps.kznjk.com)
+Releases also reach apt, dnf, zypper and pacman through signed repositories on
+**apps.kznjk.com** — the same host, and the same repositories, that Nullgate
+(`steeb-k/nullgate`) publishes to. **Nothing in this repo publishes to them**: a
+systemd timer on that host (`sync-packages.py` in `~/flatpak-repo`) polls a source
+repo's `releases/latest` every 10 minutes, downloads the release assets, verifies
+them against GitHub's sha256 digests, signs them and rebuilds the repositories;
+prereleases are ignored. **A host-side change is required before SEED Sync's
+packages show up there:** add `steeb-k/seed-sync-binaries` (the binaries repo SEED
+Sync publishes releases to — see `docs/releasing.md`) to that poller's source list
+(it currently polls only `steeb-k/nullgate`); the `.deb`/`.rpm`/`.pkg.tar.zst`
+asset types are already generically handled once a repo is in that list. Until it
+lands, the packages are still downloadable straight from the GitHub release and
+install by file — they just don't self-update through a repo yet.
+
+| Repo | URL | Client setup |
+|------|-----|--------------|
+| apt | `https://apps.kznjk.com/deb`, suite `stable`, component `main` | `/etc/apt/sources.list.d/kznjk.sources` + `/etc/apt/keyrings/kznjk-packages.asc` |
+| dnf | `https://apps.kznjk.com/rpm/$basearch` | `/etc/yum.repos.d/kznjk.repo` |
+| zypper | same repository | `/etc/zypp/repos.d/kznjk.repo` |
+| pacman | `https://apps.kznjk.com/arch/$arch`, `[kznjk]` | by hand: `pacman-key --add` + `--lsign-key`, then a `[kznjk]` section — no package edits `pacman.conf` |
+
+All are signed by **apps.kznjk.com Package Repositories**, fingerprint
+`07E6 2212 5389 C2E1 94BA 7A5A 7F75 E425 2FDB 9F8D` — the same key Nullgate's
+packages carry, since it's the same host and repositories serving both projects'
+assets side by side.
+
+**Installing a downloaded package adds the repository**, like Chrome or VS Code do,
+so nobody is stranded on the version they downloaded. The definitions live in
+`packaging/linux/repo/` and must stay byte-identical to the copies the site serves
+(see that directory's `README.md`):
+- **`.deb`**: `kznjk.sources` and the key are **conffiles**. `apt remove` keeps them
+  (so the repository still verifies), `apt purge` deletes them, and deleting them by
+  hand is a lasting opt-out because dpkg doesn't restore a removed conffile.
+- **`.rpm`**: dnf and zypper read different directories, and only one exists on a
+  given system, so the package ships both definitions under
+  `/usr/share/seed-sync/repo/` and `postinstall` copies the right one on a **first
+  install only**, never over an existing `kznjk.repo`. Erasing takes it back unless
+  it was edited.
+- **Arch** gets no automatic setup: a package editing `pacman.conf` is not
+  acceptable there, so the `.pkg.tar.zst` ships no repository definition. Add it by
+  hand — import and locally sign the key, then append the section to
+  `/etc/pacman.conf`:
+  ```sh
+  sudo pacman-key --recv-keys 7F75E4252FDB9F8D          # or: curl -fsSL https://apps.kznjk.com/rpm/RPM-GPG-KEY-kznjk-packages | sudo pacman-key --add -
+  sudo pacman-key --lsign-key 7F75E4252FDB9F8D
+  ```
+  ```ini
+  [kznjk]
+  Server = https://apps.kznjk.com/arch/$arch
+  ```
+  Then `sudo pacman -Sy seed-sync`. The AUR package builds from source instead and
+  needs none of this.
+
 ## Future work (not built)
-- Native per-distro packages (`.deb` via `cargo-deb`, Arch `PKGBUILD`, `.rpm` via
-  `cargo-generate-rpm`) + self-hosted apt/pacman repos, if a fleet standardizes.
 - A **fixed-listen-port setting** for the daemon (iroh supports binding a chosen
   port), so firewalled hosts can open exactly one UDP port instead of a subnet
   allow. Would also make the ufw guidance above a one-liner.

@@ -1,0 +1,28 @@
+# Arch convention: packages do not enable or start services themselves. SEED
+# Sync's daemon is also a *per-user* `systemd --user` service, not a root
+# system service, so — unlike a typical Arch daemon package — there is no
+# single account for a package hook to act on either: every hint below is
+# `systemctl --user`, run by whichever account wants SEED Sync running.
+
+pre_install() {
+  echo "==> NOTE: if any account has SEED Sync installed from the release tarball"
+  echo "    (~/.local/bin, which is often ahead of /usr/bin on PATH), remove it first"
+  echo "    as that user: seed-sync --uninstall. Your share keys and data are kept."
+}
+
+post_install() {
+  echo "==> Sign in as each account that should run S.E.E.D. and enable it there:"
+  echo "        systemctl --user enable --now seed-daemon"
+  echo "    Then open S.E.E.D. from your app menu, or run: seed-gui"
+}
+
+post_upgrade() {
+  echo "==> Restart your seed-daemon --user service to run the new version:"
+  echo "        systemctl --user try-restart seed-daemon"
+}
+
+pre_remove() {
+  echo "==> This does not stop a running per-user seed-daemon service."
+  echo "    If SEED Sync is running for your account, stop it yourself:"
+  echo "        systemctl --user disable --now seed-daemon"
+}
