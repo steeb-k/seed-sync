@@ -938,16 +938,31 @@ async fn load_seed_bounded(share_id: &str) -> anyhow::Result<[u8; 32]> {
     }
 }
 
-/// A master share whose write key the OS keystore would not give us. Held inert (see
-/// [`Engine::locked`]) rather than opened read-only, and retried.
-struct LockedShare {
+/// Why a share is held inert (see [`Engine::inert`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InertCause {
+    /// A master whose write key the OS keystore would not give us.
+    KeyLocked,
+    /// The share's local folder does not exist (drive removed, folder moved/deleted).
+    FolderMissing,
+}
+
+/// A share the engine will not open right now: a master whose write key the OS
+/// keystore would not give us, or any share whose local folder is gone. Held inert
+/// (see [`Engine::inert`]) rather than opened read-only / over a recreated folder,
+/// and retried.
+struct InertShare {
     record: crate::db::ShareRecord,
-    /// Unix seconds of the last keystore retry; throttles it to one per
-    /// [`KEY_RETRY_SECS`].
+    cause: InertCause,
+    /// Unix seconds of the last retry; throttles it to one per [`KEY_RETRY_SECS`].
     last_retry: i64,
-    /// Why the key is unavailable, for the UI and the log (e.g. "unlock prompt was
-    /// dismissed").
+    /// Why the share is inert, for the UI and the log (e.g. "unlock prompt was
+    /// dismissed", "folder is back but empty").
     reason: String,
+    /// How many paths the share's persisted index holds, computed once on first
+    /// use: it cannot change while the share is inert, and the folder-back check
+    /// runs every tick.
+    indexed: Option<usize>,
 }
 
 /// How often a locked master share re-asks the OS keystore for its write key. The
@@ -3241,6 +3256,20 @@ impl ReconcileJob {
     }
 }
 
+/// The reconcile gate's view of an open share's root (known-issues #37).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FolderGate {
+    /// The folder is there; passes run.
+    Open,
+    /// The folder vanished mid-run (drive unplugged, folder moved). No pass runs;
+    /// reported as `FolderMissing`.
+    Missing,
+    /// The folder came back after being missing — but **empty**, while the index
+    /// still holds files. Not "the user deleted everything": no pass runs until
+    /// content is back. Still reported as `FolderMissing`.
+    BackEmpty,
+}
+
 /// In-memory per-share state.
 struct ShareState {
     key: ShareKey,
@@ -3255,6 +3284,9 @@ struct ShareState {
     last_quick_sig: u64,
     /// When paused, the reconcile loop skips this share.
     paused: bool,
+    /// What the reconcile gate last found the root to be. Doubles as the
+    /// once-per-episode log marker: transitions are logged, steady states are not.
+    folder_gate: FolderGate,
     /// Set while a [`ReconcileJob`] for this share is running off-lock, so the
     /// reconcile loop doesn't start a second concurrent publish of it.
     publishing: bool,
@@ -3587,9 +3619,17 @@ pub struct Engine {
     /// field when a `systemd --user` daemon started at boot, before the login keyring
     /// was unlocked ("Secret Service: unlock prompt was dismissed").
     ///
-    /// Retried by [`Engine::retry_locked_keys`], so unlocking the keyring restores the
+    /// Retried by [`Engine::retry_inert_shares`], so unlocking the keyring restores the
     /// share without a daemon restart.
-    locked: HashMap<String, LockedShare>,
+    ///
+    /// Also holds any share whose local folder is missing ([`InertCause::FolderMissing`],
+    /// known-issues #37): a removed drive, a moved or deleted folder. The engine used to
+    /// `create_dir_all` the root on open, which either failed and took the *whole daemon*
+    /// down (missing drive: `os error 3` on every start, exit code 0) or silently
+    /// recreated an empty root — and an empty root under a master with a populated index
+    /// is what "the user deleted every file" looks like to the reconcile pass. Same
+    /// remedy: listed, never reconciled, retried until the folder is back *with content*.
+    inert: HashMap<String, InertShare>,
     db: crate::db::Db,
     /// Live import progress (`done_bytes`, `total_bytes`) for shares currently
     /// being published off-lock, keyed by share id. Shared with each in-flight
@@ -3750,7 +3790,7 @@ impl Engine {
             node,
             author,
             shares: HashMap::new(),
-            locked: HashMap::new(),
+            inert: HashMap::new(),
             db,
             progress: Arc::new(StdMutex::new(HashMap::new())),
             downloads_inflight: Arc::new(StdMutex::new(HashMap::new())),
@@ -3935,11 +3975,41 @@ impl Engine {
                     continue;
                 }
             };
+            // A share whose local folder is gone — its drive removed, the folder
+            // moved or deleted — is held INERT, exactly like a locked key below, and
+            // re-checked by `retry_inert_shares`. It is emphatically not recreated:
+            // `open_share` used to `create_dir_all` the root, which on a missing
+            // drive failed and took the whole daemon down with it on every start
+            // (known-issues #37), and on a merely-unplugged one silently produced an
+            // empty root — which, under a master with a populated index, is what
+            // "the user deleted every file" looks like to the reconcile pass.
+            // Checked before the keystore so the more actionable fault is the one
+            // reported, and so a missing folder costs no keystore round-trip.
+            if !Path::new(&rec.folder).is_dir() {
+                let share_id = rec.share_id.clone();
+                let folder = rec.folder.clone();
+                tracing::error!(
+                    "share {share_id} folder is missing ({folder}); holding the share INERT \
+                     (not syncing, nothing created) until the folder is back — reconnect the \
+                     drive or move the folder back"
+                );
+                self.inert.insert(
+                    share_id,
+                    InertShare {
+                        record: rec,
+                        cause: InertCause::FolderMissing,
+                        last_retry: 0,
+                        reason: format!("folder is missing: {folder}"),
+                        indexed: None,
+                    },
+                );
+                continue;
+            }
             // Master shares keep their seed in the OS keystore; load it to restore
             // write capability.
             //
             // If it's unavailable, the share is held INERT — not opened at all — and
-            // retried by `retry_locked_keys`. It emphatically must not be opened
+            // retried by `retry_inert_shares`. It emphatically must not be opened
             // read-only, which is what this used to do. Read-only is not a safe
             // fallback for a master: a viewer treats the replica as authoritative and
             // *reverts local edits*, so a user writing to what they believe is their
@@ -3966,10 +4036,12 @@ impl Engine {
                              share INERT (not syncing) until the key is available — unlock your \
                              login keyring: {e:#}"
                         );
-                        self.locked.insert(
+                        self.inert.insert(
                             share_id,
-                            LockedShare {
+                            InertShare {
                                 record: rec,
+                                cause: InertCause::KeyLocked,
+                                indexed: None,
                                 // 0, not `now`: retry on the very first tick rather than
                                 // sitting locked for a throttle interval. The keyring
                                 // often unlocks seconds after the daemon starts (the
@@ -4059,7 +4131,10 @@ impl Engine {
             .await
             .context("disable docs content auto-download")?;
 
-        std::fs::create_dir_all(folder)?;
+        // NOTE: the folder is deliberately NOT created here. `create_open` and
+        // `add_share_open` create it (the user just chose it); reload and the inert
+        // retry must never conjure an empty root for a share that had content
+        // (known-issues #37).
 
         // Subscribe (keeps live sync alive + feeds the peer roster) and register
         // the namespace for serving + connect to any bootstrap peers.
@@ -4164,6 +4239,7 @@ impl Engine {
                 last_seqno,
                 last_quick_sig: 0,
                 paused,
+                folder_gate: FolderGate::Open,
                 publishing: false,
                 cancel: Arc::new(AtomicBool::new(false)),
                 roster,
@@ -4248,43 +4324,51 @@ impl Engine {
                 // the source (always 100); a viewer reports its present/total %.
                 let retrying = s.skipped.len() as u32;
                 let out_of_sync = s.is_out_of_sync();
-                let (status, percent, indexed_bytes, index_total) = if s.paused || paused_all {
-                    (seed_ipc::ShareStatus::Paused, 0, 0, 0)
-                } else if let Some(&(done, tot)) = progress.get(id) {
-                    let pct = (done.min(tot) * 100).checked_div(tot).unwrap_or(0) as u8;
-                    (seed_ipc::ShareStatus::Indexing, pct, done, tot)
-                } else if s.isolated() {
-                    // Ranked above OutOfSync deliberately. Divergence is a claim about
-                    // what our *peers* hold, and `diverged_since` is sticky — so a node
-                    // that diverged and then lost every peer would keep insisting
-                    // "members disagree" about members it can no longer hear at all.
-                    // Being partitioned is both the truer statement and the one the
-                    // user has to fix first: no other condition can even be assessed,
-                    // let alone repaired, until this node can reach somebody.
-                    (seed_ipc::ShareStatus::NoPeers, s.health, 0, 0)
-                } else if out_of_sync {
-                    // Members disagree on the fileset past the settle window — the most
-                    // serious steady-state condition; never read "Healthy".
-                    (seed_ipc::ShareStatus::OutOfSync, s.health, 0, 0)
-                } else if retrying > 0 {
-                    // Files we can't read/publish yet (locked/unreadable) are being
-                    // retried — the share is NOT settled even if content % looks full.
-                    // Never read "Healthy" in this state.
-                    (seed_ipc::ShareStatus::Syncing, s.health, 0, 0)
-                } else if s.health >= 100 && s.converged_with_online_peers() {
-                    (seed_ipc::ShareStatus::Healthy, 100, 0, 0)
-                } else if s.health >= 100 {
-                    // Content-complete against the manifest we currently hold, but an
-                    // online peer advertises a different fingerprint — we haven't
-                    // converged toward the agreed fileset yet (our doc replica is still
-                    // catching up). Show Syncing rather than a premature Healthy 100%,
-                    // and cap the bar below 100 so it doesn't read "done". Persistent
-                    // disagreement escalates to OutOfSync above once past the settle
-                    // window.
-                    (seed_ipc::ShareStatus::Syncing, 99, 0, 0)
-                } else {
-                    (seed_ipc::ShareStatus::Syncing, s.health, 0, 0)
-                };
+                let (status, percent, indexed_bytes, index_total) =
+                    if !s.folder.is_dir() || s.folder_gate != FolderGate::Open {
+                        // The root vanished while we were running (drive unplugged, folder
+                        // moved) — or came back empty and the reconcile gate is holding
+                        // the share until its content is back. Ranked above everything,
+                        // paused included: no other status can be assessed, and no pass
+                        // runs against it (known-issues #37).
+                        (seed_ipc::ShareStatus::FolderMissing, s.health, 0, 0)
+                    } else if s.paused || paused_all {
+                        (seed_ipc::ShareStatus::Paused, 0, 0, 0)
+                    } else if let Some(&(done, tot)) = progress.get(id) {
+                        let pct = (done.min(tot) * 100).checked_div(tot).unwrap_or(0) as u8;
+                        (seed_ipc::ShareStatus::Indexing, pct, done, tot)
+                    } else if s.isolated() {
+                        // Ranked above OutOfSync deliberately. Divergence is a claim about
+                        // what our *peers* hold, and `diverged_since` is sticky — so a node
+                        // that diverged and then lost every peer would keep insisting
+                        // "members disagree" about members it can no longer hear at all.
+                        // Being partitioned is both the truer statement and the one the
+                        // user has to fix first: no other condition can even be assessed,
+                        // let alone repaired, until this node can reach somebody.
+                        (seed_ipc::ShareStatus::NoPeers, s.health, 0, 0)
+                    } else if out_of_sync {
+                        // Members disagree on the fileset past the settle window — the most
+                        // serious steady-state condition; never read "Healthy".
+                        (seed_ipc::ShareStatus::OutOfSync, s.health, 0, 0)
+                    } else if retrying > 0 {
+                        // Files we can't read/publish yet (locked/unreadable) are being
+                        // retried — the share is NOT settled even if content % looks full.
+                        // Never read "Healthy" in this state.
+                        (seed_ipc::ShareStatus::Syncing, s.health, 0, 0)
+                    } else if s.health >= 100 && s.converged_with_online_peers() {
+                        (seed_ipc::ShareStatus::Healthy, 100, 0, 0)
+                    } else if s.health >= 100 {
+                        // Content-complete against the manifest we currently hold, but an
+                        // online peer advertises a different fingerprint — we haven't
+                        // converged toward the agreed fileset yet (our doc replica is still
+                        // catching up). Show Syncing rather than a premature Healthy 100%,
+                        // and cap the bar below 100 so it doesn't read "done". Persistent
+                        // disagreement escalates to OutOfSync above once past the settle
+                        // window.
+                        (seed_ipc::ShareStatus::Syncing, 99, 0, 0)
+                    } else {
+                        (seed_ipc::ShareStatus::Syncing, s.health, 0, 0)
+                    };
                 let (online, total) = s.roster.lock().map(|r| r.counts()).unwrap_or((0, 0));
                 // Count this device itself as a peer (always present + online), so
                 // a share with no remote peers reads "1 of 1" rather than "0 of 0".
@@ -4305,12 +4389,13 @@ impl Engine {
                     retrying,
                 }
             })
-            // Shares held inert because their write key is locked in the OS keystore are
-            // NOT in `self.shares` — they were never opened. They must still be listed:
-            // a share that silently vanishes from the UI is its own kind of lie, and the
-            // user needs to see *why* it isn't syncing (and that the cure is to unlock
-            // their keyring, which nothing else would ever suggest).
-            .chain(self.locked.values().map(|l| {
+            // Shares held inert — write key locked in the OS keystore, or folder missing
+            // — are NOT in `self.shares`: they were never opened. They must still be
+            // listed: a share that silently vanishes from the UI is its own kind of lie,
+            // and the user needs to see *why* it isn't syncing (and that the cure is to
+            // unlock their keyring / reconnect the drive, which nothing else would ever
+            // suggest).
+            .chain(self.inert.values().map(|l| {
                 let folder = PathBuf::from(&l.record.folder);
                 seed_ipc::ShareSummary {
                     share_id: l.record.share_id.clone(),
@@ -4319,8 +4404,15 @@ impl Engine {
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| l.record.share_id.clone()),
                     folder: l.record.folder.clone(),
-                    role: seed_ipc::Role::Master,
-                    status: seed_ipc::ShareStatus::KeyLocked,
+                    role: if l.record.role_master {
+                        seed_ipc::Role::Master
+                    } else {
+                        seed_ipc::Role::Viewer
+                    },
+                    status: match l.cause {
+                        InertCause::KeyLocked => seed_ipc::ShareStatus::KeyLocked,
+                        InertCause::FolderMissing => seed_ipc::ShareStatus::FolderMissing,
+                    },
                     percent: 0,
                     online: 1,
                     total: 1,
@@ -5031,7 +5123,7 @@ impl Engine {
     /// through the flap instead of thrashing per blip.
     ///
     /// Returns [`DocResync`] jobs to run off-lock (ladder 1's doc re-kick), mirroring
-    /// [`Engine::retry_locked_keys`]. Subscribing to gossip is a local actor hand-off
+    /// [`Engine::retry_inert_shares`]. Subscribing to gossip is a local actor hand-off
     /// (not a network dial), so rebuilding the handle inline under the lock is
     /// consistent with [`Engine::open_share`], which does the same.
     pub async fn connectivity_recoveries(&mut self) -> Vec<DocResync> {
@@ -5312,7 +5404,7 @@ impl Engine {
         // Dropping the share states aborts their presence receive tasks and
         // releases their doc handles; the docs actor itself goes with the node.
         self.shares.clear();
-        self.locked.clear();
+        self.inert.clear();
         self.reclaim_pending.clear();
         if let Ok(mut m) = self.progress.lock() {
             m.clear();
@@ -5431,63 +5523,167 @@ impl Engine {
         jobs
     }
 
-    /// Re-ask the OS keystore for the write key of every share held inert by
-    /// [`Engine::locked`], and open any whose key has become available.
+    /// Re-check every share held inert by [`Engine::inert`] and open any whose
+    /// blocker has cleared: a master whose write key the OS keystore now hands back,
+    /// or a share whose folder is back on disk.
     ///
-    /// This is what makes the failure recoverable *in place*. The keyring is typically
-    /// unlocked at graphical login — seconds to hours after a headless boot — so the
-    /// daemon must notice that itself. Without this, the only cure is restarting the
-    /// daemon, which nothing about the symptom would ever suggest: "my files aren't
-    /// syncing" does not lead anyone to "your keyring was locked when the service
-    /// started". A fault that only a maintainer knows how to clear is, in practice,
-    /// not recoverable at all.
+    /// This is what makes both failures recoverable *in place*. The keyring is
+    /// typically unlocked at graphical login — seconds to hours after a headless boot
+    /// — and a removed drive comes back whenever the user plugs it in; the daemon must
+    /// notice either itself. Without this, the only cure is restarting the daemon,
+    /// which nothing about the symptom would ever suggest: "my files aren't syncing"
+    /// does not lead anyone to "your keyring was locked when the service started".
+    /// A fault that only a maintainer knows how to clear is, in practice, not
+    /// recoverable at all.
+    ///
+    /// A folder that is back but **empty** while the share's index says it held
+    /// files is *not* reopened: the next full scan would see every indexed path gone
+    /// and, on a master, tombstone them all — every member would delete its copy
+    /// (known-issues #37). It stays inert until content is back (or the user removes
+    /// and re-adds the share, whose fresh, empty index makes an empty folder safe).
     ///
     /// Returns a [`DocResync`] per recovered share so the caller starts live-sync off
     /// the engine lock, exactly like [`Engine::add_share_open`].
-    pub async fn retry_locked_keys(&mut self) -> Vec<DocResync> {
-        if self.locked.is_empty() {
+    pub async fn retry_inert_shares(&mut self) -> Vec<DocResync> {
+        if self.inert.is_empty() {
             return Vec::new();
         }
         let now = now_secs();
+        // The keystore probe is throttled (a synchronous OS call, possibly a prompt);
+        // the folder probe is one `stat`, so a missing folder is checked every tick
+        // and a re-plugged drive resumes within a second.
         let due: Vec<String> = self
-            .locked
+            .inert
             .iter()
-            .filter(|(_, l)| now - l.last_retry >= KEY_RETRY_SECS)
+            .filter(|(_, l)| {
+                l.cause == InertCause::FolderMissing || now - l.last_retry >= KEY_RETRY_SECS
+            })
             .map(|(id, _)| id.clone())
             .collect();
 
         let mut out = Vec::new();
         for id in due {
-            let Some(l) = self.locked.get_mut(&id) else {
+            let Some(l) = self.inert.get_mut(&id) else {
                 continue;
             };
             l.last_retry = now;
-            let seed = match load_seed_bounded(&id).await {
-                Ok(seed) => seed,
-                Err(e) => {
-                    // Still locked. Debug, not warn: on a box whose keyring is never
-                    // unlocked this would otherwise log every 30s forever, and the loud
-                    // ERROR was already emitted once at startup.
-                    tracing::debug!("master seed for {id} still unavailable: {e:#}");
-                    continue;
+
+            // Is the blocker gone? Each arm yields the key to open with, or `continue`s.
+            let key = match l.cause {
+                InertCause::FolderMissing => {
+                    let folder = PathBuf::from(&l.record.folder);
+                    if !folder.is_dir() {
+                        tracing::debug!("share {id} folder still missing: {}", folder.display());
+                        continue;
+                    }
+                    let folder_empty = std::fs::read_dir(&folder)
+                        .map(|mut d| d.next().is_none())
+                        .unwrap_or(true);
+                    let indexed = match l.indexed {
+                        Some(n) => n,
+                        None => {
+                            let n = self.db.get_index(&id).map(|m| m.len()).unwrap_or(0);
+                            l.indexed = Some(n);
+                            n
+                        }
+                    };
+                    if folder_empty && indexed > 0 {
+                        // Only say it once per episode: the reason text doubles as
+                        // the "already warned" marker, and this is polled every tick.
+                        let reason = format!(
+                            "folder is back but empty; refusing to open it over an index of \
+                             {indexed} file(s) — restore the content, or remove and re-add \
+                             the share to start it fresh"
+                        );
+                        if l.reason != reason {
+                            tracing::warn!(
+                                "share {id} folder {} is back but EMPTY while its index holds \
+                                 {indexed} file(s); still holding it INERT — opening it now \
+                                 would read as \"the user deleted everything\" and every member \
+                                 would follow",
+                                folder.display()
+                            );
+                            l.reason = reason;
+                        }
+                        continue;
+                    }
+                    let key = match ShareKey::decode(&l.record.key) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            tracing::error!(
+                                "share {id} folder is back but its stored key is unreadable: {e}"
+                            );
+                            continue;
+                        }
+                    };
+                    if l.record.role_master && l.record.seed_in_keyring {
+                        // A master's stored key is seedless; restore write capability
+                        // from the keystore, as `reload_shares` does. If *that* now
+                        // fails, the share moves to the key-locked cause and is
+                        // retried there.
+                        match load_seed_bounded(&id).await {
+                            Ok(seed) => {
+                                let eid =
+                                    key.endpoint_id().unwrap_or(self.node.endpoint_id_bytes());
+                                ShareKey::from_master_seed(seed).with_endpoint_id(eid)
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "share {id} folder is back, but its master seed is unavailable \
+                                     from the keystore; holding it INERT until the key is \
+                                     available: {e:#}"
+                                );
+                                l.cause = InertCause::KeyLocked;
+                                l.reason = format!("{e:#}");
+                                continue;
+                            }
+                        }
+                    } else {
+                        key
+                    }
+                }
+                InertCause::KeyLocked => {
+                    let seed = match load_seed_bounded(&id).await {
+                        Ok(seed) => seed,
+                        Err(e) => {
+                            // Still locked. Debug, not warn: on a box whose keyring is
+                            // never unlocked this would otherwise log every 30s forever,
+                            // and the loud ERROR was already emitted once at startup.
+                            tracing::debug!("master seed for {id} still unavailable: {e:#}");
+                            continue;
+                        }
+                    };
+                    match ShareKey::decode(&l.record.key) {
+                        Ok(k) => {
+                            let eid = k.endpoint_id().unwrap_or(self.node.endpoint_id_bytes());
+                            ShareKey::from_master_seed(seed).with_endpoint_id(eid)
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "recovered seed for {id} but its stored key is unreadable: {e}"
+                            );
+                            continue;
+                        }
+                    }
                 }
             };
-
-            let locked = self.locked.remove(&id).expect("present: checked above");
-            let rec = locked.record;
-            let key = match ShareKey::decode(&rec.key) {
-                Ok(k) => {
-                    let eid = k.endpoint_id().unwrap_or(self.node.endpoint_id_bytes());
-                    ShareKey::from_master_seed(seed).with_endpoint_id(eid)
-                }
-                Err(e) => {
+            // The key is usable, but the folder may have gone away *while* we were
+            // key-locked (or vice versa). Never open over a missing root.
+            if !Path::new(&l.record.folder).is_dir() {
+                if l.cause != InertCause::FolderMissing {
                     tracing::error!(
-                        "recovered seed for {id} but its stored key is unreadable: {e}"
+                        "share {id} key is available but its folder {} is missing; holding \
+                         it INERT until the folder is back",
+                        l.record.folder
                     );
-                    continue;
+                    l.cause = InertCause::FolderMissing;
+                    l.reason = format!("folder is missing: {}", l.record.folder);
                 }
-            };
+                continue;
+            }
 
+            let inert = self.inert.remove(&id).expect("present: checked above");
+            let rec = inert.record;
             match self
                 .open_share(
                     &key,
@@ -5500,9 +5696,15 @@ impl Engine {
                 .await
             {
                 Ok((mut state, boot)) => {
-                    tracing::info!(
-                        "master seed for {id} recovered from keystore; share is syncing again"
-                    );
+                    match inert.cause {
+                        InertCause::KeyLocked => tracing::info!(
+                            "master seed for {id} recovered from keystore; share is syncing again"
+                        ),
+                        InertCause::FolderMissing => tracing::info!(
+                            "share {id} folder {} is back; share is syncing again",
+                            rec.folder
+                        ),
+                    }
                     state.last_quick_sig = rec.quick_sig;
                     let doc = state.doc.clone();
                     self.shares.insert(id.clone(), state);
@@ -5513,16 +5715,17 @@ impl Engine {
                     });
                 }
                 Err(e) => {
-                    tracing::error!("recovered seed for {id} but opening the share failed: {e:#}");
+                    tracing::error!("share {id} is unblocked but opening it failed: {e:#}");
                 }
             }
         }
         out
     }
 
-    /// Why a share is being held inert (the keystore error), if it is.
-    pub fn locked_reason(&self, share_id: &str) -> Option<&str> {
-        self.locked.get(share_id).map(|l| l.reason.as_str())
+    /// Why a share is being held inert (the keystore error, or the missing folder),
+    /// if it is.
+    pub fn inert_reason(&self, share_id: &str) -> Option<&str> {
+        self.inert.get(share_id).map(|l| l.reason.as_str())
     }
 
     /// Reveal the keys for a share. Returns the master key only when this node
@@ -5628,6 +5831,7 @@ impl Engine {
     ) -> anyhow::Result<(CreatedShare, ReconcileJob)> {
         let key = ShareKey::generate_master().with_endpoint_id(self.node.endpoint_id_bytes());
         let share_id = key.share_id_hex();
+        std::fs::create_dir_all(folder).context("create share folder")?;
         let (state, boot) = self
             .open_share(&key, folder, vec![], ignore.clone(), 0, false)
             .await?;
@@ -5674,6 +5878,50 @@ impl Engine {
         };
         if state.paused || state.publishing {
             return Ok(None);
+        }
+        // The root vanished mid-run (drive unplugged, folder moved). A pass would
+        // only fail in `scan` — a missing root is an error there, never an empty
+        // set — but don't even start one: nothing may be created or fetched into a
+        // folder that isn't there. And a root that comes back *empty* after being
+        // missing (a replaced disk, a fresh mount point) is not the user deleting
+        // every file: a full scan would tombstone each indexed path and every
+        // member would follow, so hold the share until content is back. Both are
+        // reported as `FolderMissing` by `list_summaries`; each transition is
+        // logged once (known-issues #37).
+        if !state.folder.is_dir() {
+            if state.folder_gate != FolderGate::Missing {
+                tracing::error!(
+                    "share {share_id} folder {} is missing; not syncing until it is back \
+                     — reconnect the drive or move the folder back",
+                    state.folder.display()
+                );
+                state.folder_gate = FolderGate::Missing;
+            }
+            return Ok(None);
+        }
+        if state.folder_gate != FolderGate::Open {
+            let empty = std::fs::read_dir(&state.folder)
+                .map(|mut d| d.next().is_none())
+                .unwrap_or(true);
+            if empty && !base.is_empty() {
+                if state.folder_gate != FolderGate::BackEmpty {
+                    tracing::warn!(
+                        "share {share_id} folder {} is back but EMPTY while its index holds \
+                         {} file(s); still not syncing — a pass now would read as \"the \
+                         user deleted everything\" and every member would follow. Restore \
+                         the content, or remove and re-add the share to start it fresh",
+                        state.folder.display(),
+                        base.len()
+                    );
+                    state.folder_gate = FolderGate::BackEmpty;
+                }
+                return Ok(None);
+            }
+            tracing::info!(
+                "share {share_id} folder {} is back; syncing again",
+                state.folder.display()
+            );
+            state.folder_gate = FolderGate::Open;
         }
         let is_master = matches!(state.key.role, Role::Master);
         let providers = peer_providers(&state.key, &state.roster);
@@ -6005,6 +6253,7 @@ impl Engine {
     ) -> anyhow::Result<(String, DocResync)> {
         let key = ShareKey::decode(key_str).context("decode share key")?;
         let share_id = key.share_id_hex();
+        std::fs::create_dir_all(folder).context("create share folder")?;
         let (state, boot) = self
             .open_share(&key, folder, bootstrap, vec![], 0, false)
             .await?;
@@ -6102,6 +6351,13 @@ impl Engine {
     }
 
     pub fn set_paused(&mut self, share_id: &str, paused: bool) -> anyhow::Result<()> {
+        // An inert share isn't open, but the flag is still the user's to set: it is
+        // persisted and honored when the share is eventually opened.
+        if let Some(l) = self.inert.get_mut(share_id) {
+            l.record.paused = paused;
+            self.db.set_paused(share_id, paused)?;
+            return Ok(());
+        }
         let state = self
             .shares
             .get_mut(share_id)
@@ -6157,6 +6413,11 @@ impl Engine {
                 let _ = std::fs::remove_dir_all(&state.folder);
             }
         }
+        // An inert share (locked key / missing folder) was never opened, but it is
+        // listed, and removing it must make it go away — not linger until restart.
+        // Its folder, if it even exists, is left alone: an inert share's folder is
+        // by definition one we have not verified as ours.
+        self.inert.remove(share_id);
         crate::secrets::delete_seed(share_id);
         self.db.remove_share(share_id)?;
         Ok(())

@@ -257,6 +257,7 @@ private fun StatusDot(share: ShareSummary) {
         share.status == ShareStatus.OUT_OF_SYNC -> Color(0xFFD32F2F)
         share.status == ShareStatus.NO_PEERS -> Color(0xFFD32F2F)
         share.status == ShareStatus.KEY_LOCKED -> Color(0xFFD32F2F)
+        share.status == ShareStatus.FOLDER_MISSING -> Color(0xFFD32F2F)
         share.status == ShareStatus.HEALTHY -> Color(0xFF2E7D32)
         else -> Color(0xFFF9A825) // syncing / indexing
     }
@@ -274,6 +275,7 @@ private fun statusLabel(share: ShareSummary): String = when {
         ShareStatus.OUT_OF_SYNC -> "⚠ Out of sync"
         ShareStatus.NO_PEERS -> "⚠ No members reachable"
         ShareStatus.KEY_LOCKED -> "⚠ Write key locked"
+        ShareStatus.FOLDER_MISSING -> "⚠ Folder missing"
     } + roleSuffix(share.role)
 }
 

@@ -38,6 +38,8 @@ why, and the fix or current disposition.
 | 33 | the hourly GC sweep drops every node to `Syncing 98%` permanently | **open** (pre-existing; no data impact) |
 | 34 | a removed or paused share keeps reconciling: the in-flight pass writes files, dials peers and stalls every other share | fixed (cancellable passes + hard pass timeout) |
 | 35 | a flapping share disarms the #23 self-heal ladders (episode clocks reset on every blip) | fixed (hysteretic `EpisodeClock`) |
+| 36 | a long-running endpoint stops reaching a live member; the #23/#35 ladders cannot heal it | fixed (in-process transport rebuild ladder) — pending field confirmation |
+| 37 | a share whose folder is on a removed drive kills the daemon on every start, silently (exit 0) | fixed (held inert as `FolderMissing`, never recreated, auto-resume; real exit code to the SCM) |
 
 Three vendored crates carry upstream fixes (`vendor/iroh`, `vendor/iroh-blobs`,
 `vendor/iroh-docs` — see `vendor/README.md` for the per-hunk detail and the
@@ -460,7 +462,7 @@ Fixed: a master that cannot load its write key is held **inert** — not opened,
 never reconciled, so it cannot touch the user's files (read-only is not a safe
 fallback for a master). The fault is visible via `ShareStatus::KeyLocked` ("Write
 key locked — unlock your login keyring", naming the cure) in the GUI, CLI, and
-Android, and the share stays listed. It recovers in place: `retry_locked_keys`
+Android, and the share stays listed. It recovers in place: `retry_inert_shares` (then `retry_locked_keys`)
 re-asks the keystore every `KEY_RETRY_SECS` and opens the share the moment the key
 is available, no restart. The read is now bounded (`load_seed_bounded`,
 `spawn_blocking` + 5 s timeout) like the write path. The data-loss test needs a live
@@ -1129,3 +1131,69 @@ stale) is still uncaptured — step 0 of `docs/connectivity-plan.md` (run the
 service with `iroh=debug` until the next episode) stands, and the roaming-peer
 soak from that plan is still to write. The rung-2 rebuild is the remedy, not the
 diagnosis.
+
+## 37. A share whose folder is on a removed drive kills the daemon on every start — silently
+
+**Status: FIXED (2026-09-17).** Suite: `missing_folder` (`--ignored`).
+
+**Where:** `Engine::open_share` / `Engine::reload_shares`
+(`crates/seed-core/src/engine.rs`), `run_service` (`crates/seed-daemon/src/service.rs`).
+
+Observed on the Windows dev box the day its `D:` drive was removed. The only share
+on the machine had its root at `D:\SEED_Share`. From then on every service start
+died about one second in, before a single share was listed:
+
+```text
+ERROR seed_daemon::service: daemon serve error: The system cannot find the path specified. (os error 3)
+```
+
+The GUI could not reach the pipe and showed "daemon not started"; Windows showed
+nothing at all. Three things had gone wrong at once:
+
+1. **The engine created the folder on open.** `open_share` ran
+   `std::fs::create_dir_all(folder)` before anything else, for every caller —
+   create, add, *and reload*. On a missing drive that fails (`ERROR_PATH_NOT_FOUND`).
+   On a drive that is merely unplugged, or a folder the user moved, it *succeeds* —
+   and quietly conjures an empty root. That second case is the dangerous one: the
+   reconcile pass tombstones every indexed path a full scan no longer sees on a
+   master (`(None, Some(re))` with `base == replica` → `tombstone`), so an empty root
+   under a populated index is indistinguishable from the user deleting every file,
+   and every member follows.
+2. **One share sank all of them.** `reload_shares` propagated the open error with
+   `?`, so a single bad share took down the whole daemon, including shares whose
+   folders were fine. (The keystore fault of #18 had already been given the right
+   shape — hold the share inert, keep going, retry — but only for that one cause.)
+3. **The service reported a clean stop.** `run_service` logged the error and then
+   set `Stopped` with exit code 0. The SCM recorded no failure, wrote no 7024/7034
+   event, and never fired the failure actions the service had just provisioned for
+   itself. Nothing in the event log pointed at the daemon.
+
+**Fix.** The inert-share mechanism of #18 is generalized: `InertShare` carries an
+`InertCause` (`KeyLocked` | `FolderMissing`). On reload, a share whose folder is
+not a directory is held inert with `FolderMissing` — listed, never reconciled,
+nothing created on disk — and the other shares load normally. `open_share` no
+longer creates the folder; `create_open` and `add_share_open` do it themselves,
+since there the user has just chosen the path. `make_reconcile_job` refuses to run
+against a root that has vanished mid-run (one ERROR per episode, INFO when it is
+back) and `list_summaries` reports such a share as `FolderMissing`, ranked above
+every other status including Paused. `retry_inert_shares` (formerly
+`retry_locked_keys`) re-checks every 30 s and reopens the share when the folder is
+back — **unless it is back empty while the index still holds files**, in which case
+it stays inert with a one-time WARN naming the cure (restore the content, or remove
+and re-add the share, whose fresh empty index makes an empty folder safe). The
+status is surfaced in the GTK GUI ("Folder missing — reconnect the drive to
+resume", with a toast + OS notification once per episode and a tray tooltip line),
+the CLI (`FolderMissing`) and Android. The service now reports a service-specific
+exit code when `serve` fails, so Windows logs the failure and applies the
+recovery actions.
+
+**Recovering an install already hit by this** (the pre-fix daemon): the daemon
+cannot start, so the share row has to be cleared by hand: stop the service, back
+up `state.db`, delete the share's rows from `shares`, `sync_index`, `peer_health`
+and `peer_names` (what `Db::remove_share` does), start the service, re-add the
+share to a new folder. The master seed in the keystore and the replica in
+`docs.redb` are untouched by this.
+
+**Not fixed here:** `sync_index` on that box held ~3.5 k rows for share ids no
+longer in `shares` — orphans from earlier removals that did not go through
+`Db::remove_share`. Harmless, but worth a startup sweep.

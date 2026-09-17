@@ -21,6 +21,7 @@ ALL_SUITES=(
   "seed-core:docs_spike"
   "seed-core:persistence"
   "seed-core:keystore"
+  "seed-core:missing_folder"
   "seed-core:loopback"
   "seed-core:share_removal"
   "seed-core:live_folder"

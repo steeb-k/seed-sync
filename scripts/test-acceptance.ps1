@@ -21,6 +21,7 @@ $AllSuites = @(
     @{ Crate = "seed-core";   Test = "docs_spike" },
     @{ Crate = "seed-core";   Test = "persistence" },
     @{ Crate = "seed-core";   Test = "keystore" },
+    @{ Crate = "seed-core";   Test = "missing_folder" },
     @{ Crate = "seed-core";   Test = "loopback" },
     @{ Crate = "seed-core";   Test = "share_removal" },
     @{ Crate = "seed-core";   Test = "live_folder" },

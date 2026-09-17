@@ -219,7 +219,7 @@ async fn unlocking_the_keystore_restores_the_master_in_place() -> anyhow::Result
     // The user logs in and the keyring unlocks — the seed becomes readable again.
     seed_core::secrets::store_seed(&share_id, &seed)?;
 
-    let recovered = engine.retry_locked_keys().await;
+    let recovered = engine.retry_inert_shares().await;
     assert_eq!(
         recovered.len(),
         1,

@@ -624,7 +624,7 @@ async fn presence_loop(daemon: Daemon) {
             // unlocking the keyring resumes the share on its own — the alternative is
             // that the user must restart the daemon, which nothing about the symptom
             // would ever suggest. Internally throttled; a no-op when nothing is locked.
-            let recovered = { daemon.engine.lock().await.retry_locked_keys().await };
+            let recovered = { daemon.engine.lock().await.retry_inert_shares().await };
             for resync in recovered {
                 tokio::spawn(async move {
                     let _ = tokio::time::timeout(Duration::from_secs(30), resync.run()).await;

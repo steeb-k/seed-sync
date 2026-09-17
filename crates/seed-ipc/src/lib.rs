@@ -244,6 +244,18 @@ pub enum ShareStatus {
     /// writes in their own share while every screen reports Healthy. Holding it inert
     /// is the only degradation that cannot lose data.
     KeyLocked,
+    /// The share's local folder does not exist — its drive was removed or unplugged,
+    /// or the folder was moved or deleted. The share is held **inert** (listed, never
+    /// reconciled, nothing created on disk) and re-checked automatically, so plugging
+    /// the drive back in resumes it without a restart.
+    ///
+    /// The engine deliberately does **not** recreate the folder. Before this status
+    /// existed it did, and that was wrong twice over: on a missing drive the create
+    /// failed and took the whole daemon down with it (every start, with exit code 0,
+    /// known-issues #37); on a merely-unplugged one it succeeded, and an empty root
+    /// under a master with a populated index is precisely what "the user deleted
+    /// every file" looks like to the reconcile pass.
+    FolderMissing,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

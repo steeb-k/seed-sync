@@ -54,6 +54,7 @@ tier 0.
 | `share_removal` | a removed or paused share must stop the reconcile pass already running for it, and a cancelled pass must commit nothing (known-issues #34) |
 | `transport_rebuild` | the in-process iroh endpoint rebuild the transport-repair ladder fires: same endpoint id, shares reopened, sync resumes both ways, a pre-rebuild pass is fenced off (known-issues #36) |
 | `persistence` / `keystore` | state survives restart; locked-keystore behaviour |
+| `missing_folder` | a share whose folder is gone (drive removed) holds inert as `FolderMissing`, never recreates the folder, keeps the other shares running, resumes when the folder is back — and stays inert if it is back *empty* (known-issues #37) |
 | `seed-daemon/loopback_ipc`, `health_ipc` | the same through the real IPC surface the GUI uses |
 
 ## How to write a test that would have caught a real bug

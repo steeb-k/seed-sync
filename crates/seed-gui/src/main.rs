@@ -629,6 +629,7 @@ fn build_ui(
     let paused_state = Arc::new(AtomicBool::new(false));
     let tray_speeds = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
     let tray_stranded = Arc::new(AtomicUsize::new(0));
+    let tray_missing = Arc::new(AtomicUsize::new(0));
     let (tray_refresh_tx, tray_refresh_rx) = async_channel::unbounded::<()>();
     let (tray_pause_tx, tray_pause_rx) = async_channel::unbounded::<()>();
 
@@ -953,6 +954,7 @@ fn build_ui(
         let keys_nav = keys_nav.clone();
         let tray_speeds = tray_speeds.clone();
         let tray_stranded = tray_stranded.clone();
+        let tray_missing = tray_missing.clone();
         let rows: Rc<RefCell<HashMap<String, RowWidgets>>> = Rc::new(RefCell::new(HashMap::new()));
         glib::spawn_future_local(async move {
             // Which status page (if any) the main area should show. Recomputed on
@@ -961,6 +963,11 @@ fn build_ui(
             // persists across ticks so a DaemonDown keeps the last-known value.
             let mut daemon_up;
             let mut all_paused = false;
+            // Shares already alerted as `FolderMissing`, so each episode notifies
+            // once (on the transition), not on every summaries tick; cleared when
+            // the folder is back so the recovery is announced too.
+            let mut missing_alerted: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             // Last throughput pushed to the tray, so an idle stream of identical
             // samples doesn't re-render the tray every second.
             let mut last_tray_speeds = (u64::MAX, u64::MAX);
@@ -997,6 +1004,53 @@ fn build_ui(
                             .filter(|s| s.status == ShareStatus::NoPeers)
                             .count();
                         if tray_stranded.swap(stranded, Ordering::Relaxed) != stranded {
+                            let _ = tray_refresh_tx.send(()).await;
+                        }
+                        // Shares whose folder is gone (drive removed, folder moved):
+                        // alert once per episode with a toast + OS notification —
+                        // the window is usually closed — mirror the count in the
+                        // tray tooltip, and announce the recovery (known-issues #37).
+                        let now_missing: std::collections::HashSet<String> = shares
+                            .iter()
+                            .filter(|s| s.status == ShareStatus::FolderMissing)
+                            .map(|s| s.share_id.clone())
+                            .collect();
+                        for s in shares.iter().filter(|s| now_missing.contains(&s.share_id)) {
+                            if missing_alerted.insert(s.share_id.clone()) {
+                                let summary = format!("Share folder missing: {}", s.name);
+                                let body = format!(
+                                    "'{}' is not syncing: its folder {} is not available \
+                                     (drive removed or folder moved). It resumes on its own \
+                                     once the folder is back with its files.",
+                                    s.name, s.folder
+                                );
+                                let toast = adw::Toast::new(&body);
+                                toast.set_timeout(10);
+                                toast_overlay.add_toast(toast);
+                                notify::os_notify(&summary, &body);
+                            }
+                        }
+                        let back: Vec<String> = missing_alerted
+                            .iter()
+                            .filter(|id| !now_missing.contains(*id))
+                            .cloned()
+                            .collect();
+                        for id in back {
+                            missing_alerted.remove(&id);
+                            // A removed share just drops out; only one that is still
+                            // listed has "come back".
+                            if let Some(s) = shares.iter().find(|s| s.share_id == id) {
+                                let summary = format!("Share folder is back: {}", s.name);
+                                let body = format!(
+                                    "'{}' found its folder again; syncing resumed.",
+                                    s.name
+                                );
+                                toast_overlay.add_toast(adw::Toast::new(&body));
+                                notify::os_notify(&summary, &body);
+                            }
+                        }
+                        let missing = now_missing.len();
+                        if tray_missing.swap(missing, Ordering::Relaxed) != missing {
                             let _ = tray_refresh_tx.send(()).await;
                         }
                         if let Some(lbl) = pause_all_btn.child().and_downcast::<gtk::Label>() {
@@ -1182,6 +1236,7 @@ fn build_ui(
             refresh_rx: tray_refresh_rx,
             speeds: tray_speeds.clone(),
             stranded: tray_stranded.clone(),
+            missing: tray_missing.clone(),
         },
     );
 
@@ -1366,6 +1421,8 @@ fn status_text(s: &ShareSummary) -> String {
         // Name the cure, not just the fault: nothing about "my share stopped syncing"
         // would lead a user to think about their login keyring.
         ShareStatus::KeyLocked => "⚠ Write key locked — unlock your login keyring".into(),
+        // Likewise: say what's wrong AND that it heals itself once the disk is back.
+        ShareStatus::FolderMissing => "⚠ Folder missing — reconnect the drive to resume".into(),
     }
 }
 

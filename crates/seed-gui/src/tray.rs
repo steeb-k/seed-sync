@@ -33,21 +33,36 @@ pub struct TrayWiring {
     /// only visible once you open the window is a partition nobody notices, which is
     /// how known-issues #16 went unseen for a week.
     pub stranded: Arc<AtomicUsize>,
+    /// How many shares have no local folder right now
+    /// ([`seed_ipc::ShareStatus::FolderMissing`]): a removed drive, a moved folder.
+    /// Same reasoning as `stranded` — a share that silently stopped syncing because
+    /// its disk went away has to be visible from the tray (known-issues #37).
+    pub missing: Arc<AtomicUsize>,
 }
 
 /// The tray tooltip: the live down/up rate line (mirroring the window's bottom
 /// status bar, e.g. "↓ 1.2 Mbps   ↑ 0.3 Mbps"), plus a warning line whenever some
-/// share can reach nobody.
-fn tooltip(speeds: &(AtomicU64, AtomicU64), stranded: &AtomicUsize) -> String {
+/// share can reach nobody, and another whenever some share's folder is missing.
+fn tooltip(
+    speeds: &(AtomicU64, AtomicU64),
+    stranded: &AtomicUsize,
+    missing: &AtomicUsize,
+) -> String {
     use std::sync::atomic::Ordering;
     let down = speeds.0.load(Ordering::Relaxed);
     let up = speeds.1.load(Ordering::Relaxed);
-    let rate = format!("↓ {}   ↑ {}", crate::fmt_speed(down), crate::fmt_speed(up));
+    let mut out = format!("↓ {}   ↑ {}", crate::fmt_speed(down), crate::fmt_speed(up));
     match stranded.load(Ordering::Relaxed) {
-        0 => rate,
-        1 => format!("{rate}\n⚠ 1 share has no members reachable"),
-        n => format!("{rate}\n⚠ {n} shares have no members reachable"),
+        0 => {}
+        1 => out.push_str("\n⚠ 1 share has no members reachable"),
+        n => out.push_str(&format!("\n⚠ {n} shares have no members reachable")),
     }
+    match missing.load(Ordering::Relaxed) {
+        0 => {}
+        1 => out.push_str("\n⚠ 1 share's folder is missing"),
+        n => out.push_str(&format!("\n⚠ {n} shares' folders are missing")),
+    }
+    out
 }
 
 #[cfg(any(windows, target_os = "macos"))]
@@ -66,6 +81,7 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow, wiring: 
         refresh_rx: _refresh_rx,
         speeds,
         stranded,
+        missing,
     } = wiring;
 
     // Opt the process into dark mode so native popups (the tray's context menu,
@@ -127,7 +143,7 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow, wiring: 
     let app = app.clone();
     let window = window.clone();
     let mut last_paused = paused.load(Ordering::Relaxed);
-    let mut last_speeds = (u64::MAX, u64::MAX, usize::MAX);
+    let mut last_speeds = (u64::MAX, u64::MAX, usize::MAX, usize::MAX);
     // Track the panel background theme so the glyph variant can be re-picked when
     // the user switches light/dark (taskbar on Windows, system appearance on
     // macOS) while the app is running.
@@ -156,9 +172,13 @@ pub fn install(app: &adw::Application, window: &adw::ApplicationWindow, wiring: 
             speeds.0.load(Ordering::Relaxed),
             speeds.1.load(Ordering::Relaxed),
             stranded.load(Ordering::Relaxed),
+            missing.load(Ordering::Relaxed),
         );
         if now_speeds != last_speeds {
-            let _ = icon.set_tooltip(Some(format!("S.E.E.D.\n{}", tooltip(&speeds, &stranded))));
+            let _ = icon.set_tooltip(Some(format!(
+                "S.E.E.D.\n{}",
+                tooltip(&speeds, &stranded, &missing)
+            )));
             last_speeds = now_speeds;
         }
         let mut open_window = false;
@@ -363,6 +383,8 @@ mod linux {
         speeds: std::sync::Arc<(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64)>,
         /// Shares that can reach no member at all; warned about in the tooltip.
         stranded: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Shares whose local folder is missing; warned about in the tooltip.
+        missing: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl ksni::Tray for SeedTray {
@@ -384,7 +406,7 @@ mod linux {
         fn tool_tip(&self) -> ksni::ToolTip {
             ksni::ToolTip {
                 title: "S.E.E.D.".into(),
-                description: super::tooltip(&self.speeds, &self.stranded),
+                description: super::tooltip(&self.speeds, &self.stranded, &self.missing),
                 icon_name: String::new(),
                 icon_pixmap: Vec::new(),
             }
@@ -489,6 +511,7 @@ mod linux {
             refresh_rx,
             speeds,
             stranded,
+            missing,
         } = wiring;
         let icons = load_icons();
         if icons.is_empty() {
@@ -522,6 +545,7 @@ mod linux {
             pause_tx,
             speeds,
             stranded,
+            missing,
         };
         let spawn = std::thread::Builder::new()
             .name("seed-tray".into())

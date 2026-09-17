@@ -33,6 +33,10 @@ use windows_service::{
 const SERVICE_NAME: &str = "SeedSyncDaemon";
 const SERVICE_DISPLAY: &str = "SEED Sync";
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+/// Service-specific exit code reported to the SCM when [`crate::serve`] returns an
+/// error (the daemon could not start or died), so Windows logs it as a failure and
+/// applies the recovery actions instead of recording a clean stop.
+const SERVE_FAILED_EXIT_CODE: u32 = 1;
 
 /// SCM entry point (invoked when started by `seed-daemon service`).
 pub fn run_as_service() -> WsResult<()> {
@@ -92,14 +96,18 @@ fn run_service() -> WsResult<()> {
         })
         .await
     });
+    // Tell the SCM the truth about how we stopped. This used to report exit code 0
+    // even when `serve` failed, so a daemon that died on every start (known-issues
+    // #37: a share root on a removed drive) looked to Windows like a clean stop —
+    // no 7024/7034 event, no failure actions, nothing in the event log for the
+    // user to find. A service-specific code makes it a recorded failure that the
+    // recovery ladder (`provision_failure_actions`) restarts.
+    let mut stopped = set_state(ServiceState::Stopped, ServiceControlAccept::empty());
     if let Err(e) = result {
-        tracing::error!("daemon serve error: {e}");
+        tracing::error!("daemon serve error: {e:#}");
+        stopped.exit_code = ServiceExitCode::ServiceSpecific(SERVE_FAILED_EXIT_CODE);
     }
-
-    status_handle.set_service_status(set_state(
-        ServiceState::Stopped,
-        ServiceControlAccept::empty(),
-    ))?;
+    status_handle.set_service_status(stopped)?;
     Ok(())
 }
 
