@@ -1,0 +1,559 @@
+# Every platform's release artifact, built once and reused.
+#
+# Called by `release.yml` (a tag, or a rehearsal by hand). Each job produces
+# exactly the assets the in-product updaters and the distro repos look for on
+# `releases/latest` — see docs/ci-release.md §3 for the contract — and
+# uploads them as a workflow artifact only; nothing here publishes. The
+# platforms run in parallel: a release needs all of them regardless of order,
+# so the wall clock is the slowest job (Windows), not the sum.
+#
+# Actions are pinned by commit SHA, as in ci.yml: a tag can be moved.
+name: build
+
+on:
+  workflow_call:
+    inputs:
+      sign:
+        description: 'Sign the Windows MSIs (Azure Trusted Signing) and the Android APK (release keystore). Off for a build that only needs to prove the pipeline. macOS is always ad-hoc-signed regardless of this input (docs/ci-release.md §5) — there is no Apple Developer account.'
+        required: false
+        default: true
+        type: boolean
+      platforms:
+        description: 'Which platforms to build: all, or a space-separated subset of linux arch windows macos android.'
+        required: false
+        default: all
+        type: string
+      ref:
+        description: 'The commit to build. Defaults to the caller''s ref; a rebuild of an existing tag from a fixed workflow on main names the tag here.'
+        required: false
+        default: ''
+        type: string
+
+# `azure/login` asks GitHub for an OIDC token; that is what replaces a stored
+# client secret for Windows signing.
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    if: inputs.platforms == 'all' || contains(format(' {0} ', inputs.platforms), ' linux ')
+    name: Linux tarball, .deb, .rpm and Flatpak
+    # Deliberately the OLDEST image that can build the GUI (GTK 4.14 satisfies
+    # the gtk4 crate's v4_10 feature; 22.04's GTK 4.6 cannot). The tarball
+    # binds the target's glibc to this image's (2.39), so moving it forward
+    # raises the floor for every installed machine.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Install GTK4, libadwaita, D-Bus headers, ImageMagick and Flatpak
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev libdbus-1-dev build-essential pkg-config \
+            imagemagick flatpak flatpak-builder desktop-file-utils appstream
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: linux-release
+
+      - name: Build and package the tarball
+        run: bash scripts/package-linux.sh
+
+      - name: Install nfpm
+        # A pinned release checked against the sha256 from its checksums.txt,
+        # rather than a third-party action.
+        env:
+          NFPM_VERSION: 2.47.0
+          NFPM_SHA256: 0660ca602b2d2d2ae4781a06c692b3eeb9d437ffea05b831d76e41f4a3188783
+        run: |
+          curl -fsSLo /tmp/nfpm.tar.gz "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz"
+          echo "${NFPM_SHA256}  /tmp/nfpm.tar.gz" | sha256sum -c -
+          sudo tar -xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
+          nfpm --version | tail -n 4
+
+      - name: Build the .deb and .rpm
+        run: bash scripts/package-linux-native.sh
+
+      - name: Build the Flatpak bundle
+        run: bash scripts/package-flatpak.sh
+
+      - name: Check the asset names
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          for f in \
+            "seed-sync-$version-linux-x86_64.tar.gz" \
+            "seed-sync_$version-1_amd64.deb" \
+            "seed-sync-$version-1.x86_64.rpm" \
+            "io.github.steeb_k.SeedSync-$version-x86_64.flatpak"; do
+            test -f "dist/$f" || { echo "::error::no dist/$f"; ls -la dist; exit 1; }
+          done
+
+      - name: Smoke-test the .deb
+        # This app is a per-user daemon (systemd --user), so — unlike a system
+        # service package — the package does NOT start or enable anything; it
+        # only stages the unit and prints how to enable it (docs/ci-release.md
+        # §6). So the smoke test proves the layout and the refusal, not that
+        # the daemon is running.
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          sudo apt-get install -y "./dist/seed-sync_$version-1_amd64.deb"
+          for bin in seed-daemon seed-gui seed-cli seed-sync; do
+            command -v "$bin" >/dev/null || { echo "::error::$bin not on PATH"; exit 1; }
+          done
+          [ "$(seed-daemon --version)" = "seed-daemon $version" ]
+          test -f /usr/lib/systemd/user/seed-daemon.service
+          grep -qx 'ExecStart=/usr/bin/seed-daemon run' /usr/lib/systemd/user/seed-daemon.service
+          desktop-file-validate /usr/share/applications/io.github.steeb_k.SeedSync.desktop
+          appstreamcli validate --no-net /usr/share/metainfo/io.github.steeb_k.SeedSync.metainfo.xml
+          if seed-sync --update; then echo "::error::seed-sync managed a package install"; exit 1; fi
+          # The package configures the apps.kznjk.com repository (conffiles).
+          grep -qx 'URIs: https://apps.kznjk.com/deb' /etc/apt/sources.list.d/kznjk.sources
+          test -s /etc/apt/keyrings/kznjk-packages.asc
+          sudo apt-get remove -y seed-sync
+          test ! -e /usr/bin/seed-daemon
+
+      - name: Smoke-test the .rpm on Fedora
+        # No systemd --user session in the container: this proves the
+        # dependencies resolve on a current Fedora and every scriptlet
+        # tolerates a host without a login session, not that the daemon runs.
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          docker run --rm -e V="$version" -v "$PWD/dist:/dist:ro" registry.fedoraproject.org/fedora:latest bash -euxc '
+            dnf install -y "/dist/seed-sync-$V-1.x86_64.rpm"
+            rpm -V seed-sync
+            [ "$(seed-daemon --version)" = "seed-daemon $V" ]
+            ldd /usr/bin/seed-daemon /usr/bin/seed-gui /usr/bin/seed-cli | { ! grep "not found"; }
+            if seed-sync --update; then exit 1; fi
+            test -s /etc/yum.repos.d/kznjk.repo
+            # rpm -e, not dnf remove: dnf would first refresh the repo just added.
+            rpm -e seed-sync
+            test ! -e /usr/bin/seed-daemon
+            test ! -e /etc/yum.repos.d/kznjk.repo'
+
+      - name: Smoke-test the Flatpak bundle
+        # A throwaway --user installation — the runner's profile does not
+        # survive past this job anyway. If the manifest's runtime is not
+        # already cached from the flatpak-builder step above, this step
+        # fetches it from Flathub.
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          flatpak --user remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak --user install -y --bundle "dist/io.github.steeb_k.SeedSync-$version-x86_64.flatpak"
+          flatpak run io.github.steeb_k.SeedSync --version | grep -q "$version"
+          flatpak --user uninstall -y io.github.steeb_k.SeedSync
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux
+          path: |
+            dist/seed-sync-*-linux-x86_64.tar.gz
+            dist/seed-sync_*_amd64.deb
+            dist/seed-sync-*.x86_64.rpm
+            dist/io.github.steeb_k.SeedSync-*-x86_64.flatpak
+          if-no-files-found: error
+
+  arch:
+    if: inputs.platforms == 'all' || contains(format(' {0} ', inputs.platforms), ' arch ')
+    name: Arch PKGBUILD and package
+    # Proves the PKGBUILD the maintainer publishes to the AUR
+    # (scripts/aur-prepare.sh) still builds, installs and removes cleanly
+    # against the tagged tree, and uploads the resulting package:
+    # release.yml attaches it, and apps.kznjk.com's [kznjk] pacman repo signs
+    # and serves it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Source archive shaped like GitHub's tag archive
+        # GitHub's tag archive extracts to the SOURCE repo's name
+        # (seed-sync-gtk-<version>/), not the package name (seed-sync) — see
+        # the _srcname comment in packaging/arch/PKGBUILD.
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          mkdir -p dist/arch
+          git archive --prefix="seed-sync-gtk-$version/" -o "dist/arch/seed-sync-gtk-$version.tar.gz" HEAD
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: makepkg, install and remove in archlinux
+        run: |
+          mkdir -p dist/arch-out
+          docker run --rm -v "$PWD:/src:ro" -v "$PWD/dist/arch-out:/out" archlinux:latest \
+            bash /src/scripts/ci/arch-pkgbuild.sh "/src/dist/arch/seed-sync-gtk-$VERSION.tar.gz"
+          test -f "dist/arch-out/seed-sync-$VERSION-1-x86_64.pkg.tar.zst"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: arch
+          path: dist/arch-out/seed-sync-*-1-x86_64.pkg.tar.zst
+          if-no-files-found: error
+
+  windows:
+    if: inputs.platforms == 'all' || contains(format(' {0} ', inputs.platforms), ' windows ')
+    name: Windows installers (x86_64 + arm64)
+    runs-on: windows-2025
+    timeout-minutes: 120
+    # Not a gate, a subject: the Azure federated credential trusts
+    # repo:steeb-k/seed-sync-gtk:environment:release, and a subject cannot
+    # carry a wildcard while tag names vary. Adding a required reviewer to
+    # the environment is what would make a release wait for approval.
+    environment: release
+    env:
+      SIGN_WINDOWS: ${{ inputs.sign && secrets.AZURE_CLIENT_ID != '' }}
+      # gvsbuild publishes prebuilt GTK4 for x64; building GTK from source on
+      # a runner takes an hour. Pinned by version AND digest — bump both
+      # together. Version matches docs/windows-packaging.md §0.
+      GVSBUILD_VERSION: 2026.4.1
+      GVSBUILD_SHA256: a6c3e4b222a5a699f2f33140635033124d70f5ca21f9e9fc845d76e5337530ab
+      # llvm-mingw supplies aarch64-w64-mingw32-{clang,windres} for the ARM64
+      # GUI (mingw ABI, to match MSYS2's GTK); see scripts/build-arm64.ps1.
+      LLVM_MINGW_VERSION: '20260908'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Refuse to ship unsigned
+        if: inputs.sign && env.SIGN_WINDOWS != 'true'
+        shell: bash
+        run: |
+          echo "::error::AZURE_CLIENT_ID is not set; a release MSI must be signed (SmartScreen, and the updater refuses unsigned MSIs). Rehearse with sign=false instead."
+          exit 1
+
+      - name: Install the WiX toolset
+        shell: pwsh
+        run: dotnet tool install --global wix --version 5.*
+
+      - name: GTK for x86_64 (gvsbuild release zip -> C:\gtk)
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "gtk4-gvsbuild.zip"
+          Invoke-WebRequest -Uri "https://github.com/wingtk/gvsbuild/releases/download/$env:GVSBUILD_VERSION/GTK4_Gvsbuild_${env:GVSBUILD_VERSION}_x64.zip" -OutFile $zip
+          $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          if ($hash -ne $env:GVSBUILD_SHA256) { throw "gvsbuild zip digest $hash != pinned $env:GVSBUILD_SHA256" }
+          Expand-Archive -Path $zip -DestinationPath "C:\gtk" -Force
+          if (-not (Test-Path "C:\gtk\lib\pkgconfig\gtk4.pc")) { throw "C:\gtk has no lib\pkgconfig\gtk4.pc" }
+          # pkgconf relocates the prefix in these .pc files to C:\gtk on its
+          # own; prove it before spending the build finding out.
+          $env:PATH = "C:\gtk\bin;$env:PATH"
+          $env:PKG_CONFIG_PATH = "C:\gtk\lib\pkgconfig"
+          $v = & pkgconf --modversion gtk4
+          if ($LASTEXITCODE -ne 0) { throw "pkgconf cannot resolve gtk4" }
+          Write-Host "gtk4 $v, libadwaita $(& pkgconf --modversion libadwaita-1)"
+
+      - name: GTK for arm64 (MSYS2 CLANGARM64 + the x86_64 host-tools mirror)
+        shell: pwsh
+        # Both roots — the mirror is not optional (gdk-pixbuf-query-loaders
+        # dlopens each loader, so it can only ever query loaders of its own
+        # architecture; see docs/windows-packaging.md §1b).
+        run: |
+          pwsh -File scripts\fetch-gtk-msys2.ps1
+          pwsh -File scripts\fetch-gtk-msys2.ps1 -Env ucrt64 -Root C:\gtk-msys2-x64
+
+      - name: llvm-mingw and the ARM64 Rust targets
+        shell: pwsh
+        run: |
+          $zip = Join-Path $env:RUNNER_TEMP "llvm-mingw.zip"
+          Invoke-WebRequest -Uri "https://github.com/mstorsjo/llvm-mingw/releases/download/$env:LLVM_MINGW_VERSION/llvm-mingw-$env:LLVM_MINGW_VERSION-ucrt-x86_64.zip" -OutFile $zip
+          # build-arm64.ps1 globs C:\llvm-mingw-*; the zip's top-level folder has that name.
+          Expand-Archive -Path $zip -DestinationPath "C:\" -Force
+          if (-not (Get-ChildItem "C:\" -Directory -Filter "llvm-mingw-*")) { throw "llvm-mingw did not land at C:\llvm-mingw-*" }
+          if (-not (Test-Path "C:\Program Files\LLVM\bin\clang.exe")) { throw "no LLVM clang at C:\Program Files\LLVM (ring needs it for aarch64)" }
+          rustup target add aarch64-pc-windows-msvc aarch64-pc-windows-gnullvm
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: windows-release
+          cache-on-failure: true
+
+      - name: Build x86_64 (MSVC, against gvsbuild)
+        shell: pwsh
+        env:
+          PKG_CONFIG_PATH: C:\gtk\lib\pkgconfig
+        run: |
+          $env:PATH = "C:\gtk\bin;$env:PATH"
+          $env:LIB = "C:\gtk\lib;$env:LIB"
+          cargo build --release -p seed-gui -p seed-daemon -p seed-cli
+          if ($LASTEXITCODE -ne 0) { throw "x86_64 build failed" }
+
+      - name: "Build arm64 (cross: daemon + CLI on MSVC, GUI on gnullvm)"
+        shell: pwsh
+        # Both architectures are built BEFORE signing in below. The OIDC
+        # token behind azure/login lives ~5 minutes and a service principal
+        # has no refresh token, and these two builds together run far longer
+        # than that — so the login (and the probe) come after, not before,
+        # unlike a job that logs in early to fail fast.
+        run: |
+          pwsh -File scripts\build-arm64.ps1
+          if ($LASTEXITCODE -ne 0) { throw "arm64 build failed" }
+
+      - name: Sign in to Azure
+        if: env.SIGN_WINDOWS == 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Install the Trusted Signing client
+        if: env.SIGN_WINDOWS == 'true'
+        shell: pwsh
+        # The signing library comes from the NuGet package, not the
+        # PowerShell module of the same name (which carries no dlib). A
+        # .nupkg is a zip.
+        run: |
+          $url = "https://www.nuget.org/api/v2/package/Microsoft.Trusted.Signing.Client"
+          $zip = Join-Path $env:RUNNER_TEMP "trusted-signing-client.zip"
+          $out = Join-Path $env:RUNNER_TEMP "trusted-signing-client"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath $out -Force
+          $dlib = Get-ChildItem -Path $out -Recurse -Filter 'Azure.CodeSigning.Dlib.dll' |
+            Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1
+          if (-not $dlib) { $dlib = Get-ChildItem -Path $out -Recurse -Filter 'Azure.CodeSigning.Dlib.dll' | Select-Object -First 1 }
+          if (-not $dlib) { throw "no Azure.CodeSigning.Dlib.dll in the NuGet package" }
+          "ARTIFACT_SIGNING_DLIB=$($dlib.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "ARTIFACT_SIGNING_METADATA=$(Join-Path $PWD 'scripts\artifact-signing-metadata.ci.json')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Prove the signing chain works
+        if: env.SIGN_WINDOWS == 'true'
+        shell: pwsh
+        run: |
+          pwsh -File scripts\ci\windows-signing-probe.ps1
+          if ($LASTEXITCODE -ne 0) { throw "signing probe failed" }
+
+      - name: Sign in to Azure again
+        # GitHub's OIDC assertion lives five minutes and the access token
+        # about an hour; a fresh session right before signing is what keeps
+        # signtool from hitting a dead assertion after the two long builds
+        # (and the probe) above.
+        if: env.SIGN_WINDOWS == 'true'
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Sign, bundle and build both installers
+        shell: pwsh
+        # -SkipBuild: the binaries exist already; build-msi.ps1 signs the
+        # exes, bundles GTK, generates the license, runs wix and signs the
+        # MSI. Both arches, or neither — the updater will not fall back
+        # across them.
+        run: |
+          pwsh -File scripts\build-msi.ps1 -Arch x86_64 -SkipBuild
+          if ($LASTEXITCODE -ne 0) { throw "x86_64 MSI failed" }
+          pwsh -File scripts\build-msi.ps1 -Arch arm64 -SkipBuild
+          if ($LASTEXITCODE -ne 0) { throw "arm64 MSI failed" }
+
+      - name: Verify the bundles and the signatures
+        shell: pwsh
+        run: |
+          pwsh -File scripts\verify-bundle.ps1 -Dist dist\SeedSync -Arch x86_64
+          if ($LASTEXITCODE -ne 0) { throw "x86_64 bundle verification failed" }
+          pwsh -File scripts\verify-bundle.ps1 -Dist dist\SeedSync-arm64 -Arch arm64
+          if ($LASTEXITCODE -ne 0) { throw "arm64 bundle verification failed" }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          foreach ($arch in "x86_64", "arm64") {
+            $msi = "target\wix\seed-sync-$version-windows-$arch.msi"
+            if (-not (Test-Path $msi)) { throw "missing $msi" }
+            $sig = Get-AuthenticodeSignature $msi
+            Write-Host "$msi -> $($sig.Status) $($sig.SignerCertificate.Subject)"
+            if ($env:SIGN_WINDOWS -eq 'true' -and $sig.Status -ne 'Valid') { throw "$msi is not validly signed ($($sig.Status))" }
+          }
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows
+          path: target/wix/seed-sync-*-windows-*.msi
+          if-no-files-found: error
+
+  macos:
+    if: inputs.platforms == 'all' || contains(format(' {0} ', inputs.platforms), ' macos ')
+    name: macOS universal bundle
+    # Apple Silicon. The x86_64 slice is cross-built here against the osx-64
+    # conda env, exactly as scripts/package-macos.sh does on the maintainer's
+    # Mac, so one job yields the universal tarball both updaters accept.
+    #
+    # No codesign identity, no notarization: there is no Apple Developer
+    # account, and there is none planned — ad-hoc signing plus the
+    # `curl | sh` quarantine dodge (docs/macos-packaging.md) is the whole
+    # story, so `sign` has no effect on this job.
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Intel target
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Restore the conda-forge GTK environments
+        id: conda-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .conda-gtk
+          key: conda-gtk-universal-${{ hashFiles('scripts/setup-conda-macos.sh') }}
+
+      - name: Install micromamba
+        run: |
+          mkdir -p "$RUNNER_TEMP/mm/bin"
+          curl -Ls https://micro.mamba.pm/api/micromamba/osx-arm64/latest | tar -xvjO bin/micromamba > "$RUNNER_TEMP/mm/bin/micromamba"
+          chmod +x "$RUNNER_TEMP/mm/bin/micromamba"
+          echo "$RUNNER_TEMP/mm/bin" >> "$GITHUB_PATH"
+          echo "MAMBA_ROOT_PREFIX=$RUNNER_TEMP/mm/root" >> "$GITHUB_ENV"
+
+      - name: Build the conda-forge GTK environments (arm64 + x86)
+        if: steps.conda-cache.outputs.cache-hit != 'true'
+        run: bash scripts/setup-conda-macos.sh --universal
+
+      - name: Save the conda environments
+        # Saved the moment they exist rather than in a post step, which is
+        # skipped when the job fails — and the first attempts at any macOS
+        # job fail after the environment is built.
+        if: steps.conda-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .conda-gtk
+          key: ${{ steps.conda-cache.outputs.cache-primary-key }}
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: macos-release
+          cache-on-failure: true
+
+      - name: Build, bundle and package
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: 'false'
+        run: bash scripts/package-macos.sh
+
+      - name: Check the asset, the slices, the floor and the signature
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          tarball="dist/seed-sync-$version-macos-universal.tar.gz"
+          test -f "$tarball" || { echo "::error::no $tarball — the x86 conda env or the x86_64 target was missing, so the build was arm64-only"; ls -la dist; exit 1; }
+          app="dist/seed-sync-$version-macos-universal/SEED Sync.app"
+          lipo -archs "$app/Contents/MacOS/seed-gui" | grep -q x86_64 || { echo "::error::seed-gui is not universal"; exit 1; }
+          # conda-forge's dylibs carry minos 11.0 on the arm64 slice; a higher
+          # number means something Homebrew-built crept in (see
+          # docs/macos-packaging.md).
+          if ! otool -l "$app"/Contents/lib/libgtk-4.*.dylib | grep -A3 LC_BUILD_VERSION | grep -q "minos 11.0"; then
+            echo "::error::bundled GTK does not report minos 11.0 (arm64 slice)"; exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "$app"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: macos
+          path: dist/seed-sync-*-macos-universal.tar.gz
+          if-no-files-found: error
+
+  android:
+    if: inputs.platforms == 'all' || contains(format(' {0} ', inputs.platforms), ' android ')
+    name: Android universal APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # r27d, the image's default. Local builds pin r27c
+      # (docs/android-packaging.md), but Google has withdrawn r27c from the
+      # sdkmanager repository, so it cannot be installed on a runner; r27d is
+      # the same LTS line and the image already has it.
+      NDK_VERSION: 27.3.13750724
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Host build deps
+        # Gradle also builds seed-mobile for the HOST so uniffi-bindgen can
+        # read it; on Linux that pulls keyring -> libdbus-sys, which needs
+        # the D-Bus headers exactly as ci.yml does.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libdbus-1-dev pkg-config
+
+      - name: Android targets and cargo-ndk
+        run: |
+          rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+          cargo install --locked cargo-ndk
+
+      - name: Pin the NDK
+        run: |
+          if [ ! -d "$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" ]; then
+            yes 2>/dev/null | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "ndk;$NDK_VERSION" > /dev/null
+          fi
+          test -d "$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" || { echo "::error::NDK $NDK_VERSION is not installed and sdkmanager could not fetch it"; exit 1; }
+          echo "ANDROID_NDK_HOME=$ANDROID_SDK_ROOT/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: android-release
+
+      - name: Write the release keystore
+        # The key that decides whether this APK can upgrade an installed
+        # one. Every release must be signed with the SAME keystore (a
+        # rotated key blocks in-place updates for every user, Obtainium
+        # included), so a signed build with the keystore missing is a hard
+        # failure, not a warning. An unsigned rehearsal (`sign: false`)
+        # still builds. Keys read from android/app/build.gradle.kts's
+        # keystoreProps: storeFile / storePassword / keyAlias / keyPassword.
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          SIGN: ${{ inputs.sign }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            if [ "$SIGN" = "true" ]; then
+              echo "::error::ANDROID_KEYSTORE_BASE64 is not set; a release APK must be signed with the release keystore"
+              exit 1
+            fi
+            echo "::warning::No release keystore; this APK is unsigned and cannot be installed over a release."
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > android/seedsync-release.jks
+          {
+            echo "storeFile=seedsync-release.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          } > android/keystore.properties
+
+      - name: Build the APK
+        env:
+          CARGO_PROFILE_RELEASE_DEBUG: 'false'
+        run: cd android && ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Name it after the release
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk "dist/seed-sync-$version-android-universal.apk"
+
+      - name: Verify the APK signature
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          apksigner="$(find "$ANDROID_SDK_ROOT/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)/apksigner"
+          "$apksigner" verify --print-certs "dist/seed-sync-$version-android-universal.apk"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android
+          path: dist/seed-sync-*-android-universal.apk
+          if-no-files-found: error
