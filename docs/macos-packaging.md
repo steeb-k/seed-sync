@@ -39,8 +39,11 @@ signing only** (re-sign after relocation, mandatory on Apple Silicon; no
 notarization — rely on the `curl | sh` quarantine dodge, so $0 and no Apple account).
 
 The distribution model — public artifact repo, version-driven updater, mandatory
-Cargo bump, no CI — is shared across platforms and documented in
-[`releasing.md`](releasing.md#distribution-model). On macOS the updater is
+Cargo bump, one CI-built release per tag — is shared across platforms and
+documented in [`releasing.md`](releasing.md#distribution-model); the `macos` job
+of `.github/workflows/build.yml` runs `scripts/package-macos.sh` on a hosted
+`macos-15` runner with the conda-forge GTK described below, which is what keeps
+the macOS 11 floor there ([`ci-release.md`](ci-release.md) §5). On macOS the updater is
 `seed-sync --update`, run daily by a launchd agent; the asset is
 `seed-sync-<ver>-macos-universal.tar.gz`.
 
@@ -197,7 +200,7 @@ this by always building on `macos-14`, GitHub's *oldest* Apple-Silicon runner.
 **conda-forge breaks that coupling.** It builds `osx-arm64` packages against the macOS 11.0 SDK (Big
 Sur — the floor for *all* Apple Silicon) and `osx-64` against ~10.13, independent of the build host.
 So sourcing the GTK closure from conda-forge envs lets us cut a **macOS 11 floor on any Mac, including
-the macOS 26 dev box** — no old hardware, no hosted CI runner. macOS 11 is the absolute floor on Apple
+the macOS 26 dev box or a hosted `macos-15` runner** — no old hardware. macOS 11 is the absolute floor on Apple
 Silicon anyway (no Apple Silicon Mac runs anything older), and covers Intel back to High Sierra. (On
 Apple Silicon dyld always loads the arm64 slice, so the arm64 `minos` gates those machines; the x86_64
 floor only affects Intel Macs.)

@@ -1,15 +1,15 @@
 # CI release pipeline — design and contract
 
-**Status: design (2026-09-17), being implemented.** This document is the authority
-for how a SEED Sync release is built, signed, published and distributed once the
-pipeline lands. It replaces the "releases are built locally, CI never ships" rule
-in `CLAUDE.md` and `docs/releasing.md`; those get rewritten as part of the same
-change. The pattern is Nullgate's (`steeb-k/nullgate`, `docs/ci-release.md` there),
+**Status: implemented (2026-09-17); the `v0.8.0-test1` rehearsal is the remaining
+proof for the hosted-runner-only parts (§11).** This document is the authority
+for how a SEED Sync release is built, signed, published and distributed. It
+replaced the "releases are built locally, CI never ships" rule that `CLAUDE.md`
+and `docs/releasing.md` used to carry. The pattern is Nullgate's (`steeb-k/nullgate`, `docs/ci-release.md` there),
 adapted to this app's differences, which are called out below.
 
 ## 1. Goals and non-negotiables
 
-- **One tag, one release, every asset.** Pushing `vX.Y.Z` to `steeb-k/seed-sync-gtk`
+- **One tag, one release, every asset.** Pushing `vX.Y.Z` to `steeb-k/seed-sync`
   produces a single GitHub release on **`steeb-k/seed-sync-binaries`** (not on the
   source repo — every installed updater reads that repo's `releases/latest`) with
   every asset attached in **one** `gh release create` call. Never create-then-upload,
@@ -173,13 +173,13 @@ seed-daemon`) and never touches user sessions. Builder: **nfpm** (one
 soname; deb compression xz, rpm zstd), fed from the tree `package-linux.sh` stages.
 
 **Arch:** `packaging/arch/PKGBUILD` builds from the source tarball of the tag
-(`depends=(gtk4 libadwaita dbus)`, `makedepends=(cargo git imagemagick)`), installs
+(`depends=(bash dbus gdk-pixbuf2 glib2 glibc gtk4 hicolor-icon-theme libadwaita libgcc pango)`, `makedepends=(cargo pkgconf imagemagick)`), installs
 the same layout, ships `seed-sync.install` with the enable hint. `scripts/ci/arch-pkgbuild.sh`
 runs it in a container; `scripts/aur-prepare.sh` rewrites `pkgver`/`sha256sums` and
 regenerates `.SRCINFO` for the AUR clone.
 
 **Flatpak:** `packaging/flatpak/io.github.steeb_k.SeedSync.yml` on
-`org.gnome.Platform//48` (GTK4 + libadwaita come from the runtime; the SDK adds
+`org.gnome.Platform//50` (GTK4 + libadwaita come from the runtime; 48 went end-of-life in 2026-03 and Flathub no longer serves it; the SDK adds
 `org.freedesktop.Sdk.Extension.rust-stable`). This app cannot use portal file
 grants — the daemon does continuous R/W on whole folders — so the manifest asks
 for `--filesystem=host`, `--share=network`, `--socket=session-bus` (the tray is a
@@ -226,7 +226,7 @@ self-subscribes (Chrome/VS Code pattern): `packaging/linux/repo/kznjk.sources`,
 | Secret | Used by | Notes |
 |--------|---------|-------|
 | `SEED_BINARIES_TOKEN` | publish | fine-grained PAT, `contents: write` on `steeb-k/seed-sync-binaries` only |
-| `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | windows | service principal with "Artifact Signing Certificate Profile Signer" on the cert profile; federated credential subject `repo:steeb-k/seed-sync-gtk:environment:release` (register both the legacy and immutable-ID spellings) |
+| `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | windows | service principal with "Artifact Signing Certificate Profile Signer" on the cert profile; federated credential subject `repo:steeb-k/seed-sync:environment:release` (register both the legacy and immutable-ID spellings) |
 | `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`, `ANDROID_KEY_PASSWORD` | android | the existing, irreplaceable `seedsync-release.jks` |
 
 Plus: a GitHub **environment** named `release` on the source repo; the `CHANGELOG.md`
@@ -254,7 +254,7 @@ Disjoint file ownership so the workstreams can run in parallel:
   `scripts/artifact-signing-metadata.ci.json`, `CHANGELOG.md`, and this doc's §2–5
   and §8 kept accurate.
 - **W2 — Linux native packages & repos:** `packaging/linux/nfpm.yaml`,
-  `packaging/linux/scripts/{pre,post}{install,remove}.sh`, package-variant unit and
+  `packaging/linux/scripts/{preinstall,postinstall,preremove}.sh`, package-variant unit and
   desktop file, `packaging/linux/repo/*`, `packaging/arch/{PKGBUILD,seed-sync.install}`,
   `scripts/package-linux-native.sh`, `scripts/ci/arch-pkgbuild.sh`,
   `scripts/aur-prepare.sh`, `packaging/linux/seed-sync` (`refuse_if_pkg_managed`),

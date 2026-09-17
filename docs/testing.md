@@ -37,6 +37,14 @@ works. Use `scripts/test-acceptance.{ps1,sh}` for that.
 Tier 1 is the gate. `cargo fmt` + `cargo clippy --workspace` are assumed alongside
 tier 0.
 
+**CI is tier 0 only.** `ci.yml` on every push and the `gate` job of `release.yml`
+on every tag run `cargo build --workspace --locked --all-targets`, `cargo test
+--workspace --locked` and cargo-deny — exactly the wall of `0 passed; N ignored`
+above. A release tag whose gate is green has been compiled and unit-tested, and
+its packages have been installed and removed on real images (`docs/ci-release.md`
+§5), but nothing in CI has synced a file between two nodes. Run tier 1 before
+tagging; CI cannot.
+
 ## Tier 1 suites (`crates/seed-core/tests/`)
 
 | Suite | Covers |
@@ -204,8 +212,9 @@ Honest list; not yet written.
   the index-lag defect red/green, but the GC race itself only appears in a run long
   enough to straddle an hourly sweep. `GC_INTERVAL_SECS` is not injectable.
 - **No GUI test at all.** Everything the user actually looks at is unverified.
-- **Cross-platform pairs are untested in CI** (there is no CI). Windows↔Linux and
-  Windows↔Android sync is only ever exercised by hand.
+- **Cross-platform pairs are untested in CI.** CI builds every platform but never
+  runs two peers against each other; Windows↔Linux and Windows↔Android sync is
+  only ever exercised by hand.
 
 ## Soak (tier 2)
 

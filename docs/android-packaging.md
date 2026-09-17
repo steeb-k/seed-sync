@@ -2,8 +2,10 @@
 
 The Android app lives in `android/` (Gradle) and wraps the shared `seed-core`
 engine through the `crates/seed-mobile` UniFFI facade. This doc covers building
-and **signing** a release APK locally. For the engine/UniFFI design see
-[`android-app.md`](../android-app.md).
+and **signing** a release APK; the `android` job of `.github/workflows/build.yml`
+does the same on a runner, with the keystore materialised from the
+`ANDROID_KEYSTORE_*` secrets ([`ci-release.md`](ci-release.md) §5, §8). For the
+engine/UniFFI design see [`android-app.md`](../android-app.md).
 
 ## Toolchain (one-time)
 
@@ -68,8 +70,9 @@ keyPassword=<key password>
 ```
 
 `app/build.gradle.kts` loads this into the `release` `signingConfig`. If the
-file is absent (fresh checkout, or CI without the secret), the release build is
-produced **unsigned** — it won't install, by design; debug builds are unaffected.
+file is absent (fresh checkout, or a CI rehearsal with `sign: false`), the release
+build is produced **unsigned** — it won't install, by design; debug builds are
+unaffected. A CI build with `sign: true` and no keystore secret fails instead.
 
 > ### Back up the key — this is irreplaceable
 > Both `android/keystore/seedsync-release.jks` **and** its password must be

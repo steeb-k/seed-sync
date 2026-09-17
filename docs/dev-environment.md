@@ -1,9 +1,10 @@
 # Local cross-platform dev environment (one Windows box)
 
 This documents a single **Windows 11** machine set up to build, run, and package
-SEED Sync for **Windows, Linux, and Android** — without switching machines. All
-releases are built locally (there is no CI); macOS still needs a Mac, see
-`docs/macos-packaging.md`.
+SEED Sync for **Windows, Linux, and Android** — without switching machines.
+Releases themselves are built by CI from a tag (`docs/releasing.md`); this box
+is for development and for building any artifact by hand as a fallback. macOS
+still needs a Mac, see `docs/macos-packaging.md`.
 
 - **Windows** — native MSVC build + GTK4 via gvsbuild + WiX 5 MSI.
 - **Linux** — WSL2 (Ubuntu 24.04) with the GTK GUI rendered through WSLg, plus an
@@ -88,16 +89,16 @@ the `v4_10`/`v1_4` features; 22.04's GTK 4.6 does not). User `steeb` has passwor
 sudo. GTK dev packages: `libgtk-4-dev libadwaita-1-dev libdbus-1-dev` + `build-essential
 pkg-config imagemagick`. A separate Linux `rustup` toolchain.
 
-**Where the code lives:** clone into the **WSL filesystem** (`~/seed-sync-gtk`), not
+**Where the code lives:** clone into the **WSL filesystem** (`~/seed-sync`), not
 `/mnt/c` — `/mnt/c` is slow for cargo and trips git's dubious-ownership guard. The
 clone was made from the Windows working tree:
 ```bash
-git config --global --add safe.directory /mnt/c/Users/<you>/seed-sync-gtk
-git clone /mnt/c/Users/<you>/seed-sync-gtk ~/seed-sync-gtk
+git config --global --add safe.directory /mnt/c/Users/<you>/seed-sync
+git clone /mnt/c/Users/<you>/seed-sync ~/seed-sync
 ```
 
 ### Build + run the GTK GUI
-From inside WSL, in `~/seed-sync-gtk`:
+From inside WSL, in `~/seed-sync`:
 ```bash
 bash scripts/run-linux.sh            # checks env, builds, launches daemon + GUI
 bash scripts/run-linux.sh --skip-build   # launch without rebuilding
@@ -105,7 +106,7 @@ bash scripts/run-linux.sh --skip-build   # launch without rebuilding
 The window renders on your Windows desktop through **WSLg**. To run it from a Windows
 terminal in one shot:
 ```powershell
-wsl -d Ubuntu-24.04 -- bash -lc "cd ~/seed-sync-gtk && bash scripts/run-linux.sh"
+wsl -d Ubuntu-24.04 -- bash -lc "cd ~/seed-sync && bash scripts/run-linux.sh"
 ```
 
 **Rendering:** WSL has no hardware GL via EGL (no DRM render node), and GTK4 only uses
@@ -139,7 +140,7 @@ plain WSLg. A KDE Plasma desktop + xrdp is installed for that:
 
 Inside the KDE session, run the app and watch the panel tray:
 ```bash
-bash ~/seed-sync-gtk/scripts/run-linux.sh
+bash ~/seed-sync/scripts/run-linux.sh
 ```
 
 ---

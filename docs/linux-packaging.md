@@ -27,7 +27,7 @@ the keyring, full network (iroh), the session bus (tray), and system GTK 4.10+/l
 
 ### Distribution / update flow
 
-The public-repo, version-driven, no-CI distribution model is shared across all
+The public-repo, version-driven, CI-built distribution model is shared across all
 platforms and documented once in [`releasing.md`](releasing.md#distribution-model).
 On Linux the updater is `seed-sync --update`, run daily by `seed-sync-update.timer`.
 
@@ -264,16 +264,15 @@ between the .deb and .rpm scriptlet forms) never touch a user session:
   only**, then prints the `systemctl --user enable --now seed-daemon` hint.
 - `preremove` warns that it isn't stopping anything running, and on an rpm erase
   (not an upgrade) takes back the repository files it added, unless they were edited.
-- `postremove` is a no-op: `seed-daemon.service` lives under
+- There is no `postremove`: `seed-daemon.service` lives under
   `/usr/lib/systemd/user`, which the *system* manager never loads, so there is no
-  system-level `daemon-reload` to run.
+  system-level `daemon-reload` to run (and lintian flags an empty `postrm`).
 
 ## Arch Linux / AUR
 `packaging/arch/PKGBUILD` builds `seed-sync` from the **source tarball of the
-tagged release** (`https://github.com/steeb-k/seed-sync-gtk/archive/refs/tags/v$pkgver.tar.gz`
-— note the repo is `seed-sync-gtk`, so the extracted directory is
-`seed-sync-gtk-$pkgver`, not `$pkgname-$pkgver`), not a binary package:
-`depends=(gtk4 libadwaita dbus)`, `makedepends=(cargo git imagemagick)` (icons are
+tagged release** (`https://github.com/steeb-k/seed-sync/archive/refs/tags/v$pkgver.tar.gz`,
+which extracts to `$pkgname-$pkgver`), not a binary package:
+`depends=(bash dbus gdk-pixbuf2 glib2 glibc gtk4 hicolor-icon-theme libadwaita libgcc pango)`, `makedepends=(cargo pkgconf imagemagick)` (icons are
 rendered from `icon/appIcon.png` at build time, the same `ICON_SIZES` as
 `package-linux.sh`), `options=('!lto')` (makepkg's LTO compiles `ring`'s C bits to
 GCC LTO bitcode, which rustc's lld linker can't read — this bit both Nullgate and
@@ -309,13 +308,13 @@ It never commits or pushes — review the diff first.
 `packaging/flatpak/io.github.steeb_k.SeedSync.yml` builds a single-file `.flatpak`
 bundle — a third distribution channel alongside the tarball and the native
 packages above, for users who'd rather install and auto-update through Flatpak.
-It targets `org.gnome.Platform`/`org.gnome.Sdk` branch `48` (GTK4 + libadwaita
+It targets `org.gnome.Platform`/`org.gnome.Sdk` branch `50` (GTK4 + libadwaita
 come from the runtime) plus the `org.freedesktop.Sdk.Extension.rust-stable` SDK
 extension to build. Build it with:
 ```sh
 scripts/package-flatpak.sh
 ```
-which installs the runtime/SDK/extension from Flathub into the user installation
+which has flatpak-builder install the runtime/SDK/extension from Flathub into the user installation
 on first run, then writes `dist/io.github.steeb_k.SeedSync-<version>-x86_64.flatpak`
 (the exact name the release pipeline's asset table expects — see
 `docs/ci-release.md` §3). Install a downloaded bundle with:
@@ -376,6 +375,11 @@ There is no `systemd --user` reachable inside the sandbox, so nothing brings
   (`packaging/linux/seed-sync`'s `AUTOSTART_DIR`), rather than the Background
   portal's `ashpd` binding, which is not a dependency of this workspace
   (`Cargo.lock` has no `ashpd` entry) and wasn't worth adding for one call.
+  Same file name as the tarball install's entry, so the two can collide on an
+  account that has both: an existing entry whose `Exec=` is not
+  `flatpak run io.github.steeb_k.SeedSync` is left alone (the tarball's
+  `seed-sync --install`/`--uninstall` own it); only a missing entry, or a
+  stale one the Flatpak wrote, is (re)written.
   That file is read/written via the literal `$HOME` env var rather than
   `directories::BaseDirs::config_dir()` (`$XDG_CONFIG_HOME`), because Flatpak
   always redirects `$XDG_CONFIG_HOME` to the sandboxed

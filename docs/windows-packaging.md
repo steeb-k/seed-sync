@@ -1,8 +1,11 @@
 # Windows: build, bundle, package, service
 
-The MSI is built, bundled, and signed locally on a real Windows machine; there is
-no CI. For the release runbook and shared distribution model, see
-[`releasing.md`](releasing.md).
+The MSI is built, bundled, and signed by the `windows` job of
+`.github/workflows/build.yml` on a hosted `windows-2025` runner (both
+architectures, Azure Trusted Signing over GitHub OIDC — see
+[`ci-release.md`](ci-release.md) §5); the same scripts run by hand on a real
+Windows machine set up as below, which is the fallback. For the release runbook
+and shared distribution model, see [`releasing.md`](releasing.md).
 
 ## 0. One-time dev setup
 
@@ -25,7 +28,7 @@ no CI. For the release runbook and shared distribution model, see
    $env:PATH = "C:\gtk\bin;$env:PATH"
    $env:LIB = "C:\gtk\lib;$env:LIB"
    ```
-5. `git clone https://github.com/steeb-k/seed-sync-gtk` and `cargo build --release`.
+5. `git clone https://github.com/steeb-k/seed-sync` and `cargo build --release`.
 
 ## 1. Build + bundle the portable tree
 

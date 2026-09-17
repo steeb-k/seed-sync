@@ -43,12 +43,24 @@ cargo test --workspace
 
 ## Installing (Linux)
 
-Releases are published as a portable tarball on the public
-[`seed-sync-binaries`](https://github.com/steeb-k/seed-sync-binaries) repo. Per-user
-install (no root); requires GTK 4.10+, libadwaita 1.4+, and libdbus-1 on the system.
+Every release on the public
+[`seed-sync-binaries`](https://github.com/steeb-k/seed-sync-binaries) repo carries
+native packages and a portable tarball. Pick one:
 
-One command installs, updates, or removes — it detects what's already there and
-prompts (install / update / remove):
+- **Debian / Ubuntu** (`.deb`), **Fedora / openSUSE** (`.rpm`): install the
+  downloaded package; it also subscribes the machine to the apps.kznjk.com
+  repository, so later releases arrive through `apt`/`dnf`/`zypper`.
+- **Arch:** the `seed-sync` AUR package, or the `[kznjk]` pacman repository.
+- **Flatpak:** the `io.github.steeb_k.SeedSync-<ver>-x86_64.flatpak` bundle
+  (`flatpak install <file>`); see `docs/linux-packaging.md` for the sandbox
+  permissions it needs.
+
+With any package: `systemctl --user enable --now seed-daemon`, then launch
+**S.E.E.D.** from the app menu. Details in `docs/linux-packaging.md`.
+
+**Tarball** (any distro, per-user, no root; requires GTK 4.10+, libadwaita 1.4+,
+and libdbus-1 on the system). One command installs, updates, or removes — it
+detects what's already there and prompts (install / update / remove):
 
 ```bash
 curl -fsSL https://steeb-k.github.io/seed-install.sh | sh
@@ -67,8 +79,10 @@ seed-sync --status              # installed/latest version + service state
 seed-sync --uninstall [--purge] # remove (--purge also deletes synced data)
 ```
 
-Maintainers: see **`docs/linux-packaging.md`** for how releases, the tarball, and
-auto-update work, **`docs/windows-packaging.md`** for the MSI side, and
+Maintainers: releases are built and published by CI from a tag
+(**`docs/releasing.md`**, **`docs/ci-release.md`**); see
+**`docs/linux-packaging.md`** for the tarball, packages and auto-update,
+**`docs/windows-packaging.md`** for the MSI side, and
 **`docs/android-packaging.md`** for the Android APK (build + signing).
 
 ## Installing (Android)

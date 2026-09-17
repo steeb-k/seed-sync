@@ -50,7 +50,7 @@ cargo fmt --all                  # format before committing
 
 # The acceptance gate. `cargo test --workspace` runs ZERO integration tests
 # (they are all `#[ignore]`d), so this is what actually proves the app syncs.
-# Required before cutting a release — see docs/testing.md.
+# Required before tagging a release (CI's gate job cannot run it) — see docs/testing.md.
 pwsh scripts/test-acceptance.ps1         # Windows
 bash scripts/test-acceptance.sh          # Linux/macOS
 
@@ -85,25 +85,35 @@ environment looks off, `scripts/run-linux.sh` self-checks and points at
   `vendor/iroh-blobs`, a one-line patch for cross-volume export on Windows. See
   the comment in `Cargo.toml` and known-issues #25 before touching it or bumping
   iroh-blobs.
-- **No releases from CI.** All releases are built **locally on each platform's
-  own machine** and published to the public `steeb-k/seed-sync-binaries` repo.
-  The old release-building Actions workflow was removed and must not come back —
-  no workflow may produce, sign, or upload an artifact. See `docs/releasing.md`.
-- **CI checks, it never ships.** Two workflows run on push + PR, neither
-  emitting an artifact:
+- **Releases are built and published by CI from a tag.** Pushing `vX.Y.Z`
+  runs `.github/workflows/release.yml`: a `gate` job (build + unit tests +
+  cargo-deny), the reusable `.github/workflows/build.yml` (Linux tarball/.deb/
+  .rpm/Flatpak, Arch package, both Windows MSIs signed via Azure Trusted Signing
+  over OIDC, macOS universal tarball ad-hoc signed, signed Android APK — every
+  Linux package installed and removed in-job), then one `publish` job that
+  creates **one** release on the public `steeb-k/seed-sync-binaries` repo with
+  all nine assets in a single `gh release create`. The asset names and tag scheme
+  are a contract consumed by installed updaters (`docs/ci-release.md` §3). A
+  dashed tag (`v0.8.0-test1`) publishes a prerelease that updaters ignore —
+  rehearse pipeline changes that way. Runbook: `docs/releasing.md`; design and
+  binding contract: `docs/ci-release.md`. Every action is pinned by commit SHA
+  and every third-party tool by version + sha256; keep it that way.
+- **`ci.yml` and `cargo-deny.yml` check, they never ship.** Both run on push +
+  PR and emit no artifact:
   - `.github/workflows/ci.yml` — `cargo build --workspace --locked
     --all-targets` then `cargo test --workspace --locked` on ubuntu, installing
     the same `libgtk-4-dev libadwaita-1-dev libdbus-1-dev` listed above.
-    **This is not the acceptance gate.** Every integration test is `#[ignore]`d
-    (~61 of ~128), so a green run proves the workspace compiles and the unit
-    tests pass — nothing about whether the app actually syncs. That remains
+    **This is not the acceptance gate**, and neither is `release.yml`'s `gate`
+    job, which repeats it. Every integration test is `#[ignore]`d (~61 of
+    ~128), so a green run proves the workspace compiles and the unit tests pass
+    — nothing about whether the app actually syncs. That remains
     `scripts/test-acceptance.{ps1,sh}`, which needs multiple peers and cannot
     run on a single runner. See `docs/testing.md`.
   - `.github/workflows/cargo-deny.yml` — supply-chain checks (advisories,
-    licenses, sources). `deny.toml`'s `ignore` list is the open-advisory
-    backlog; removing an entry is how one gets fixed. Note it checks the
-    **vendored** `iroh*` copies as path deps, so advisories filed against the
-    real upstream versions will not match them.
+    licenses, sources, `--all-features`). `deny.toml`'s `ignore` list is the
+    open-advisory backlog; removing an entry is how one gets fixed. Note it
+    checks the **vendored** `iroh*` copies as path deps, so advisories filed
+    against the real upstream versions will not match them.
 - **Version** is set once in `[workspace.package]` in `Cargo.toml`.
 - **License:** GPL-3.0-or-later.
 - Match the surrounding code's style; run `cargo fmt` and `cargo clippy` before
@@ -122,8 +132,9 @@ Architecture / engine internals:
 - `connectivity-plan.md` — 2026-09 two-member unreachability: why the #23/#35 ladders can't heal a wedged endpoint, the control experiment (`examples/dial_probe.rs`), and the transport-level fix plan.
 
 Packaging / distribution (maintainer guides):
-- `releasing.md` — how to cut a release across platforms + the shared distribution model.
-- `linux-packaging.md` — tarball + `systemd --user` + auto-update; the release baseline.
+- `ci-release.md` — the CI release pipeline: design, the asset/tag contract, per-platform jobs, secrets. **Binding for any change under `.github/workflows/`, `packaging/` or `scripts/ci/`.**
+- `releasing.md` — the release runbook (tag → CI → one release on `seed-sync-binaries`) + the shared distribution model.
+- `linux-packaging.md` — tarball + `systemd --user` + auto-update, the `.deb`/`.rpm`/Arch packages and repos, and the Flatpak.
 - `windows-packaging.md` — MSI build/bundle/sign + Windows service.
 - `macos-packaging.md` — `.app` bundle, launchd, universal2, install/update flow.
 - `android-packaging.md` — building & signing the release APK from `android/`.

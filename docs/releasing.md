@@ -1,205 +1,142 @@
 # Cutting a release
 
-Releases are built **locally, on each platform's own machine**, and published as
-a GitHub Release on the **public** `steeb-k/seed-sync-binaries` repo. There is no
-GitHub Actions / CI path — the old `.github/workflows/release.yml` was removed in
-favor of local builds (notably so the macOS asset can target an OS floor well
-below what the hosted `macos-14` runner allowed).
+**Releases are built and published by CI from a tag.** Pushing `vX.Y.Z` to
+`steeb-k/seed-sync` runs `.github/workflows/release.yml`, which builds every
+platform through `.github/workflows/build.yml`, gates on the same checks `ci.yml`
+runs, and creates **one** GitHub release on the **public
+`steeb-k/seed-sync-binaries`** repo with all nine assets attached in a single
+call. The design, the asset contract and the per-platform jobs are in
+[`ci-release.md`](ci-release.md); this page is the runbook. The per-platform
+scripts still work by hand and are exactly what CI runs — building locally is
+the fallback, not the process.
 
-The auto-updaters (Windows scheduled task, Linux timer/service, macOS launchd, and
-the `web-install.sh` bootstrap) are version-driven: each compares the installed
-`seed-daemon --version` against the latest release tag on `seed-sync-binaries` and
-upgrades only when the release is newer. So every release must bump the version.
+The auto-updaters (Windows scheduled task, Linux timer/service, macOS launchd,
+the `web-install.sh` bootstraps, and apps.kznjk.com's package poller) are
+version-driven: each compares the installed `seed-daemon --version` against the
+release marked **Latest** on `seed-sync-binaries` and upgrades only when it is
+newer. So every release must bump the version, and the newest release must be
+the one marked Latest.
+
+Per-platform mechanics: [`windows-packaging.md`](windows-packaging.md),
+[`linux-packaging.md`](linux-packaging.md), [`macos-packaging.md`](macos-packaging.md),
+[`android-packaging.md`](android-packaging.md).
 
 ## Distribution model
 
-All four platforms share one distribution model; the per-OS packaging docs describe
-only the mechanics on top of it.
-
 ```
-  dev machines (local builds)         seed-sync-binaries (PUBLIC)         user machine
-  ───────────────────────────         ──────────────────────────         ────────────
-  package-linux.sh  ──► gh release ──►  Release "vX.Y.Z"          ◄─── seed-sync --update
-  build-msi.ps1         create/upload   ├─ ...linux-x86_64.tar.gz  poll   (timer/task/agent)
-  gradlew assembleRel   (per platform)  ├─ ...windows-x86_64.msi    +     compares to
-  package-macos.sh                      └─ ...android...   APK     fetch  `seed-daemon --version`
-```
-
-- Artifacts are published to a **separate public repo** (`steeb-k/seed-sync-binaries`)
-  so machines download with no auth; source stays private in `seed-sync-gtk`. One
-  GitHub Release per `vX.Y.Z` tag carries every platform's asset.
-- The **installed version is the source of truth**: the updater reads
-  `seed-daemon --version` and compares it to the latest release tag, so the Cargo
-  version must be bumped per release or no machine ever sees a newer build.
-- **No CI.** Every artifact is built and signed locally on its own platform's machine
-  and attached to the release; the old GitHub Actions workflow was removed.
-
-## 1. Create the draft release FIRST — before building anything
-
-**Do this at the very start of every release, not at the end.** Cutting a release is a
-long, multi-machine job (three or four platform builds, minutes each); if the GitHub
-release page only appears after all of them finish, it's invisible for the whole run and
-there's nowhere for assets to land as they complete. So create it up front, as a **draft**,
-the moment you know the target version:
-
-```sh
-# You know vX.Y.Z before you build — it's a decision, not a build output.
-gh release create vX.Y.Z \
-  --repo steeb-k/seed-sync-binaries \
-  --title vX.Y.Z \
-  --notes-file release-notes.md \
-  --draft
-# -> prints the draft's URL. Assets get attached to it in step 3 as each build lands;
-#    the notes can be refined any time before you finalize.
+  steeb-k/seed-sync (source)        seed-sync-binaries (PUBLIC)          user machine
+  ──────────────────────────        ───────────────────────────          ────────────
+  git push v0.8.0 ─► release.yml ─►  Release "v0.8.0" (Latest)   ◄────  seed-sync --update
+                     gate + build     ├─ ...linux-x86_64.tar.gz    poll   (timer/task/agent)
+                     + publish        ├─ ...windows-{x86_64,arm64}.msi    compares to
+                     (one gh call)    ├─ ...macos-universal.tar.gz        `seed-daemon --version`
+                                      ├─ ...android-universal.apk
+                                      ├─ seed-sync_<v>-1_amd64.deb ◄───  apps.kznjk.com poller
+                                      ├─ seed-sync-<v>-1.x86_64.rpm      (apt/dnf/zypper/pacman/
+                                      ├─ seed-sync-<v>-1-x86_64.pkg.tar.zst   flatpak repos)
+                                      └─ io.github.steeb_k.SeedSync-<v>-x86_64.flatpak
 ```
 
-Draft, not published, because the release marked **Latest** is what every updater fetches
-(`releases/latest`) — you don't want a half-built release going Latest with only some
-platforms' assets attached. It stays a draft, invisible to updaters, until step 4.
+- Artifacts live on a **separate public repo** so machines download with no
+  auth. One release per `vX.Y.Z` carries every platform's asset; the asset names
+  are the contract in [`ci-release.md` §3](ci-release.md#3-the-contract-assets-tag-versions).
+- The **installed version is the source of truth**: the updaters read
+  `seed-daemon --version` and compare it to the Latest release tag.
+- **Linux packages** are picked up by apps.kznjk.com's poller, which verifies
+  each asset's sha256, GPG-signs it and rebuilds the apt, dnf/zypper, pacman and
+  flatpak repositories. Nothing in this repo pushes to a package repository.
+- A **dashed tag** (`v0.8.0-test1`) publishes a *prerelease*, which every updater,
+  Obtainium and the package poller ignore. Rehearse every pipeline change that way.
 
-> If `release-notes.md` isn't written yet, create the draft with a placeholder and edit the
-> notes before finalizing (`gh release edit vX.Y.Z --repo … --notes-file release-notes.md`).
-> The point is that the page exists from minute one.
+## Versioning
 
-## 2. Bump the version
+- The workspace version lives once in the root `Cargo.toml` `[workspace.package]`;
+  every crate inherits it. `seed-daemon --version` and the updaters' comparison
+  come from this.
+- Android carries the same number by hand in `android/app/build.gradle.kts`:
+  `versionName` matches, `versionCode` is `MAJOR*10000 + MINOR*100 + PATCH`
+  (`0.8.0` → `800`). Android refuses an APK whose `versionCode` is lower than the
+  installed one, so the code must only ever climb.
+- The tag is `v<version>`. The `publish` job refuses a tag whose version differs
+  from `Cargo.toml` or from the Android literals, so forgetting a bump is loud.
 
-The workspace version in `Cargo.toml` is the single source of truth.
+## Release checklist
 
-```sh
-# Edit Cargo.toml [workspace.package] version, then refresh the lockfile:
-cargo update --workspace
-```
+1. **Acceptance gate:** `scripts/test-acceptance.ps1` / `.sh` passes (see
+   [`testing.md`](testing.md)). CI's `gate` job repeats only the unit tests and
+   cargo-deny; every integration suite is `#[ignore]`d and needs real peers.
+2. **Bump** the version in `Cargo.toml`, run `cargo update --workspace`, bump the
+   Android `versionName`/`versionCode`, and move `CHANGELOG.md`'s `## [Unreleased]`
+   items under `## [<version>] - <date>` (the release notes are cut from that
+   section). Commit `release: v<version>` and push `main`.
+3. **Rehearse if anything in the pipeline changed:**
+   `git tag v<version>-test1 && git push origin v<version>-test1`. That publishes
+   a prerelease with all nine assets that nothing installed will take. Install
+   one or two of them by hand (smoke-check below), then delete the prerelease and
+   the tag on both repos.
+4. **Tag:** `git tag v<version> && git push origin v<version>`. The `release`
+   workflow builds all five jobs, gates, and creates the Latest release with every
+   asset in one call. If the `release` environment has a required reviewer,
+   approve it in the Actions tab.
+5. **If a platform job fails, nothing is published.** Fix on a branch, then
+   dispatch `release.yml` from that branch with `tag: v<version>`: the workflow
+   comes from the branch, the source from the tag.
+6. **Package repositories** need nothing: apps.kznjk.com's timer signs the
+   `.deb`, `.rpm`, `.pkg.tar.zst` and `.flatpak` into its repositories within
+   about ten minutes (`journalctl --user -u packages-sync` on that host).
+7. **AUR**, once the release is published: `scripts/aur-prepare.sh <version>
+   ../seed-sync-aur`, review, commit and push the clone (details in
+   [`linux-packaging.md`](linux-packaging.md)). CI's `arch` job has already proved
+   that PKGBUILD builds against the tag.
 
-Also bump `android/app/build.gradle.kts`:
+### Building by hand (fallback)
 
-- `versionName` — matches the workspace version (e.g. `"0.3.4"`).
-- `versionCode` — `MAJOR*10000 + MINOR*100 + PATCH` (so `0.3.4` → `304`,
-  `1.2.0` → `10200`). Monotonic and decodable; see `docs/android-packaging.md`.
-  > Android refuses to install an APK whose `versionCode` is **lower** than the
-  > one already on the device. If you ever lower the version line (as in the
-  > 1.x → 0.x rollback), bump past the old code or uninstall first.
+Each artifact on its own OS: **Windows** `pwsh -File scripts\build-msi.ps1`
+(+ `-Arch arm64`; signed when `artifact-signing-metadata.json` and an `az login`
+session are present, see [`windows-packaging.md`](windows-packaging.md));
+**Linux** `scripts/package-linux.sh`, then `scripts/package-linux-native.sh`
+(needs nfpm, the version pinned in `build.yml`) and `scripts/package-flatpak.sh`;
+**Arch** `scripts/ci/arch-pkgbuild.sh` in an `archlinux` container with `/out`
+mounted; **macOS** `scripts/setup-conda-macos.sh --universal` once, then
+`scripts/package-macos.sh`; **Android** `cd android && ./gradlew :app:assembleRelease`
+with `android/keystore.properties`, renamed to `seed-sync-<version>-android-universal.apk`.
 
-Then commit:
+Publish with `gh release create v<version> -R steeb-k/seed-sync-binaries --latest
+--notes-file notes.md <all nine files>` in **one command** (no `--verify-tag`:
+the binaries repo has no source, `gh` creates the tag there). Never
+create-then-upload and never leave a draft: the moment a release is Latest,
+updaters act on it, and a release missing an asset strands that platform.
 
-```sh
-git commit -am "release: vX.Y.Z"
-git push origin main
-```
+## Smoke-check before announcing
 
-You can tag the source repo too if you like history (`git tag vX.Y.Z && git push
-origin vX.Y.Z`) — with CI gone, the tag triggers nothing. It is **not** required;
-the release on `seed-sync-binaries` carries its own tag, created by `gh` below.
+- **Windows:** install the MSI on a clean machine; the app opens, the
+  `SeedSyncDaemon` service runs, the `SeedSyncUpdate` task exists
+  (`schtasks /Query /TN SeedSyncUpdate`), and `Get-AuthenticodeSignature` is `Valid`.
+- **Linux packages:** once the poller has picked the release up, on a machine that
+  already has the repository run `sudo apt update && sudo apt upgrade` (or
+  `dnf upgrade`, `pacman -Syu`, `flatpak update`) and confirm it moves to
+  `<version>`; `seed-sync --update` must refuse on a package-managed install.
+  Installing the downloaded `.deb`/`.rpm` on a fresh machine must leave the
+  repository configured.
+- **Linux/macOS tarball:** run the `curl … | sh` one-liner; `seed-sync --status`
+  shows the daemon active and the updater enabled.
+- **Two machines:** create a share on one, join on the other, confirm both
+  directions sync and both report 100%.
+- **Auto-update path:** with an older build installed, confirm the updater picks
+  the release up (or force it: `seed-sync --update`; Windows
+  `…\bin\seed-sync-update.ps1 -Check`).
+- **Android:** on a device that has the *previous* release-signed build,
+  `adb install -r seed-sync-<version>-android-universal.apk` must update **in
+  place**. A signature clash means the keystore changed; stop and fix it before
+  announcing (see [`android-packaging.md`](android-packaging.md)).
 
-## 3. Build the artifacts — and upload each to the draft as it lands
+## Secrets and one-time setup
 
-Only build the platforms you have a machine for — the release is assembled
-incrementally, so you can attach more assets to the same (draft) release later. Every
-artifact is named `seed-sync-<ver>-<platform>`. **As each build finishes, upload it to the
-draft right away** rather than saving them all for the end:
-
-```sh
-gh release upload vX.Y.Z --repo steeb-k/seed-sync-binaries <artifact>
-```
-
-**Windows MSI** (Windows, GTK + Azure signing set up — see
-[`windows-packaging.md`](windows-packaging.md)):
-
-```pwsh
-cargo build --release
-az login   # your user must hold the Azure Artifact Signing signer role
-# point ARTIFACT_SIGNING_DLIB at Azure.CodeSigning.Dlib.dll (from the
-# Microsoft.ArtifactSigning.Client NuGet)
-pwsh -File scripts\build-msi.ps1 -SkipBuild
-# -> target\wix\seed-sync-<ver>-windows-x86_64.msi
-pwsh -File scripts\build-msi.ps1 -Arch arm64
-# -> target\wix\seed-sync-<ver>-windows-arm64.msi   (cross-built here; see windows-packaging.md)
-# verify: signtool verify /pa target\wix\seed-sync-<ver>-windows-x86_64.msi
-```
-Ship **both** Windows MSIs or neither: the updater picks its asset from the machine's OS
-architecture and will not fall back across architectures, so a release carrying only the x86_64 MSI
-leaves every ARM64 install sitting on its current version.
-
-The whole bundle → sign exes → wix → sign-MSI chain runs locally; `-SkipBuild`
-reuses an existing `target\release\*.exe`. Signing uses your interactive `az`
-session (your user must hold the signer role); see
-[`windows-packaging.md`](windows-packaging.md) §3.1/§3.3 for the Azure setup.
-
-**Android APK** (any OS with the Android toolchain — see
-[`android-packaging.md`](android-packaging.md)):
-
-```pwsh
-cd android; .\gradlew.bat clean :app:assembleRelease
-# -> android\app\build\outputs\apk\release\app-release.apk
-# rename on upload to seed-sync-<ver>-android-universal.apk
-```
-
-**Linux tarball** (Linux or WSL, GTK dev packages installed):
-
-```sh
-scripts/package-linux.sh            # -> seed-sync-<ver>-linux-x86_64.tar.gz
-```
-
-**macOS universal** (macOS, GTK sourced from conda-forge — see
-[`macos-packaging.md`](macos-packaging.md)):
-
-```sh
-scripts/package-macos.sh            # -> seed-sync-<ver>-macos-universal.tar.gz
-```
-
-Publishing/uploading needs write access to `steeb-k/seed-sync-binaries`: either be logged in
-via `gh auth login` as an account with `repo` scope (the maintainer's `steeb-k`
-account is), or export a `SEED_BINARIES_TOKEN` PAT (`contents: write` on that repo)
-and pass it to `gh` via `GH_TOKEN`. (`gh` created the `vX.Y.Z` tag on *that* repo back in
-step 1.)
-
-## 4. Finalize — publish the draft as Latest
-
-Only once every platform you're shipping has its asset attached, flip the draft to a
-published, Latest release:
-
-```sh
-# refine notes if they were a placeholder, then publish:
-gh release edit vX.Y.Z --repo steeb-k/seed-sync-binaries --notes-file release-notes.md
-gh release edit vX.Y.Z --repo steeb-k/seed-sync-binaries --draft=false --latest
-```
-
-The release marked **Latest** on `seed-sync-binaries` is what the updaters fetch
-(`releases/latest`). Finalizing last — never leaving the newest version as a draft or
-pre-release, never marking it Latest before its assets are all attached — is what keeps a
-half-built release from being handed to every updater.
-
-## 5. Release notes
-
-Write `release-notes.md` (the `--notes-file` above). Keep it consistent with the
-downloads list and the minimum OS / Linux deps:
-
-```markdown
-**S.E.E.D. (SEED Sync) vX.Y.Z** — P2P mirrored-folder sync.
-
-### Downloads
-- **Linux x86_64** — `seed-sync-<ver>-linux-x86_64.tar.gz`
-- **macOS universal** (Apple Silicon + Intel) — `seed-sync-<ver>-macos-universal.tar.gz`
-- **Windows x86_64** (signed MSI) — `seed-sync-<ver>-windows-x86_64.msi`
-- **Windows ARM64** (signed MSI) — `seed-sync-<ver>-windows-arm64.msi`
-- **Android** (universal APK) — `seed-sync-<ver>-android-universal.apk`
-
-### System requirements
-
-**Linux** — GTK is *not* bundled; install the runtime packages first:
-- GTK 4.10+, libadwaita 1.4+, libdbus-1
-- Debian/Ubuntu: `libgtk-4-1 libadwaita-1-0 libdbus-1-3`
-- Fedora: `gtk4 libadwaita dbus-libs`
-- Arch: `gtk4 libadwaita dbus`
-
-**macOS** — set the floor to whatever your local build targets (building locally
-lets you go well below the old CI floor of macOS 14). GTK4 + libadwaita are
-bundled in the app; no Homebrew or other runtime needed.
-
-**Windows** — **Windows 10 (64-bit)** or later. GTK4 + libadwaita and all
-libraries are bundled in the signed MSI; no separate runtime install required.
-
-**Android** — Android 11 (API 30) or later.
-```
-
-macOS/Windows bundle their whole runtime; Linux does not (see the per-OS
-`docs/*-packaging.md`).
+Listed in [`ci-release.md` §8](ci-release.md#8-secrets-and-one-time-setup-maintainer):
+`SEED_BINARIES_TOKEN`, the three `AZURE_*` ids behind the OIDC federated
+credential (`repo:steeb-k/seed-sync:environment:release`), the four
+`ANDROID_*` keystore secrets, and the `release` environment on the source repo.
+The Windows signing account and certificate profile names are committed in
+`scripts/artifact-signing-metadata.ci.json` (the same Trusted Signing account
+Nullgate uses); the maintainer's local copy stays git-ignored at the repo root.
+The keystore itself is irreplaceable: back it up, never rotate it.
