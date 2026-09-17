@@ -33,6 +33,8 @@ Pre-1.0; prereleases are tagged `v<version>-test<N>`.
 - `seed-gui --version` prints the version, as `seed-daemon --version` does.
 
 ### Changed
+- `h2` 0.4.19 and `rustls` 0.23.45 for RUSTSEC-2026-0258 and RUSTSEC-2026-0285; cargo-deny had
+  been failing on `main` since 0.7.4, and the release gate runs the same check.
 - **The Android release keystore is new** (generated 2026-09-17; no shipped install was ever
   signed with the old one). A device that still has an earlier release APK must uninstall it
   before installing this one; from here on every release is signed with this key, forever.
