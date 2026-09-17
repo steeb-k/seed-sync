@@ -407,6 +407,15 @@ fn macos_hide_from_switcher() {
 fn macos_hide_from_switcher() {}
 
 fn main() -> glib::ExitCode {
+    // `--version` prints the same line `seed-daemon --version` does and exits,
+    // before any GTK/display setup: it is what the Flatpak smoke test runs
+    // (`flatpak run io.github.steeb_k.SeedSync --version`, whose command is
+    // this binary) and a build with no display must still answer it.
+    if std::env::args().any(|a| a == "--version") {
+        println!("seed-gui {}", env!("CARGO_PKG_VERSION"));
+        return glib::ExitCode::SUCCESS;
+    }
+
     setup_runtime_env();
 
     // `--debug` reveals the log console (release builds are windowed by default,

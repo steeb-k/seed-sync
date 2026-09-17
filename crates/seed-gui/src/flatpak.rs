@@ -198,18 +198,36 @@ fn ensure_autostart_entry() -> std::io::Result<()> {
     write_autostart_entry_in(&dir)
 }
 
+/// The `Exec=` line that marks an autostart entry as one this module wrote.
+fn autostart_exec_marker() -> String {
+    format!("Exec=flatpak run {APP_ID}")
+}
+
 /// Testable half of [`ensure_autostart_entry`]: write into an injected
 /// directory rather than the real `$HOME`.
+///
+/// The file name is the app id, which is also what the tarball install's
+/// `seed-sync --install` writes to the same directory (`Exec=~/.local/bin/
+/// seed-gui --hidden`). An account can have both installs, and that entry is
+/// the tarball's to manage: an existing file whose `Exec=` is not ours is left
+/// alone, so the Flatpak never hijacks the other install's login autostart.
+/// Only a missing file, or a stale one this module wrote, is (re)written.
 fn write_autostart_entry_in(dir: &Path) -> std::io::Result<()> {
     use std::io::Write as _;
     std::fs::create_dir_all(dir)?;
     let path = dir.join(format!("{APP_ID}.desktop"));
     let contents = autostart_desktop_contents();
-    if std::fs::read_to_string(&path)
-        .map(|s| s == contents)
-        .unwrap_or(false)
-    {
-        return Ok(());
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if existing == contents {
+            return Ok(());
+        }
+        if !existing.contains(&autostart_exec_marker()) {
+            tracing::info!(
+                "flatpak: leaving {} alone (another install's autostart entry)",
+                path.display()
+            );
+            return Ok(());
+        }
     }
     let mut f = std::fs::File::create(&path)?;
     f.write_all(contents.as_bytes())
@@ -266,6 +284,38 @@ mod tests {
         write_autostart_entry_in(&dir).unwrap();
         let second = std::fs::read_to_string(&path).unwrap();
         assert_eq!(first, second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autostart_entry_never_overwrites_another_installs_entry() {
+        let dir = scratch_dir("autostart-foreign");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{APP_ID}.desktop"));
+        // What packaging/linux/seed-sync writes for a tarball install.
+        let tarball = "[Desktop Entry]\nType=Application\nName=SEED Sync\n\
+                       Exec=/home/u/.local/bin/seed-gui --hidden\n\
+                       X-GNOME-Autostart-enabled=true\n";
+        std::fs::write(&path, tarball).unwrap();
+        write_autostart_entry_in(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), tarball);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn autostart_entry_refreshes_a_stale_one_of_its_own() {
+        let dir = scratch_dir("autostart-stale");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("{APP_ID}.desktop"));
+        let stale = format!("[Desktop Entry]\nExec=flatpak run {APP_ID}\n");
+        std::fs::write(&path, &stale).unwrap();
+        write_autostart_entry_in(&dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            autostart_desktop_contents()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
