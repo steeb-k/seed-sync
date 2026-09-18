@@ -22,7 +22,6 @@ names=(
   "seed-sync_$version-1_amd64.deb"
   "seed-sync-$version-1.x86_64.rpm"
   "seed-sync-$version-1-x86_64.pkg.tar.zst"
-  "io.github.steeb_k.SeedSync-$version-x86_64.flatpak"
 )
 
 for name in "${names[@]}"; do

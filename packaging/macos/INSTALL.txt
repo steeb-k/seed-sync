@@ -6,10 +6,11 @@ Per-user install, no root required. One command does it all:
     ./seed-sync --install
 
 This is a self-contained build: "SEED Sync.app" bundles GTK4 + libadwaita and
-their dependencies, so nothing from Homebrew is required. The app is ad-hoc
-signed; installing via the curl|sh bootstrap (or unpacking with tar) avoids the
-Gatekeeper quarantine, so it runs without an "unidentified developer" prompt and
-without notarization.
+their dependencies, so nothing from Homebrew is required. Release builds are
+Developer-ID signed and notarized; installing via the curl|sh bootstrap (or
+unpacking with tar) also avoids the Gatekeeper quarantine entirely, so even a
+locally built, ad-hoc-signed bundle runs without an "unidentified developer"
+prompt.
 
 What --install does:
   - copies "SEED Sync.app" to ~/Applications (shows in Launchpad / Spotlight /

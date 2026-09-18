@@ -88,11 +88,11 @@ environment looks off, `scripts/run-linux.sh` self-checks and points at
 - **Releases are built and published by CI from a tag.** Pushing `vX.Y.Z`
   runs `.github/workflows/release.yml`: a `gate` job (build + unit tests +
   cargo-deny), the reusable `.github/workflows/build.yml` (Linux tarball/.deb/
-  .rpm/Flatpak, Arch package, both Windows MSIs signed via Azure Trusted Signing
-  over OIDC, macOS universal tarball ad-hoc signed, signed Android APK — every
+  .rpm, Arch package, both Windows MSIs signed via Azure Trusted Signing
+  over OIDC, macOS universal tarball Developer-ID signed + notarized, signed Android APK — every
   Linux package installed and removed in-job), then one `publish` job that
   creates **one** release on the public `steeb-k/seed-sync-binaries` repo with
-  all nine assets in a single `gh release create`. The asset names and tag scheme
+  all eight assets in a single `gh release create`. The asset names and tag scheme
   are a contract consumed by installed updaters (`docs/ci-release.md` §3). A
   dashed tag (`v0.8.0-test1`) publishes a prerelease that updaters ignore —
   rehearse pipeline changes that way. Runbook: `docs/releasing.md`; design and
@@ -134,7 +134,7 @@ Architecture / engine internals:
 Packaging / distribution (maintainer guides):
 - `ci-release.md` — the CI release pipeline: design, the asset/tag contract, per-platform jobs, secrets. **Binding for any change under `.github/workflows/`, `packaging/` or `scripts/ci/`.**
 - `releasing.md` — the release runbook (tag → CI → one release on `seed-sync-binaries`) + the shared distribution model.
-- `linux-packaging.md` — tarball + `systemd --user` + auto-update, the `.deb`/`.rpm`/Arch packages and repos, and the Flatpak.
+- `linux-packaging.md` — tarball + `systemd --user` + auto-update, and the `.deb`/`.rpm`/Arch packages and repos.
 - `windows-packaging.md` — MSI build/bundle/sign + Windows service.
 - `macos-packaging.md` — `.app` bundle, launchd, universal2, install/update flow.
 - `android-packaging.md` — building & signing the release APK from `android/`.

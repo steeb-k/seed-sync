@@ -13,7 +13,6 @@
 // for the logs (see `main`). Debug builds keep the console for `cargo run`.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod flatpak;
 mod notify;
 mod tray;
 
@@ -408,9 +407,7 @@ fn macos_hide_from_switcher() {}
 
 fn main() -> glib::ExitCode {
     // `--version` prints the same line `seed-daemon --version` does and exits,
-    // before any GTK/display setup: it is what the Flatpak smoke test runs
-    // (`flatpak run io.github.steeb_k.SeedSync --version`, whose command is
-    // this binary) and a build with no display must still answer it.
+    // before any GTK/display setup, so a build with no display can answer it.
     if std::env::args().any(|a| a == "--version") {
         println!("seed-gui {}", env!("CARGO_PKG_VERSION"));
         return glib::ExitCode::SUCCESS;
@@ -441,12 +438,6 @@ fn main() -> glib::ExitCode {
     let socket = std::env::var_os("SEED_SOCKET")
         .map(PathBuf::from)
         .unwrap_or_else(default_socket);
-
-    // Flatpak has no systemd --user to bring the daemon up on its own, so the
-    // GUI supervises it: a no-op everywhere else (`in_flatpak()` is false).
-    // Must run before the first IPC connect, which happens once `build_ui`
-    // issues its initial `net.refresh()`.
-    flatpak::ensure_daemon(&socket);
 
     // A leaked multi-thread runtime lives for the process; we only need a Handle.
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -816,7 +807,7 @@ fn build_ui(
     {
         let net = net.clone();
         start_daemon_btn.connect_clicked(move |_| {
-            start_daemon(&net.socket);
+            start_daemon();
             // Give the service a moment to come up, then re-query.
             let net = net.clone();
             glib::timeout_add_local_once(Duration::from_millis(1500), move || net.refresh());
@@ -1315,16 +1306,9 @@ fn ensure_autostart() {}
 /// Attempt to start the background daemon (the "Start Daemon" button). On Windows
 /// the daemon is a LocalSystem service the unprivileged GUI can't start, so we
 /// relaunch `seed-daemon start` elevated via UAC. On Linux it's a systemd *user*
-/// service — except inside Flatpak, which has no `systemd --user` at all, so
-/// that case is checked first and handed off to `flatpak::ensure_daemon`
-/// (a no-op outside the sandbox). Best effort: failures are logged and the GUI
-/// re-queries shortly after, falling back to the "Daemon Not Started" page if
-/// it's still down.
-fn start_daemon(socket: &std::path::Path) {
-    if flatpak::in_flatpak() {
-        flatpak::ensure_daemon(socket);
-        return;
-    }
+/// service. Best effort: failures are logged and the GUI re-queries shortly
+/// after, falling back to the "Daemon Not Started" page if it's still down.
+fn start_daemon() {
     #[cfg(windows)]
     {
         // <prefix>\bin\seed-gui.exe -> sibling seed-daemon.exe.

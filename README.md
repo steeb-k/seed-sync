@@ -51,9 +51,6 @@ native packages and a portable tarball. Pick one:
   downloaded package; it also subscribes the machine to the apps.kznjk.com
   repository, so later releases arrive through `apt`/`dnf`/`zypper`.
 - **Arch:** the `seed-sync` AUR package, or the `[kznjk]` pacman repository.
-- **Flatpak:** the `io.github.steeb_k.SeedSync-<ver>-x86_64.flatpak` bundle
-  (`flatpak install <file>`); see `docs/linux-packaging.md` for the sandbox
-  permissions it needs.
 
 With any package: `systemctl --user enable --now seed-daemon`, then launch
 **S.E.E.D.** from the app menu. Details in `docs/linux-packaging.md`.

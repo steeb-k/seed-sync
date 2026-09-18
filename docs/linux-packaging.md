@@ -10,15 +10,13 @@ S.E.E.D. is **not a typical sandboxed GUI app** — it's a *per-user background 
 GUI + CLI. The daemon continuously reads/writes **arbitrary user-chosen folders** and needs
 the keyring, full network (iroh), the session bus (tray), and system GTK 4.10+/libadwaita 1.4+.
 
-- **Flatpak needs a wide sandbox, not a narrow one.** A daemon doing continuous R/W to
-  arbitrary user-chosen folders can't use per-file portal grants — those hand back a
-  one-shot, revocable handle to a single picked path, useless for "keep this folder
-  mirrored indefinitely" — so the Flatpak build (added later, see
-  [Flatpak](#flatpak) below) asks for `--filesystem=host` outright instead of pretending
-  otherwise. It's still worth shipping: for users who prefer Flatpak's sandboxing and
-  auto-update over the per-user tarball, most of the sandbox still holds (no arbitrary
-  binary execution, network/bus access are the normal grants, GPU/display access is the
-  normal portals) even though the filesystem grant is broad.
+- **Flatpak was rejected** (built and then dropped in 0.8.0). A daemon doing continuous
+  R/W to arbitrary user-chosen folders can't use per-file portal grants — those hand
+  back a one-shot handle to a single picked path — so a Flatpak needs
+  `--filesystem=host` + `--share=network` + secrets + the session bus, which guts the
+  sandbox while paying its complexity, and with no `systemd --user` inside the sandbox
+  the GUI has to supervise the daemon itself, so the daemon only runs while the tray
+  does. It worked; it just bought nothing over the packages below.
 - **AppImage was rejected:** GTK4 bundling is fiddly and it does nothing for the daemon
   autostart problem.
 - **Chosen: a distro-agnostic tarball** installed per-user, with the daemon run as a
@@ -317,133 +315,6 @@ cd ../seed-sync-aur && git diff && git commit -am "seed-sync 0.8.0" && git push
 the now-published tag archive, and regenerates `.SRCINFO` (via `makepkg
 --printsrcinfo`, or an `archlinux` container if `makepkg` isn't available locally).
 It never commits or pushes — review the diff first.
-
-## Flatpak
-`packaging/flatpak/io.github.steeb_k.SeedSync.yml` builds a single-file `.flatpak`
-bundle — a third distribution channel alongside the tarball and the native
-packages above, for users who'd rather install and auto-update through Flatpak.
-It targets `org.gnome.Platform`/`org.gnome.Sdk` branch `50` (GTK4 + libadwaita
-come from the runtime) plus the `org.freedesktop.Sdk.Extension.rust-stable` SDK
-extension to build. Build it with:
-```sh
-scripts/package-flatpak.sh
-```
-which has flatpak-builder install the runtime/SDK/extension from Flathub into the user installation
-on first run, then writes `dist/io.github.steeb_k.SeedSync-<version>-x86_64.flatpak`
-(the exact name the release pipeline's asset table expects — see
-`docs/ci-release.md` §3). Install a downloaded bundle with:
-```sh
-flatpak install --user ./io.github.steeb_k.SeedSync-<v>-x86_64.flatpak
-```
-
-### Permissions, and why
-The manifest's `finish-args` comment block has the full reasoning per
-permission; in short:
-- `--share=network` — iroh (QUIC + relay fallback), the whole point of the app.
-- `--socket=wayland` / `--socket=fallback-x11`, `--device=dri` — normal GTK4
-  display + GPU access.
-- `--socket=session-bus` — the Linux tray (`crates/seed-gui/src/tray.rs`'s
-  `ksni` backend) registers a StatusNotifierItem with the desktop shell, which
-  by default means *owning* a per-instance well-known bus name
-  (`org.kde.StatusNotifierItem-<pid>-<n>`) that can't be pre-authorized with a
-  narrower `--own-name=` pattern — see the manifest comment for the exact
-  `ksni` internals this is based on, and the `disable_dbus_name(true)` escape
-  hatch that could narrow this to a plain `--talk-name` in a later pass.
-- `--talk-name=org.freedesktop.secrets` — the OS keystore for share master
-  seeds (`crates/seed-core/src/secrets.rs`) goes through the `keyring` crate's
-  Secret Service backend on Linux.
-- `--talk-name=org.freedesktop.portal.Background` — reserved for a future
-  `RequestBackground` portal call; not used yet (see next section).
-- `--filesystem=host` — the daemon mirrors arbitrary, runtime-chosen folders
-  continuously; no portal file-grant model supports that. This is also what
-  makes `~/.config/autostart` directly writable from inside the sandbox (see
-  below) without a separate `xdg-config` filesystem permission.
-
-No `--filesystem=xdg-run/seed-sync:create`: the IPC socket lives under
-`$XDG_DATA_HOME/seedsync/seed.sock` (`default_data_dir`/`default_socket` in
-`crates/seed-daemon/src/main.rs`), not `$XDG_RUNTIME_DIR`, and `$XDG_DATA_HOME`
-is already the sandbox's own per-app data directory with no extra permission
-needed — see the data directory paragraph below.
-
-### In-sandbox daemon supervision
-There is no `systemd --user` reachable inside the sandbox, so nothing brings
-`seed-daemon` up the way the tarball's unit or the Windows service does.
-`crates/seed-gui/src/flatpak.rs` covers this:
-- `in_flatpak()` detects the sandbox via `/.flatpak-info`, which Flatpak
-  bind-mounts into every sandboxed process.
-- `ensure_daemon(socket)` — a no-op outside Flatpak — checks whether anything
-  is listening on the daemon's socket and, if not, spawns
-  `seed-daemon run` as a child of the GUI (resolved next to the running
-  `seed-gui` binary, both installed to `/app/bin`), with its stdout/stderr
-  appended to `$XDG_DATA_HOME/seedsync/daemon.log` (on Linux, `seed-daemon run`
-  only ever logs to stdout — see `init_logging` in
-  `crates/seed-daemon/src/main.rs` — so without this redirect a
-  GUI-spawned child's output would just go nowhere).
-- It's called once at GUI startup, before the first IPC connection, and again
-  from the "Daemon Not Started" page's retry button.
-- For the daemon to survive a reboot without the user opening the GUI by hand,
-  `ensure_daemon` also writes an XDG autostart entry to
-  `~/.config/autostart/io.github.steeb_k.SeedSync.desktop` running
-  `flatpak run io.github.steeb_k.SeedSync --hidden` — the same mechanism and
-  directory the non-Flatpak install already uses for the tray
-  (`packaging/linux/seed-sync`'s `AUTOSTART_DIR`), rather than the Background
-  portal's `ashpd` binding, which is not a dependency of this workspace
-  (`Cargo.lock` has no `ashpd` entry) and wasn't worth adding for one call.
-  Same file name as the tarball install's entry, so the two can collide on an
-  account that has both: an existing entry whose `Exec=` is not
-  `flatpak run io.github.steeb_k.SeedSync` is left alone (the tarball's
-  `seed-sync --install`/`--uninstall` own it); only a missing entry, or a
-  stale one the Flatpak wrote, is (re)written.
-  That file is read/written via the literal `$HOME` env var rather than
-  `directories::BaseDirs::config_dir()` (`$XDG_CONFIG_HOME`), because Flatpak
-  always redirects `$XDG_CONFIG_HOME` to the sandboxed
-  `~/.var/app/<id>/config` — invisible to the host session manager that reads
-  autostart entries — while `$HOME` itself is not redirected, and
-  `--filesystem=host` makes the real `~/.config/autostart` directly writable.
-
-### Data directory and socket path
-Unchanged from the tarball/native install: the data dir + socket are chosen by
-the `directories` crate the same way everywhere (`ProjectDirs::from("io.github",
-"steeb_k","SeedSync")`), which resolves via `$XDG_DATA_HOME`. Flatpak sets
-`$XDG_DATA_HOME` to `~/.var/app/io.github.steeb_k.SeedSync/data` inside the
-sandbox (its standard per-app data isolation, independent of the
-`--filesystem=host` grant), so the data dir lands at
-**`~/.var/app/io.github.steeb_k.SeedSync/data/seedsync`** — holding `state.db`,
-`blobs/`, `docs/`, `node.key` and `seed.sock`, exactly like
-`~/.local/share/seedsync` does outside Flatpak. `seed-gui` and `seed-daemon`
-compute this independently (each has its own `ProjectDirs::from(...)` call —
-see `default_socket()` in `crates/seed-gui/src/main.rs` and
-`default_data_dir()`/`default_socket()` in `crates/seed-daemon/src/main.rs`)
-but always agree, in the sandbox or out of it, because both read the same
-inputs. No code changes were needed for the sandbox case, and no
-`$XDG_RUNTIME_DIR` involvement — the socket is a regular file under the data
-directory, not under the runtime directory.
-
-### Updates
-Updating is Flatpak's own job (`flatpak update`, or automatic updates if the
-user's Flatpak setup does that) — `seed-sync --update` is **not** shipped
-inside the Flatpak build, and the bundle carries no update timer/service.
-
-### Flathub prerequisites (not done here)
-This manifest is built for our own distribution (a self-published bundle,
-apps.kznjk.com's future flatpak repo — see `docs/ci-release.md` §7) and is
-**not** Flathub-submission-ready:
-- **`cargo-sources.json`.** The manifest's `build-options.build-args:
-  [--share=network]` lets `cargo build` fetch crates from crates.io during the
-  build — fine for a build we run ourselves, but Flathub's build sandbox has no
-  network access at all. A Flathub submission needs a `cargo-sources.json`
-  generated from this workspace's `Cargo.lock` by
-  [`flatpak-cargo-generator`](https://github.com/flatpak/flatpak-builder-tools),
-  added as an extra `sources:` entry, with `--share=network` removed.
-- **Screenshots + a `<releases>` block** in
-  `packaging/linux/io.github.steeb_k.SeedSync.metainfo.xml` — Flathub requires
-  both; neither exists yet (the `.deb`/`.rpm` packages already generate a
-  `<releases>` block from `CHANGELOG.md` at package time — see "Native
-  packages" above — the same generation would need wiring into the Flatpak
-  build too).
-- A Flathub review of the permission set above, which tends to push back hard
-  on `--filesystem=host` and `--socket=session-bus` — expect that
-  conversation, not a rubber stamp.
 
 ## Package repositories (apps.kznjk.com)
 Releases also reach apt, dnf, zypper and pacman through signed repositories on

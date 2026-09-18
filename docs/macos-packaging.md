@@ -34,9 +34,14 @@ to prefer it:
 Key decisions: a **universal2** build (`lipo` both slices of every binary and
 bundled dylib, built phased — arm64 first, x86_64 added after); **bundle the GTK4 +
 libadwaita dylibs** into the tarball (self-contained, no user Homebrew; relocate and
-re-sign, ship pixbuf loaders, GSettings schemas, Adwaita resources); and **ad-hoc
-signing only** (re-sign after relocation, mandatory on Apple Silicon; no
-notarization — rely on the `curl | sh` quarantine dodge, so $0 and no Apple account).
+re-sign, ship pixbuf loaders, GSettings schemas, Adwaita resources); and **signing
+in two layers**: ad-hoc while bundling (re-sign after every relocation, mandatory on
+Apple Silicon), then — since 0.8.0, in CI — every Mach-O and the bundle re-signed with
+the **Developer ID** Nullgate and Commune share, **notarized and stapled** before
+tarring (`CODESIGN_IDENTITY` + `SEED_NOTARIZE=1` in `package-macos.sh`, the
+certificate from `scripts/ci/macos-keychain.sh`; see `ci-release.md` §5). A local
+build without the identity stays ad-hoc, which the `curl | sh` install path still
+accepts (below).
 
 The distribution model — public artifact repo, version-driven updater, mandatory
 Cargo bump, one CI-built release per tag — is shared across platforms and
@@ -266,9 +271,8 @@ on the arm64 slice (use `lipo -thin x86_64` first to check the Intel slice).
 
 - **Unified hosted bootstrap** — mirror `packaging/web-install.sh` (built, OS-detecting) to
   `steeb-k.github.io/seed-install.sh`, replacing the Linux-only one.
-- Developer ID signing + **notarization** (clean install from any source, incl. a future `.dmg`) —
-  needs an Apple Developer account ($99/yr). Keeps ad-hoc as the default; notarize on top.
-- A `.dmg` for drag-to-Applications (would need notarization; the `.app` already exists).
+- A `.dmg` for drag-to-Applications (the release bundle is notarized since 0.8.0, so a
+  browser download would now pass Gatekeeper; the `.app` already exists).
 - Sparkle-style in-app updates (vs the launchd timer).
 
 See also: `docs/linux-packaging.md` (the model this mirrors), `docs/windows-packaging.md`

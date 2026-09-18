@@ -5,8 +5,9 @@
 #
 # This is the macOS arm of the bootstrap (the canonical seed-install.sh detects the
 # OS and runs this path on Darwin). Fetching + unpacking with curl|tar|sh does NOT
-# set the com.apple.quarantine xattr, so the ad-hoc-signed tarball runs without a
-# Gatekeeper "unidentified developer" block — no notarization needed.
+# set the com.apple.quarantine xattr, so even an ad-hoc-signed (local) tarball runs
+# without a Gatekeeper "unidentified developer" block; release bundles are
+# Developer-ID signed and notarized on top of that.
 #
 # Interactive when run from a terminal; otherwise defaults to install/update.
 # Non-interactive override:

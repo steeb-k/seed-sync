@@ -3,7 +3,7 @@
 # Pushing `v<version>` builds every platform (build.yml), gates on the same
 # checks ci.yml runs, and publishes ONE GitHub release — on the PUBLIC
 # `steeb-k/seed-sync-binaries` repo, not this one; every installed updater
-# reads that repo's `releases/latest` — with all nine assets attached in a
+# reads that repo's `releases/latest` — with all eight assets attached in a
 # single call. Never create-then-upload, because the moment a release is
 # Latest, updaters act on it, and a release missing an asset strands that
 # platform (the Windows updater will not cross architectures).
@@ -103,7 +103,7 @@ jobs:
         # place. See docs/ci-release.md §4.
         run: scripts/ci/version-gate.sh "${{ inputs.tag || github.ref_name }}" >> "$GITHUB_OUTPUT"
 
-      - name: Collect exactly the nine assets
+      - name: Collect exactly the eight assets
         run: scripts/ci/collect-assets.sh "${{ steps.release.outputs.version }}" artifacts dist
 
       - name: Release notes from the changelog

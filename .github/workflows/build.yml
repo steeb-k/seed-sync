@@ -14,7 +14,7 @@ on:
   workflow_call:
     inputs:
       sign:
-        description: 'Sign the Windows MSIs (Azure Trusted Signing) and the Android APK (release keystore). Off for a build that only needs to prove the pipeline. macOS is always ad-hoc-signed regardless of this input (docs/ci-release.md §5) — there is no Apple Developer account.'
+        description: 'Sign the Windows MSIs (Azure Trusted Signing), the macOS bundle (Developer ID + notarization) and the Android APK (release keystore). Off for a build that only needs to prove the pipeline.'
         required: false
         default: true
         type: boolean
@@ -41,7 +41,7 @@ env:
 jobs:
   linux:
     if: inputs.platforms == 'all' || contains(format(' {0} ', inputs.platforms), ' linux ')
-    name: Linux tarball, .deb, .rpm and Flatpak
+    name: Linux tarball, .deb and .rpm
     # Deliberately the OLDEST image that can build the GUI (GTK 4.14 satisfies
     # the gtk4 crate's v4_10 feature; 22.04's GTK 4.6 cannot). The tarball
     # binds the target's glibc to this image's (2.39), so moving it forward
@@ -53,12 +53,12 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
 
-      - name: Install GTK4, libadwaita, D-Bus headers, ImageMagick and Flatpak
+      - name: Install GTK4, libadwaita, D-Bus headers and ImageMagick
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgtk-4-dev libadwaita-1-dev libdbus-1-dev build-essential pkg-config \
-            imagemagick flatpak flatpak-builder desktop-file-utils appstream
+            imagemagick desktop-file-utils appstream
 
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -82,17 +82,13 @@ jobs:
       - name: Build the .deb and .rpm
         run: bash scripts/package-linux-native.sh
 
-      - name: Build the Flatpak bundle
-        run: bash scripts/package-flatpak.sh
-
       - name: Check the asset names
         run: |
           version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           for f in \
             "seed-sync-$version-linux-x86_64.tar.gz" \
             "seed-sync_$version-1_amd64.deb" \
-            "seed-sync-$version-1.x86_64.rpm" \
-            "io.github.steeb_k.SeedSync-$version-x86_64.flatpak"; do
+            "seed-sync-$version-1.x86_64.rpm"; do
             test -f "dist/$f" || { echo "::error::no dist/$f"; ls -la dist; exit 1; }
           done
 
@@ -138,18 +134,6 @@ jobs:
             test ! -e /usr/bin/seed-daemon
             test ! -e /etc/yum.repos.d/kznjk.repo'
 
-      - name: Smoke-test the Flatpak bundle
-        # A throwaway --user installation — the runner's profile does not
-        # survive past this job anyway. If the manifest's runtime is not
-        # already cached from the flatpak-builder step above, this step
-        # fetches it from Flathub.
-        run: |
-          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          flatpak --user remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
-          flatpak --user install -y --bundle "dist/io.github.steeb_k.SeedSync-$version-x86_64.flatpak"
-          flatpak run io.github.steeb_k.SeedSync --version | grep -q "$version"
-          flatpak --user uninstall -y io.github.steeb_k.SeedSync
-
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: linux
@@ -157,7 +141,6 @@ jobs:
             dist/seed-sync-*-linux-x86_64.tar.gz
             dist/seed-sync_*_amd64.deb
             dist/seed-sync-*.x86_64.rpm
-            dist/io.github.steeb_k.SeedSync-*-x86_64.flatpak
           if-no-files-found: error
 
   arch:
@@ -383,12 +366,13 @@ jobs:
     # conda env, exactly as scripts/package-macos.sh does on the maintainer's
     # Mac, so one job yields the universal tarball both updaters accept.
     #
-    # No codesign identity, no notarization: there is no Apple Developer
-    # account, and there is none planned — ad-hoc signing plus the
-    # `curl | sh` quarantine dodge (docs/macos-packaging.md) is the whole
-    # story, so `sign` has no effect on this job.
+    # Developer ID signed and notarized, exactly as Nullgate: the same team's
+    # CI certificate lands in a throwaway keychain (scripts/ci/macos-keychain.sh)
+    # and package-macos.sh signs with it, notarizes and staples before tarring.
     runs-on: macos-15
     timeout-minutes: 90
+    env:
+      SIGN_MACOS: ${{ inputs.sign && secrets.MACOS_CERTIFICATE_P12 != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -431,8 +415,32 @@ jobs:
           shared-key: macos-release
           cache-on-failure: true
 
-      - name: Build, bundle and package
+      - name: Refuse to ship ad-hoc
+        if: inputs.sign && env.SIGN_MACOS != 'true'
+        run: |
+          echo "::error::MACOS_CERTIFICATE_P12 is not set; a release bundle must be Developer-ID signed. Rehearse with sign=false instead."
+          exit 1
+
+      - name: Import the Developer ID certificate
+        if: env.SIGN_MACOS == 'true'
         env:
+          CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+          CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: bash scripts/ci/macos-keychain.sh
+
+      - name: Build, sign, notarize and package
+        env:
+          # package-macos.sh signs with CODESIGN_IDENTITY (set by the keychain
+          # step) and, with SEED_NOTARIZE=1, notarizes + staples before
+          # tarring. Either notary credential form works.
+          SEED_NOTARIZE: ${{ env.SIGN_MACOS == 'true' && '1' || '0' }}
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+          NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
           CARGO_PROFILE_RELEASE_DEBUG: 'false'
         run: bash scripts/package-macos.sh
 
@@ -450,6 +458,10 @@ jobs:
             echo "::error::bundled GTK does not report minos 11.0 (arm64 slice)"; exit 1
           fi
           codesign --verify --deep --strict --verbose=2 "$app"
+          if [ "$SIGN_MACOS" = "true" ]; then
+            codesign -dv --verbose=2 "$app" 2>&1 | grep -q '^Authority=Developer ID Application' || { echo "::error::the bundle is not Developer-ID signed"; exit 1; }
+            xcrun stapler validate "$app"
+          fi
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

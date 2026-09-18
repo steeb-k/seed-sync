@@ -4,7 +4,7 @@
 `steeb-k/seed-sync` runs `.github/workflows/release.yml`, which builds every
 platform through `.github/workflows/build.yml`, gates on the same checks `ci.yml`
 runs, and creates **one** GitHub release on the **public
-`steeb-k/seed-sync-binaries`** repo with all nine assets attached in a single
+`steeb-k/seed-sync-binaries`** repo with all eight assets attached in a single
 call. The design, the asset contract and the per-platform jobs are in
 [`ci-release.md`](ci-release.md); this page is the runbook. The per-platform
 scripts still work by hand and are exactly what CI runs — building locally is
@@ -32,9 +32,8 @@ Per-platform mechanics: [`windows-packaging.md`](windows-packaging.md),
                      (one gh call)    ├─ ...macos-universal.tar.gz        `seed-daemon --version`
                                       ├─ ...android-universal.apk
                                       ├─ seed-sync_<v>-1_amd64.deb ◄───  apps.kznjk.com poller
-                                      ├─ seed-sync-<v>-1.x86_64.rpm      (apt/dnf/zypper/pacman/
-                                      ├─ seed-sync-<v>-1-x86_64.pkg.tar.zst   flatpak repos)
-                                      └─ io.github.steeb_k.SeedSync-<v>-x86_64.flatpak
+                                      ├─ seed-sync-<v>-1.x86_64.rpm      (apt/dnf/zypper/pacman
+                                      └─ seed-sync-<v>-1-x86_64.pkg.tar.zst   repos)
 ```
 
 - Artifacts live on a **separate public repo** so machines download with no
@@ -43,8 +42,8 @@ Per-platform mechanics: [`windows-packaging.md`](windows-packaging.md),
 - The **installed version is the source of truth**: the updaters read
   `seed-daemon --version` and compare it to the Latest release tag.
 - **Linux packages** are picked up by apps.kznjk.com's poller, which verifies
-  each asset's sha256, GPG-signs it and rebuilds the apt, dnf/zypper, pacman and
-  flatpak repositories. Nothing in this repo pushes to a package repository.
+  each asset's sha256, GPG-signs it and rebuilds the apt, dnf/zypper and pacman
+  repositories. Nothing in this repo pushes to a package repository.
 - A **dashed tag** (`v0.8.0-test1`) publishes a *prerelease*, which every updater,
   Obtainium and the package poller ignore. Rehearse every pipeline change that way.
 
@@ -71,7 +70,7 @@ Per-platform mechanics: [`windows-packaging.md`](windows-packaging.md),
    section). Commit `release: v<version>` and push `main`.
 3. **Rehearse if anything in the pipeline changed:**
    `git tag v<version>-test1 && git push origin v<version>-test1`. That publishes
-   a prerelease with all nine assets that nothing installed will take. Install
+   a prerelease with all eight assets that nothing installed will take. Install
    one or two of them by hand (smoke-check below), then delete the prerelease and
    the tag on both repos.
 4. **Tag:** `git tag v<version> && git push origin v<version>`. The `release`
@@ -82,7 +81,7 @@ Per-platform mechanics: [`windows-packaging.md`](windows-packaging.md),
    dispatch `release.yml` from that branch with `tag: v<version>`: the workflow
    comes from the branch, the source from the tag.
 6. **Package repositories** need nothing: apps.kznjk.com's timer signs the
-   `.deb`, `.rpm`, `.pkg.tar.zst` and `.flatpak` into its repositories within
+   `.deb`, `.rpm` and `.pkg.tar.zst` into its repositories within
    about ten minutes (`journalctl --user -u packages-sync` on that host).
 7. **AUR**, once the release is published: `scripts/aur-prepare.sh <version>
    ../seed-sync-aur`, review, commit and push the clone (details in
@@ -95,14 +94,16 @@ Each artifact on its own OS: **Windows** `pwsh -File scripts\build-msi.ps1`
 (+ `-Arch arm64`; signed when `artifact-signing-metadata.json` and an `az login`
 session are present, see [`windows-packaging.md`](windows-packaging.md));
 **Linux** `scripts/package-linux.sh`, then `scripts/package-linux-native.sh`
-(needs nfpm, the version pinned in `build.yml`) and `scripts/package-flatpak.sh`;
+(needs nfpm, the version pinned in `build.yml`);
 **Arch** `scripts/ci/arch-pkgbuild.sh` in an `archlinux` container with `/out`
 mounted; **macOS** `scripts/setup-conda-macos.sh --universal` once, then
-`scripts/package-macos.sh`; **Android** `cd android && ./gradlew :app:assembleRelease`
+`CODESIGN_IDENTITY='Developer ID Application: …' SEED_NOTARIZE=1 scripts/package-macos.sh`
+(ad-hoc without the identity — installable through the `curl | sh` path, not by
+browser download); **Android** `cd android && ./gradlew :app:assembleRelease`
 with `android/keystore.properties`, renamed to `seed-sync-<version>-android-universal.apk`.
 
 Publish with `gh release create v<version> -R steeb-k/seed-sync-binaries --latest
---notes-file notes.md <all nine files>` in **one command** (no `--verify-tag`:
+--notes-file notes.md <all eight files>` in **one command** (no `--verify-tag`:
 the binaries repo has no source, `gh` creates the tag there). Never
 create-then-upload and never leave a draft: the moment a release is Latest,
 updaters act on it, and a release missing an asset strands that platform.
@@ -114,12 +115,13 @@ updaters act on it, and a release missing an asset strands that platform.
   (`schtasks /Query /TN SeedSyncUpdate`), and `Get-AuthenticodeSignature` is `Valid`.
 - **Linux packages:** once the poller has picked the release up, on a machine that
   already has the repository run `sudo apt update && sudo apt upgrade` (or
-  `dnf upgrade`, `pacman -Syu`, `flatpak update`) and confirm it moves to
+  `dnf upgrade`, `pacman -Syu`) and confirm it moves to
   `<version>`; `seed-sync --update` must refuse on a package-managed install.
   Installing the downloaded `.deb`/`.rpm` on a fresh machine must leave the
   repository configured.
 - **Linux/macOS tarball:** run the `curl … | sh` one-liner; `seed-sync --status`
-  shows the daemon active and the updater enabled.
+  shows the daemon active and the updater enabled. On macOS,
+  `spctl -a -vv "/Applications/SEED Sync.app"` says `source=Notarized Developer ID`.
 - **Two machines:** create a share on one, join on the other, confirm both
   directions sync and both report 100%.
 - **Auto-update path:** with an older build installed, confirm the updater picks
@@ -135,8 +137,11 @@ updaters act on it, and a release missing an asset strands that platform.
 Listed in [`ci-release.md` §8](ci-release.md#8-secrets-and-one-time-setup-maintainer):
 `SEED_BINARIES_TOKEN`, the three `AZURE_*` ids behind the OIDC federated
 credential (`repo:steeb-k/seed-sync:environment:release`), the four
-`ANDROID_*` keystore secrets, and the `release` environment on the source repo.
-The Windows signing account and certificate profile names are committed in
-`scripts/artifact-signing-metadata.ci.json` (the same Trusted Signing account
-Nullgate uses); the maintainer's local copy stays git-ignored at the repo root.
-The keystore itself is irreplaceable: back it up, never rotate it.
+`ANDROID_*` keystore secrets, the six `MACOS_*` signing and notary secrets
+(the Developer ID team Nullgate and Commune share), and the `release`
+environment on the source repo. `~/seed-sync-signing/set-seed-sync-secrets.sh`
+sets all of them but the PAT. The Windows signing account and certificate
+profile names are committed in `scripts/artifact-signing-metadata.ci.json`
+(the same Trusted Signing account Nullgate uses); the maintainer's local copy
+stays git-ignored at the repo root. The keystore is irreplaceable from the
+first shipped APK on: back it up, never rotate it.

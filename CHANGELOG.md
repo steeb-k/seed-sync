@@ -10,23 +10,23 @@ Pre-1.0; prereleases are tagged `v<version>-test<N>`.
 ### Added
 - **Release builds move to GitHub Actions.** `.github/workflows/release.yml` builds every
   platform via `.github/workflows/build.yml` and publishes one GitHub release — on the public
-  `steeb-k/seed-sync-binaries` repo, exactly as the old local-build workflow did — with all nine
+  `steeb-k/seed-sync-binaries` repo, exactly as the old local-build workflow did — with all eight
   assets attached in a single call, after a version gate (tag == workspace version == Android
   `versionName`/`versionCode`). A dashed tag (`v<ver>-test<N>`) publishes a prerelease every
   updater ignores, for rehearsing a pipeline change before it ships. Windows is still signed with
-  Azure Trusted Signing over OIDC and Android with the release keystore; macOS stays ad-hoc
-  (no Apple Developer account). See `docs/ci-release.md`.
+  Azure Trusted Signing over OIDC, Android with the release keystore, and macOS with the same
+  Developer ID as Nullgate, notarized and stapled (until now the bundle was ad-hoc signed and
+  relied on the `curl | sh` install to dodge Gatekeeper). See `docs/ci-release.md`.
 - **Native Linux packages, with updates.** Every release now also carries a `.deb` (Debian 13+,
   Ubuntu 24.04+), an `.rpm` (Fedora 40+, openSUSE Tumbleweed), an Arch package
-  (`.pkg.tar.zst`, also published to the AUR) and a single-file Flatpak bundle. The `.deb`/`.rpm`
+  (`.pkg.tar.zst`, also published to the AUR). The `.deb`/`.rpm`
   ship signed apt/dnf/zypper repository definitions so a downloaded package self-subscribes to
   future updates; Arch users add the `[kznjk]` repository by hand or build the `seed-sync` AUR
   package. The packages install under `/usr`, stage the (per-user, `systemd --user`) daemon unit
   without enabling it, and refuse to install over the tarball's `~/.local/bin` install and vice
   versa (`seed-sync --update` now detects a package-managed install and declines to touch it).
   CI installs and removes the `.deb` under a real apt, installs and removes the `.rpm` on Fedora,
-  builds the PKGBUILD in an Arch container, and installs/runs the Flatpak bundle, before any
-  release is published. The packages also ship a system-wide tray autostart entry
+  and builds the PKGBUILD in an Arch container, before any release is published. The packages also ship a system-wide tray autostart entry
   (`/etc/xdg/autostart`, a config file with the usual `Hidden=true` per-user opt-out), and the
   GUI's **Start Daemon** button now enables the per-user unit (`systemctl --user enable --now`)
   rather than starting it for the current login only.
@@ -38,8 +38,6 @@ Pre-1.0; prereleases are tagged `v<version>-test<N>`.
 - **The Android release keystore is new** (generated 2026-09-17; no shipped install was ever
   signed with the old one). A device that still has an earlier release APK must uninstall it
   before installing this one; from here on every release is signed with this key, forever.
-- The Flatpak targets the GNOME 50 runtime (48 is end-of-life on Flathub). A Flatpak install
-  never overwrites a tarball install's login autostart entry of the same name.
 
 ### Fixed
 - **A share whose folder is on a removed drive no longer kills the daemon on every start**
