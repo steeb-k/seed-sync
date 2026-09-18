@@ -180,6 +180,15 @@ val cargoHostBuild by tasks.registering(Exec::class) {
     // whole seed-core stack costs ~8 GB of target/ next to the release build the
     // MSI/tarball steps already produced (the 0.7.4 release ran out of disk on
     // exactly this step).
+    //
+    // ...but NOT stripped. The workspace release profile has `strip = true`,
+    // and on Linux/macOS that empties the ELF/Mach-O symbol table, which is
+    // exactly where uniffi-bindgen 0.28 looks for the UNIFFI_META_* metadata
+    // (a Windows DLL keeps its export table, which is why this only ever
+    // failed on the Linux CI runner: the generator ran, wrote nothing, and
+    // Kotlin then failed on `Unresolved reference 'uniffi'`). The override
+    // applies to this crate's link step only; rlibs are unaffected.
+    environment("CARGO_PROFILE_RELEASE_STRIP", "none")
     commandLine(cargo("build", "-p", "seed-mobile", "--lib", "--release"))
 }
 
@@ -197,6 +206,10 @@ val uniffiBindgen by tasks.registering(Exec::class) {
     val hostLib = File(workspaceRoot, "target/release/$hostLibName")
     val outDir = uniffiOutDir.asFile
     doFirst { outDir.mkdirs() }
+    // Same profile override as cargoHostBuild: `cargo run --features bindgen`
+    // re-links the cdylib with the extra feature, and it must not be stripped
+    // either, or the generator reads an empty symbol table (see above).
+    environment("CARGO_PROFILE_RELEASE_STRIP", "none")
     commandLine(
         cargo(
             "run", "--release", "-p", "seed-mobile", "--features", "bindgen", "--bin", "uniffi-bindgen", "--",
